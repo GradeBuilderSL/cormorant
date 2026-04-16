@@ -200,6 +200,14 @@ class TestHeaderGen(unittest.TestCase):
         h = self._header("single_add.onnx")
         self.assertIn("inference_deinit(void)", h)
 
+    def test_fill_float_declaration_in_header(self):
+        h = self._header("single_add.onnx")
+        self.assertIn("inference_buf_fill_float(", h)
+
+    def test_read_float_declaration_in_header(self):
+        h = self._header("single_add.onnx")
+        self.assertIn("inference_buf_read_float(", h)
+
 
 # ------------------------------------------------------------------ #
 # Source generation                                                   #
@@ -220,7 +228,6 @@ class TestSourceGen(unittest.TestCase):
     def test_includes_driver(self):
         s = self._source("single_add.onnx")
         self.assertIn("xvectoropkernel.h", s)
-        self.assertIn("xil_cache.h", s)
 
     def test_no_data_t_typedef_in_source(self):
         # Data_t is defined in inference.h; source must not redefine it
@@ -244,28 +251,17 @@ class TestSourceGen(unittest.TestCase):
         s = self._source("single_add.onnx")
         self.assertIn("static void run_op(", s)
 
-    def test_platform_guard_in_source(self):
+    def test_sync_forward_decls_in_source(self):
         s = self._source("single_add.onnx")
-        self.assertIn("#ifdef __linux__", s)
-        # Both branches define these macros (Linux no-op, bare-metal Xil API)
-        self.assertIn("INFERENCE_CACHE_FLUSH", s)
-        self.assertIn("INFERENCE_CACHE_INVALIDATE", s)
+        # inference_buf.c sync API must be forward-declared before run_op()
+        self.assertIn("inference_buf_sync_to_device", s)
+        self.assertIn("inference_buf_sync_from_device", s)
 
-    def test_cache_macros_in_source(self):
+    def test_run_op_uses_sync_functions(self):
         s = self._source("single_add.onnx")
-        self.assertIn("INFERENCE_CACHE_FLUSH", s)
-        self.assertIn("INFERENCE_CACHE_INVALIDATE", s)
-
-    def test_bare_metal_cache_api_in_source(self):
-        s = self._source("single_add.onnx")
-        # Bare-metal branch must reference Xil API
-        self.assertIn("Xil_DCacheFlushRange", s)
-        self.assertIn("Xil_DCacheInvalidateRange", s)
-
-    def test_linux_cache_noop_in_source(self):
-        s = self._source("single_add.onnx")
-        # Linux branch must have no-op macros
-        self.assertIn("(void)(ptr)", s)
+        # run_op() calls sync instead of raw cache macros
+        self.assertIn("inference_buf_sync_to_device(a)", s)
+        self.assertIn("inference_buf_sync_from_device(c)", s)
 
     def test_run_op_call_add(self):
         s = self._source("single_add.onnx")
@@ -344,13 +340,24 @@ class TestBufImpl(unittest.TestCase):
         b = self._buf("single_add.onnx")
         self.assertIn("struct inference_buf", b)
 
-    def test_linux_udmabuf_device(self):
+    def test_linux_xrt_alloc(self):
         b = self._buf("single_add.onnx")
-        self.assertIn("/dev/udmabuf0", b)
+        self.assertIn("xclAllocBO(", b)
 
-    def test_linux_mmap(self):
+    def test_linux_xrt_map(self):
         b = self._buf("single_add.onnx")
-        self.assertIn("mmap(", b)
+        self.assertIn("xclMapBO(", b)
+
+    def test_linux_xrt_sync(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("xclSyncBO(", b)
+        self.assertIn("XCL_BO_SYNC_BO_TO_DEVICE", b)
+        self.assertIn("XCL_BO_SYNC_BO_FROM_DEVICE", b)
+
+    def test_linux_xrt_paddr(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("xclGetBOProperties(", b)
+        self.assertIn("props.paddr", b)
 
     def test_alloc_function(self):
         b = self._buf("single_add.onnx")
@@ -375,9 +382,42 @@ class TestBufImpl(unittest.TestCase):
         self.assertIn("inference_buf_phys(", b)
         self.assertIn("inference_buf_count(", b)
 
+    def test_sync_functions_present(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("inference_buf_sync_to_device(", b)
+        self.assertIn("inference_buf_sync_from_device(", b)
+
+    def test_bare_metal_cache_api_in_buf(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("Xil_DCacheFlushRange", b)
+        self.assertIn("Xil_DCacheInvalidateRange", b)
+
+    def test_float_cast_fill_present(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("inference_buf_fill_float(", b)
+
+    def test_float_cast_read_present(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("inference_buf_read_float(", b)
+
+    def test_fill_float_uses_data_t_cast(self):
+        # Must use (Data_t) cast, not a type-specific encoding constant
+        b = self._buf("single_add.onnx")
+        self.assertIn("(Data_t)src[i]", b)
+
+    def test_read_float_uses_float_cast(self):
+        b = self._buf("single_add.onnx")
+        self.assertIn("(float)src[i]", b)
+
+    def test_no_hardcoded_scale_in_buf(self):
+        # Must not contain ap_fixed<16,8>-specific scaling constants
+        b = self._buf("single_add.onnx")
+        self.assertNotIn("256.0f", b)
+        self.assertNotIn("127.99609375f", b)
+
 
 # ------------------------------------------------------------------ #
-# Setup script (scripts/setup_udmabuf.sh)                            #
+# Setup script (scripts/check_inference_setup.sh)                    #
 # ------------------------------------------------------------------ #
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -392,9 +432,9 @@ class TestSetupScript(unittest.TestCase):
         s = self._script("single_add.onnx")
         self.assertTrue(s.startswith("#!/bin/sh"))
 
-    def test_modprobe_udmabuf(self):
+    def test_xrt_referenced_in_script(self):
         s = self._script("single_add.onnx")
-        self.assertIn("modprobe u-dma-buf", s)
+        self.assertIn("xrt", s)
 
     def test_pool_size_in_script(self):
         import re
@@ -406,9 +446,18 @@ class TestSetupScript(unittest.TestCase):
         s = self._script("single_add.onnx")
         self.assertIn(str(pool_bytes), s)
 
-    def test_dev_udmabuf0_referenced(self):
+    def test_xrt_lib_in_script(self):
         s = self._script("single_add.onnx")
-        self.assertIn("/dev/udmabuf0", s)
+        self.assertIn("libxrt_core.so", s)
+
+    def test_pkg_config_in_script(self):
+        s = self._script("single_add.onnx")
+        self.assertIn("pkg-config", s)
+
+    def test_usr_include_xrt_candidate_in_script(self):
+        # Kria apt-package layout must be in the fallback search list
+        s = self._script("single_add.onnx")
+        self.assertIn("/usr/include/xrt/xrt.h", s)
 
 
 # ------------------------------------------------------------------ #
@@ -543,6 +592,15 @@ class TestCMakeGen(unittest.TestCase):
         cm = self._cmake("single_add.onnx")
         self.assertIn("FATAL_ERROR", cm)
 
+    def test_xrt_dir_for_linux(self):
+        cm = self._cmake("single_add.onnx")
+        # pkg-config primary path
+        self.assertIn("pkg_check_modules", cm)
+        self.assertIn("PkgConfig", cm)
+        # manual fallback still present
+        self.assertIn("XRT_DIR", cm)
+        self.assertIn("libxrt_core.so", cm)
+
 
 # ------------------------------------------------------------------ #
 # CLI — project directory output                                      #
@@ -580,7 +638,7 @@ class TestCLI(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(td, "src", "inference.c")))
             self.assertTrue(os.path.isfile(os.path.join(td, "src", "inference_buf.c")))
             self.assertTrue(os.path.isfile(os.path.join(td, "test", "test_inference.c")))
-            self.assertTrue(os.path.isfile(os.path.join(td, "scripts", "setup_udmabuf.sh")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "scripts", "check_inference_setup.sh")))
             self.assertTrue(os.path.isdir(os.path.join(td, "driver")))
 
     def test_driver_readme_when_no_src_dir(self):
@@ -637,14 +695,14 @@ class TestCLI(unittest.TestCase):
             with open(os.path.join(td, "src", "inference_buf.c")) as f:
                 b = f.read()
             self.assertIn("inference_buf_alloc(", b)
-            self.assertIn("/dev/udmabuf0", b)
+            self.assertIn("xclAllocBO(", b)
 
     def test_setup_script_content_in_project(self):
         with tempfile.TemporaryDirectory() as td:
             self._run_cli("single_add.onnx", ["--out-dir", td])
-            with open(os.path.join(td, "scripts", "setup_udmabuf.sh")) as f:
+            with open(os.path.join(td, "scripts", "check_inference_setup.sh")) as f:
                 s = f.read()
-            self.assertIn("modprobe u-dma-buf", s)
+            self.assertIn("xrt", s)
             self.assertIn("POOL_BYTES=", s)
 
     def test_test_source_content_in_project(self):

@@ -29,7 +29,8 @@ stored in AXI-Lite registers (Set_a / Set_b / Set_c).  On Linux, virtual
 pointers from malloc/stack are NOT valid DDR addresses.
 
 inference_buf_t abstracts this:
-  - Linux:      u-dma-buf pool; physical address from sysfs phys_addr.
+  - Linux:      dma-proxy pool; physical address from /proc/self/pagemap
+                (requires root; dma_alloc_coherent memory is contiguous).
   - Bare-metal: malloc (virtual == physical on Xilinx standalone).
 
 inference_buf_phys() returns the physical address to program into the kernel
@@ -128,7 +129,8 @@ class CodeGenerator:
 
         Platform-independent public API (accessors) plus two platform
         implementations selected at compile time by __linux__:
-          - Linux:      u-dma-buf pool (/dev/udmabuf0) with bump allocator.
+          - Linux:      posix_memalign + mlock + /proc/self/pagemap (root).
+                        No special device needed; each buffer is independent.
           - Bare-metal: malloc (virtual address == physical address on Xilinx
                         standalone/FreeRTOS BSP).
         """
@@ -138,7 +140,7 @@ class CodeGenerator:
         )
 
     def generate_setup_script(self) -> str:
-        """Content for scripts/setup_udmabuf.sh."""
+        """Content for scripts/check_inference_setup.sh."""
         pool_bytes = self._compute_pool_bytes()
         model_name = os.path.basename(self._model_path)
         return _SETUP_SCRIPT_TEMPLATE.format(
@@ -384,7 +386,30 @@ class CodeGenerator:
             f"            \"LINUX: driver file not found: ${{_TARGET_DRIVER}}\")\n"
             f"    endif()\n"
             f"\n"
-            f"    set(_TARGET_INCDIRS)\n"
+            f"    # XRT runtime — provides xclAllocBO/xclSyncBO/xclMapBO for DMA buffers.\n"
+            f"    # Locate XRT via pkg-config (preferred) or a manual XRT_DIR fallback.\n"
+            f"    find_package(PkgConfig QUIET)\n"
+            f"    if(PkgConfig_FOUND)\n"
+            f"        pkg_check_modules(XRT QUIET xrt)\n"
+            f"    endif()\n"
+            f"\n"
+            f"    if(XRT_FOUND)\n"
+            f"        message(STATUS \"inference: XRT found via pkg-config (${{XRT_VERSION}})\")\n"
+            f"        set(_TARGET_INCDIRS ${{XRT_INCLUDE_DIRS}})\n"
+            f"        set(_TARGET_LIBS    ${{XRT_LIBRARIES}})\n"
+            f"    else()\n"
+            f"        # Fallback: manual prefix (e.g. cross-compile or no pkg-config)\n"
+            f"        set(XRT_DIR \"/opt/xilinx/xrt\" CACHE PATH\n"
+            f"            \"XRT installation prefix, used when pkg-config cannot find xrt\")\n"
+            f"        if(NOT EXISTS \"${{XRT_DIR}}/include/xrt.h\")\n"
+            f"            message(WARNING\n"
+            f"                \"XRT not found via pkg-config and header missing at \"\n"
+            f"                \"${{XRT_DIR}}/include/xrt.h\\n\"\n"
+            f"                \"Install XRT or set -DXRT_DIR=<prefix>.\")\n"
+            f"        endif()\n"
+            f"        set(_TARGET_INCDIRS ${{XRT_DIR}}/include)\n"
+            f"        set(_TARGET_LIBS    ${{XRT_DIR}}/lib/libxrt_core.so)\n"
+            f"    endif()\n"
             f"\n"
             f"endif()\n"
             f"\n"
@@ -405,6 +430,10 @@ class CodeGenerator:
             f")\n"
             f"\n"
             f"target_compile_options(inference PRIVATE -Wall -Wextra -O2)\n"
+            f"\n"
+            f"if(DEFINED _TARGET_LIBS)\n"
+            f"    target_link_libraries(inference PUBLIC ${{_TARGET_LIBS}})\n"
+            f"endif()\n"
             f"\n"
             f"# -----------------------------------------------------------------------\n"
             f"# Install\n"
@@ -504,8 +533,9 @@ class CodeGenerator:
             "/*\n"
             " * Minimum contiguous DMA pool required for this model.\n"
             " *\n"
-            " * Linux:      run scripts/setup_udmabuf.sh before the application\n"
-            " *             to load u-dma-buf with at least this many bytes.\n"
+            " * Linux:      run scripts/check_inference_setup.sh before the\n"
+            " *             application to verify root access and pagemap\n"
+            " *             availability (required for physical address lookup).\n"
             " * Bare-metal: pool is not used; each buffer is allocated from\n"
             " *             the heap individually.\n"
             " */"
@@ -552,6 +582,38 @@ class CodeGenerator:
             "/* Number of Data_t elements that were allocated. */"
         )
         lines.append("unsigned inference_buf_count(const inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Sync buffer to device — flush CPU cache before the PL kernel reads.\n"
+            " * Called automatically by inference_run(); exposed for manual control. */"
+        )
+        lines.append("void inference_buf_sync_to_device(inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Sync buffer from device — invalidate CPU cache after the PL kernel writes.\n"
+            " * Called automatically by inference_run(); exposed for manual control. */"
+        )
+        lines.append("void inference_buf_sync_from_device(inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Fill n elements of buf from a float array.\n"
+            " * Each value is cast to Data_t using C's built-in conversion.\n"
+            " * n must be <= inference_buf_count(buf). */"
+        )
+        lines.append(
+            "void inference_buf_fill_float(inference_buf_t *buf,"
+            " const float *src, unsigned n);"
+        )
+        lines.append("")
+        lines.append(
+            "/* Read n elements from buf into a float array.\n"
+            " * Each Data_t element is cast to float using C's built-in conversion.\n"
+            " * n must be <= inference_buf_count(buf). */"
+        )
+        lines.append(
+            "void inference_buf_read_float(const inference_buf_t *buf,"
+            " float *dst, unsigned n);"
+        )
         lines.append("")
 
         # inference_init()
@@ -626,27 +688,17 @@ class CodeGenerator:
             '#include <string.h>    /* memcpy */\n'
             '\n'
             '/*\n'
-            ' * Platform guard: xvectoropkernel.h already gates u8...u64 on __linux__.\n'
-            ' * This block defines cache-maintenance macros:\n'
+            ' * Cache coherency between the CPU and the AXI DMA master is handled by\n'
+            ' * inference_buf_sync_to_device() and inference_buf_sync_from_device(),\n'
+            ' * both implemented in inference_buf.c:\n'
             ' *\n'
-            ' *   INFERENCE_CACHE_FLUSH / INFERENCE_CACHE_INVALIDATE:\n'
-            ' *     Bare-metal: explicit Xil_DCacheFlushRange / Xil_DCacheInvalidateRange\n'
-            ' *                 (required because AXI master bypasses the CPU cache).\n'
-            ' *     Linux:      KV260 HPC AXI ports are hardware cache-coherent with the\n'
-            ' *                 Cortex-A53; u-dma-buf allocations are non-cached on some\n'
-            ' *                 configurations.  Use no-ops here and rely on hardware.\n'
+            ' *   Linux:      xclSyncBO (XRT) — XCL_BO_SYNC_BO_TO/FROM_DEVICE\n'
+            ' *   Bare-metal: Xil_DCacheFlushRange / Xil_DCacheInvalidateRange\n'
             ' */\n'
-            '#ifdef __linux__\n'
-            '#  define INFERENCE_CACHE_FLUSH(ptr, bytes)      ((void)(ptr), (void)(bytes))\n'
-            '#  define INFERENCE_CACHE_INVALIDATE(ptr, bytes) ((void)(ptr), (void)(bytes))\n'
-            '#else\n'
-            '#  include "xil_cache.h"\n'
-            '#  include "xil_types.h"\n'
-            '#  define INFERENCE_CACHE_FLUSH(ptr, bytes) \\\n'
-            '       Xil_DCacheFlushRange((INTPTR)(ptr), (INTPTR)(bytes))\n'
-            '#  define INFERENCE_CACHE_INVALIDATE(ptr, bytes) \\\n'
-            '       Xil_DCacheInvalidateRange((INTPTR)(ptr), (INTPTR)(bytes))\n'
-            '#endif\n'
+            '\n'
+            '/* Forward declarations — defined in inference_buf.c */\n'
+            'void inference_buf_sync_to_device(inference_buf_t *buf);\n'
+            'void inference_buf_sync_from_device(inference_buf_t *buf);\n'
         )
 
     def _source_op_defines(self) -> str:
@@ -719,19 +771,16 @@ class CodeGenerator:
             "    XVectoropkernel_Set_size(&s_kernel, size);\n"
             "    XVectoropkernel_Set_op(&s_kernel, op);\n"
             "\n"
-            "    /* Flush CPU cache to DDR before the AXI master reads */\n"
-            "    INFERENCE_CACHE_FLUSH(inference_buf_ptr(a),\n"
-            "                         size * INFERENCE_BYTES_PER_ELEM);\n"
+            "    /* Sync inputs: flush CPU cache / XRT BO to device before AXI master reads */\n"
+            "    inference_buf_sync_to_device(a);\n"
             "    if (b != NULL)\n"
-            "        INFERENCE_CACHE_FLUSH(inference_buf_ptr(b),\n"
-            "                             size * INFERENCE_BYTES_PER_ELEM);\n"
+            "        inference_buf_sync_to_device(b);\n"
             "\n"
             "    XVectoropkernel_Start(&s_kernel);\n"
             "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
             "\n"
-            "    /* Invalidate CPU cache so the CPU sees what the kernel wrote */\n"
-            "    INFERENCE_CACHE_INVALIDATE(inference_buf_ptr(c),\n"
-            "                              size * INFERENCE_BYTES_PER_ELEM);\n"
+            "    /* Sync output: invalidate CPU cache / XRT BO from device after AXI master writes */\n"
+            "    inference_buf_sync_from_device(c);\n"
             "}\n"
         )
 
@@ -778,8 +827,8 @@ class CodeGenerator:
             "{\n"
             "    int rc;\n"
             "\n"
-            "    /* Initialise DMA buffer pool (Linux: maps /dev/udmabuf0;\n"
-            "     * bare-metal: no-op) */\n"
+            "    /* Initialise DMA buffer pool (Linux: no-op — each buffer\n"
+            "     * is individually allocated; bare-metal: no-op) */\n"
             "    rc = inference_buf_pool_init();\n"
             "    if (rc != 0) return rc;\n"
             "\n"
@@ -847,6 +896,9 @@ struct inference_buf {
     void    *virt;    /* CPU-accessible virtual address */
     uint64_t phys;    /* physical DDR address for AXI DMA registers */
     unsigned  count;  /* number of Data_t elements allocated */
+#ifdef __linux__
+    unsigned  bo;     /* XRT buffer object handle (xclBufferHandle = unsigned) */
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -869,100 +921,150 @@ unsigned inference_buf_count(const inference_buf_t *buf)
 }
 
 ////////////////////////////////////////////////////////////////////////
-/* Linux — u-dma-buf pool, bump allocator                             */
+/* Float cast helpers (platform-independent)                           */
 /*                                                                     */
-/* Prerequisites (run once as root):                                   */
-/*   sudo sh scripts/setup_udmabuf.sh                                  */
+/* Uses C's built-in implicit conversion to/from Data_t so the        */
+/* implementation is correct for any numeric Data_t (float, double,   */
+/* int8_t, int16_t, uint8_t, …) without type-specific constants.      */
+////////////////////////////////////////////////////////////////////////
+
+void inference_buf_fill_float(inference_buf_t *buf,
+                              const float *src, unsigned n)
+{
+    Data_t  *dst = (Data_t *)buf->virt;
+    unsigned i;
+    for (i = 0; i < n; i++)
+        dst[i] = (Data_t)src[i];
+}
+
+void inference_buf_read_float(const inference_buf_t *buf,
+                              float *dst, unsigned n)
+{
+    const Data_t *src = (const Data_t *)buf->virt;
+    unsigned i;
+    for (i = 0; i < n; i++)
+        dst[i] = (float)src[i];
+}
+
+////////////////////////////////////////////////////////////////////////
+/* Linux — XRT Buffer Object (BO) API                                 */
 /*                                                                     */
-/* u-dma-buf provides a contiguous physically-addressed region mapped  */
-/* into userspace.  Physical address and size are read from sysfs.     */
-/* Suballocations are 64-byte aligned (AXI burst friendly).            */
-/* Individual frees are no-ops; call inference_deinit() to release all.*/
+/* xclAllocBO allocates DMA-coherent memory managed by the XRT        */
+/* runtime.  xclGetBOProperties.paddr is the physical device address  */
+/* to program into the AXI-Lite DMA registers.                         */
+/*                                                                     */
+/* xclSyncBO handles cache coherency via the XRT DMA engine:           */
+/*   XCL_BO_SYNC_BO_TO_DEVICE   — flush before kernel reads inputs    */
+/*   XCL_BO_SYNC_BO_FROM_DEVICE — invalidate after kernel writes out  */
+/*                                                                     */
+/* Mirrors PYNQ xrt_device.py allocate_bo / map_bo /                  */
+/*   get_device_address / flush / invalidate.                          */
+/*                                                                     */
+/* Requires XRT runtime (/opt/xilinx/xrt) and access to the XRT       */
+/* device node.                                                        */
 ////////////////////////////////////////////////////////////////////////
 
 #ifdef __linux__
 
-#include <fcntl.h>
 #include <stdio.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include <xrt.h>
 
-#define _UDMABUF_DEV    "/dev/udmabuf0"
-#define _UDMABUF_PHYS   "/sys/class/u-dma-buf/udmabuf0/phys_addr"
-#define _UDMABUF_SIZE   "/sys/class/u-dma-buf/udmabuf0/size"
+/* XRT verbosity level 0 = quiet */
+#ifndef XCL_QUIET
+#  define XCL_QUIET 0
+#endif
 
-static void    *s_pool_virt   = NULL;
-static uint64_t s_pool_phys   = 0;
-static size_t   s_pool_size   = 0;
-static size_t   s_pool_offset = 0;
+/* Sentinel for a failed xclAllocBO — same as XRT's NULLBO */
+#ifndef NULLBO
+#  define NULLBO ((unsigned)(-1))
+#endif
 
-static uint64_t _read_sysfs_u64(const char *path)
-{
-    char  line[64] = {0};
-    FILE *fp = fopen(path, "r");
-    if (!fp) return 0;
-    (void)fgets(line, sizeof(line), fp);
-    fclose(fp);
-    return (uint64_t)strtoull(line, NULL, 0);
-}
+static xclDeviceHandle s_xrt_dev = NULL;
 
 int inference_buf_pool_init(void)
 {
-    int fd;
-
-    s_pool_phys = _read_sysfs_u64(_UDMABUF_PHYS);
-    s_pool_size = (size_t)_read_sysfs_u64(_UDMABUF_SIZE);
-
-    if (s_pool_size == 0) return -1;
-
-    fd = open(_UDMABUF_DEV, O_RDWR);
-    if (fd < 0) return -1;
-
-    s_pool_virt = mmap(NULL, s_pool_size,
-                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-
-    if (s_pool_virt == MAP_FAILED) {
-        s_pool_virt   = NULL;
-        s_pool_offset = 0;
+    s_xrt_dev = xclOpen(0, NULL, (enum xclVerbosityLevel)XCL_QUIET);
+    if (s_xrt_dev == NULL) {
+        fprintf(stderr, "inference: xclOpen(0) failed — is XRT loaded?\n");
         return -1;
     }
-    s_pool_offset = 0;
     return 0;
 }
 
 void inference_buf_pool_deinit(void)
 {
-    if (s_pool_virt) {
-        munmap(s_pool_virt, s_pool_size);
-        s_pool_virt   = NULL;
-        s_pool_offset = 0;
+    if (s_xrt_dev) {
+        xclClose(s_xrt_dev);
+        s_xrt_dev = NULL;
     }
 }
 
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
-    size_t bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
-    inference_buf_t *buf;
-
-    if (!s_pool_virt || s_pool_offset + bytes > s_pool_size)
-        return NULL;
+    size_t                 bytes = (size_t)n_elem * INFERENCE_BYTES_PER_ELEM;
+    xclBufferHandle        bo;
+    void                  *virt;
+    struct xclBOProperties props;
+    inference_buf_t       *buf;
 
     buf = (inference_buf_t *)malloc(sizeof(inference_buf_t));
     if (!buf) return NULL;
 
-    buf->virt  = (char *)s_pool_virt + s_pool_offset;
-    buf->phys  = s_pool_phys + (uint64_t)s_pool_offset;
+    /* flags = 0: XCL_BO_FLAGS_NONE — regular DMA-coherent host buffer */
+    bo = xclAllocBO(s_xrt_dev, bytes, 0, 0);
+    if (bo == (xclBufferHandle)NULLBO) {
+        fprintf(stderr, "inference: xclAllocBO(%zu bytes) failed\n", bytes);
+        free(buf);
+        return NULL;
+    }
+
+    /* Map buffer into CPU virtual address space */
+    virt = xclMapBO(s_xrt_dev, bo, /*write=*/1);
+    if (!virt || virt == (void *)(uintptr_t)(-1)) {
+        fprintf(stderr, "inference: xclMapBO failed\n");
+        xclFreeBO(s_xrt_dev, bo);
+        free(buf);
+        return NULL;
+    }
+
+    /* Retrieve physical (device) address from BO properties */
+    memset(&props, 0, sizeof(props));
+    if (xclGetBOProperties(s_xrt_dev, bo, &props) != 0) {
+        fprintf(stderr, "inference: xclGetBOProperties failed\n");
+        xclFreeBO(s_xrt_dev, bo);
+        free(buf);
+        return NULL;
+    }
+
+    buf->virt  = virt;
+    buf->phys  = props.paddr;
     buf->count = n_elem;
-    s_pool_offset += bytes;
+    buf->bo    = (unsigned)bo;
     return buf;
 }
 
 void inference_buf_free(inference_buf_t *buf)
 {
-    /* Pool memory is released all at once by inference_buf_pool_deinit().
-     * Only the struct metadata is individually freed here. */
-    free(buf);
+    if (buf) {
+        xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
+        free(buf);
+    }
+}
+
+/* Flush: write dirty CPU cache lines to DDR before the AXI master reads. */
+void inference_buf_sync_to_device(inference_buf_t *buf)
+{
+    xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
+              XCL_BO_SYNC_BO_TO_DEVICE,
+              buf->count * INFERENCE_BYTES_PER_ELEM, 0);
+}
+
+/* Invalidate: drop CPU cache lines after the AXI master has written. */
+void inference_buf_sync_from_device(inference_buf_t *buf)
+{
+    xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
+              XCL_BO_SYNC_BO_FROM_DEVICE,
+              buf->count * INFERENCE_BYTES_PER_ELEM, 0);
 }
 
 #else  /* bare-metal */
@@ -973,6 +1075,9 @@ void inference_buf_free(inference_buf_t *buf)
 /* On Xilinx standalone/FreeRTOS BSP the MMU uses a flat (identity)   */
 /* mapping for DDR, so virtual and physical addresses are equal.       */
 ////////////////////////////////////////////////////////////////////////
+
+#include "xil_cache.h"
+#include "xil_types.h"
 
 int  inference_buf_pool_init(void)   { return 0; }
 void inference_buf_pool_deinit(void) {}
@@ -1004,54 +1109,132 @@ void inference_buf_free(inference_buf_t *buf)
     }
 }
 
+void inference_buf_sync_to_device(inference_buf_t *buf)
+{
+    Xil_DCacheFlushRange((INTPTR)buf->virt,
+                         (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
+}
+
+void inference_buf_sync_from_device(inference_buf_t *buf)
+{
+    Xil_DCacheInvalidateRange((INTPTR)buf->virt,
+                              (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
+}
+
 #endif /* __linux__ */
 """
 
-# scripts/setup_udmabuf.sh — model-specific pool-size computation.
+# scripts/check_inference_setup.sh — preflight check for the inference library.
 # {model_name} and {pool_bytes} are substituted by generate_setup_script().
 _SETUP_SCRIPT_TEMPLATE = """\
 #!/bin/sh
-# setup_udmabuf.sh — load u-dma-buf with the DMA pool for the inference library
+# check_inference_setup.sh — verify XRT prerequisites for the inference library
 #
 # Auto-generated by inference-scheduler
 # Model   : {model_name}
-# Required: {pool_bytes} bytes
+# Required: {pool_bytes} bytes of DMA-capable memory
 #
-# This script loads the u-dma-buf kernel module and creates /dev/udmabuf0 as a
-# contiguous DMA-capable pool covering all inference buffers (weights,
-# intermediates, model I/O).
-#
-# Prerequisites:
-#   u-dma-buf kernel module (https://github.com/ikwzm/udmabuf)
-#     On KV260 PetaLinux: it may already be loaded.
-#     Otherwise: apt install u-dma-buf, or build from source and insmod.
+# The Linux inference library uses the XRT runtime (xclAllocBO / xclSyncBO)
+# for DMA buffer allocation and cache coherency.
 #
 # Usage:
-#   sudo sh scripts/setup_udmabuf.sh
+#   sh scripts/check_inference_setup.sh
 
 POOL_BYTES={pool_bytes}
+ERRORS=0
 
-# If already loaded with a large-enough pool, skip reload.
-if [ -e /dev/udmabuf0 ]; then
-    current=$(cat /sys/class/u-dma-buf/udmabuf0/size 2>/dev/null || echo 0)
-    if [ "$current" -ge "$POOL_BYTES" ]; then
-        echo "udmabuf0 already configured: ${{current}} bytes (>= ${{POOL_BYTES}})"
-        exit 0
+echo "Checking XRT inference library prerequisites..."
+echo "  Required DMA pool : $POOL_BYTES bytes"
+
+# -----------------------------------------------------------------------
+# 1. Locate xrt.h
+#    Try (in order):
+#      a) pkg-config xrt               (preferred — works on Kria Ubuntu)
+#      b) /usr/include/xrt/xrt.h       (Kria apt package layout)
+#      c) $INFERENCE_XRT_DIR/include/xrt.h  (user override / cross-compile)
+#      d) /opt/xilinx/xrt/include/xrt.h    (classic XRT install)
+# -----------------------------------------------------------------------
+XRT_HEADER=""
+
+if pkg-config --exists xrt 2>/dev/null; then
+    _inc=$(pkg-config --variable=includedir xrt 2>/dev/null)
+    if [ -f "$_inc/xrt.h" ]; then
+        XRT_HEADER="$_inc/xrt.h"
+    elif [ -f "$_inc/xrt/xrt.h" ]; then
+        XRT_HEADER="$_inc/xrt/xrt.h"
     fi
-    echo "Removing existing udmabuf0 (size=${{current}}, need=${{POOL_BYTES}})..."
-    modprobe -r u-dma-buf 2>/dev/null || rmmod u-dma-buf 2>/dev/null || true
 fi
 
-echo "Loading u-dma-buf: pool=${{POOL_BYTES}} bytes..."
-modprobe u-dma-buf udmabuf0=${{POOL_BYTES}}
+if [ -z "$XRT_HEADER" ]; then
+    for _candidate in \
+        /usr/include/xrt/xrt.h \
+        ${{INFERENCE_XRT_DIR:-/opt/xilinx/xrt}}/include/xrt.h \
+        /opt/xilinx/xrt/include/xrt.h
+    do
+        if [ -f "$_candidate" ]; then
+            XRT_HEADER="$_candidate"
+            break
+        fi
+    done
+fi
 
-if [ ! -e /dev/udmabuf0 ]; then
-    echo "ERROR: /dev/udmabuf0 not found after modprobe" >&2
-    echo "       Check that u-dma-buf is installed (https://github.com/ikwzm/udmabuf)" >&2
+if [ -n "$XRT_HEADER" ]; then
+    echo "  xrt.h             : $XRT_HEADER  OK"
+else
+    echo "ERROR: xrt.h not found. Install XRT:" >&2
+    echo "         sudo apt install xrt  (Kria/Ubuntu)" >&2
+    echo "       or set INFERENCE_XRT_DIR to your XRT prefix." >&2
+    ERRORS=$((ERRORS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# 2. Locate libxrt_core.so
+# -----------------------------------------------------------------------
+XRT_LIB=""
+
+if pkg-config --exists xrt 2>/dev/null; then
+    _libdir=$(pkg-config --variable=libdir xrt 2>/dev/null)
+    [ -f "$_libdir/libxrt_core.so" ] && XRT_LIB="$_libdir/libxrt_core.so"
+fi
+
+if [ -z "$XRT_LIB" ]; then
+    for _candidate in \
+        /usr/lib/libxrt_core.so \
+        /usr/lib/aarch64-linux-gnu/libxrt_core.so \
+        ${{INFERENCE_XRT_DIR:-/opt/xilinx/xrt}}/lib/libxrt_core.so \
+        /opt/xilinx/xrt/lib/libxrt_core.so
+    do
+        if [ -f "$_candidate" ]; then
+            XRT_LIB="$_candidate"
+            break
+        fi
+    done
+fi
+
+if [ -n "$XRT_LIB" ]; then
+    echo "  libxrt_core.so    : $XRT_LIB  OK"
+else
+    echo "ERROR: libxrt_core.so not found." >&2
+    echo "       Install XRT or set INFERENCE_XRT_DIR." >&2
+    ERRORS=$((ERRORS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# 3. XRT device node
+# -----------------------------------------------------------------------
+if ls /dev/dri/renderD* >/dev/null 2>&1; then
+    echo "  DRI render node   : $(ls /dev/dri/renderD* | head -1)  OK"
+else
+    echo "WARNING: no /dev/dri/renderD* device found — is the XRT driver loaded?" >&2
+fi
+
+# -----------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------
+if [ "$ERRORS" -eq 0 ]; then
+    echo "XRT prerequisites OK"
+else
+    echo "$ERRORS prerequisite(s) missing — see errors above." >&2
     exit 1
 fi
-
-echo "udmabuf0 ready"
-echo "  phys_addr : $(cat /sys/class/u-dma-buf/udmabuf0/phys_addr)"
-echo "  size      : $(cat /sys/class/u-dma-buf/udmabuf0/size) bytes"
 """

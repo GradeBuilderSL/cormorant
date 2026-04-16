@@ -207,7 +207,7 @@ def main(argv=None):
     _write(os.path.join(out_dir, "include", "inference.h"),      header)
     _write(os.path.join(out_dir, "src",     "inference.c"),      source)
     _write(os.path.join(out_dir, "src",     "inference_buf.c"),  buf_impl)
-    _write(os.path.join(out_dir, "scripts", "setup_udmabuf.sh"), setup_sh)
+    _write(os.path.join(out_dir, "scripts", "check_inference_setup.sh"), setup_sh)
     _write(os.path.join(out_dir, "test",    "test_inference.c"), test_src)
 
     # ---------------------------------------------------------------- #
@@ -250,7 +250,7 @@ def main(argv=None):
         "src/inference.c",
         "src/inference_buf.c",
         "test/test_inference.c",
-        "scripts/setup_udmabuf.sh",
+        "scripts/check_inference_setup.sh",
         "driver/",
     ]:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)
