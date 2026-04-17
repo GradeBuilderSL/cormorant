@@ -3,10 +3,17 @@
 gen_test_models.py — create minimal ONNX models for testing inference_scheduler.
 
 Models produced:
-  single_add.onnx      one Add node with a constant bias
-  relu_chain.onnx      Add followed by Relu
-  mixed_ops.onnx       Add -> Mul -> Relu6 (Clip 0,6) chain
-  unsupported.onnx     Conv node — must trigger a SchedulerError
+  single_add.onnx           one Add node with a constant bias (one runtime input)
+  relu_chain.onnx           Add followed by Relu (one runtime input)
+  mixed_ops.onnx            Add -> Mul -> Relu6 (Clip 0,6) chain (one runtime input)
+  two_input_add.onnx        Add with two runtime inputs: A + B -> Y
+  two_input_chain.onnx      Two runtime inputs: A + B -> Relu -> Y
+  two_output_tap.onnx       One input, two outputs: X+bias -> add_Y[out1] -> Relu -> relu_Y[out2]
+  two_output_chain.onnx     One input, two outputs: X+b1 -> add_Y[out1] -> *scale -> Relu6 -> clip_Y[out2]
+  batch_relu.onnx           2D input [4, 64]: X+bias -> Relu -> Y  (batch of 4 rows)
+  matrix_ops.onnx           2D input [8, 32]: A*B -> Relu6 -> Y  (two runtime inputs, matrix shape)
+  large_tensor.onnx         4D input [64, 64, 16, 16] (1M elements): X+bias -> add_Y[out1] -> Relu -> Y[out2]
+  unsupported.onnx          Conv node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
   python test/gen_test_models.py [--out-dir /path/to/models]
@@ -141,7 +148,245 @@ def make_mixed_ops(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 4: unsupported op (Conv)                                     #
+# Model 4: two runtime inputs — Add(A, B) -> Y                       #
+# ------------------------------------------------------------------ #
+
+def make_two_input_add(out_dir: str) -> None:
+    """A + B  (both [1, 256], both runtime inputs — no initializers)"""
+    N = 256
+
+    A = _float32("A", [1, N])
+    B = _float32("B", [1, N])
+    Y = _float32("Y", [1, N])
+
+    add_node = oh.make_node("Add", inputs=["A", "B"], outputs=["Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node],
+        name="two_input_add",
+        inputs=[A, B],
+        outputs=[Y],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "two_input_add.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 5: two runtime inputs — Add(A, B) -> Relu -> Y               #
+# ------------------------------------------------------------------ #
+
+def make_two_input_chain(out_dir: str) -> None:
+    """A + B  then  Relu  (both inputs [1, 128], no initializers)"""
+    N = 128
+
+    A      = _float32("A",      [1, N])
+    B      = _float32("B",      [1, N])
+    add_Y  = _float32("add_Y",  [1, N])
+    relu_Y = _float32("relu_Y", [1, N])
+
+    add_node  = oh.make_node("Add",  inputs=["A", "B"],    outputs=["add_Y"])
+    relu_node = oh.make_node("Relu", inputs=["add_Y"],     outputs=["relu_Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node, relu_node],
+        name="two_input_chain",
+        inputs=[A, B],
+        outputs=[relu_Y],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "two_input_chain.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 6: one input, two outputs — tap an intermediate result       #
+#   X + bias -> add_Y [output 1] -> Relu -> relu_Y [output 2]        #
+# ------------------------------------------------------------------ #
+
+def make_two_output_tap(out_dir: str) -> None:
+    """
+    add_Y is the output of the Add node AND a graph output, so the
+    caller receives both the pre-activation (add_Y) and the rectified
+    (relu_Y) result in separate caller-supplied buffers.
+    """
+    N    = 128
+    bias = np.ones((1, N), dtype=np.float32) * 0.5
+
+    X      = _float32("X",      [1, N])
+    add_Y  = _float32("add_Y",  [1, N])
+    relu_Y = _float32("relu_Y", [1, N])
+    bias_init = _initializer("bias", bias)
+
+    add_node  = oh.make_node("Add",  inputs=["X", "bias"], outputs=["add_Y"])
+    relu_node = oh.make_node("Relu", inputs=["add_Y"],     outputs=["relu_Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node, relu_node],
+        name="two_output_tap",
+        inputs=[X],
+        outputs=[add_Y, relu_Y],   # intermediate add_Y is also exposed
+        initializer=[bias_init],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "two_output_tap.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 7: one input, two outputs — longer chain with tapped middle  #
+#   X + b1 -> add_Y [output 1] -> * scale -> Relu6 -> clip_Y [out2] #
+# ------------------------------------------------------------------ #
+
+def make_two_output_chain(out_dir: str) -> None:
+    """
+    add_Y (post-Add) is tapped as output 1; the full chain result
+    clip_Y (post-Relu6) is output 2.  scale is a constant weight.
+    """
+    N     = 64
+    b1    = np.random.randn(1, N).astype(np.float32) * 0.5
+    scale = np.ones((1, N), dtype=np.float32) * 2.0
+    mn    = np.array([0.0], dtype=np.float32)
+    mx    = np.array([6.0], dtype=np.float32)
+
+    X      = _float32("X",      [1, N])
+    add_Y  = _float32("add_Y",  [1, N])
+    mul_Y  = _float32("mul_Y",  [1, N])
+    clip_Y = _float32("clip_Y", [1, N])
+
+    inits = [
+        _initializer("b1",       b1),
+        _initializer("scale",    scale),
+        _initializer("clip_min", mn),
+        _initializer("clip_max", mx),
+    ]
+
+    add_node  = oh.make_node("Add",  ["X",     "b1"],              ["add_Y"])
+    mul_node  = oh.make_node("Mul",  ["add_Y", "scale"],            ["mul_Y"])
+    clip_node = oh.make_node("Clip", ["mul_Y", "clip_min", "clip_max"], ["clip_Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node, mul_node, clip_node],
+        name="two_output_chain",
+        inputs=[X],
+        outputs=[add_Y, clip_Y],   # tap after Add; final after Relu6
+        initializer=inits,
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "two_output_chain.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 8: 2D input [4, 64] — batch of rows, one runtime input       #
+#   X[4,64] + bias[4,64] -> add_Y -> Relu -> Y[4,64]                 #
+# ------------------------------------------------------------------ #
+
+def make_batch_relu(out_dir: str) -> None:
+    """
+    X has shape [4, 64] — 4 independent rows processed as a flat
+    vector of 256 elements by VectorOPKernel.
+    """
+    B, N = 4, 64
+    bias = np.ones((B, N), dtype=np.float32) * 0.25
+
+    X     = _float32("X",     [B, N])
+    add_Y = _float32("add_Y", [B, N])
+    Y     = _float32("Y",     [B, N])
+    bias_init = _initializer("bias", bias)
+
+    add_node  = oh.make_node("Add",  inputs=["X", "bias"], outputs=["add_Y"])
+    relu_node = oh.make_node("Relu", inputs=["add_Y"],     outputs=["Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node, relu_node],
+        name="batch_relu",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[bias_init],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "batch_relu.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 9: 2D input [8, 32] — two runtime inputs, matrix shape       #
+#   A[8,32] * B[8,32] -> mul_Y -> Relu6 -> Y[8,32]                   #
+# ------------------------------------------------------------------ #
+
+def make_matrix_ops(out_dir: str) -> None:
+    """
+    A and B both have shape [8, 32] — a matrix of 256 elements each.
+    Both are runtime inputs (no initializers).
+    """
+    M, N = 8, 32
+
+    A     = _float32("A",     [M, N])
+    B     = _float32("B",     [M, N])
+    mul_Y = _float32("mul_Y", [M, N])
+    Y     = _float32("Y",     [M, N])
+    mn    = np.array([0.0], dtype=np.float32)
+    mx    = np.array([6.0], dtype=np.float32)
+
+    mul_node  = oh.make_node("Mul",  ["A", "B"],              ["mul_Y"])
+    clip_node = oh.make_node("Clip", ["mul_Y", "clip_min", "clip_max"], ["Y"])
+
+    graph = oh.make_graph(
+        nodes=[mul_node, clip_node],
+        name="matrix_ops",
+        inputs=[A, B],
+        outputs=[Y],
+        initializer=[
+            _initializer("clip_min", mn),
+            _initializer("clip_max", mx),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "matrix_ops.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 10: large 4-D tensor [64, 64, 16, 16] — 1 048 576 elements  #
+#   X[64,64,16,16] + bias -> add_Y[out1], Relu(add_Y) -> Y[out2]    #
+# ------------------------------------------------------------------ #
+
+def make_large_tensor(out_dir: str) -> None:
+    """
+    Feature-map-shaped tensor typical of a mid-network conv layer:
+      batch=64, channels=64, height=16, width=16  => 1 048 576 elements.
+
+    The intermediate add_Y is exposed as a second output so the caller
+    can inspect pre-activation values.  VectorOPKernel sees a flat
+    vector of 1 048 576 elements for each op.
+    """
+    shape = [64, 64, 16, 16]
+    numel = 64 * 64 * 16 * 16   # 1 048 576
+    bias  = np.full(shape, -0.01, dtype=np.float32)
+
+    X      = _float32("X",     shape)
+    add_Y  = _float32("add_Y", shape)
+    Y      = _float32("Y",     shape)
+    bias_init = _initializer("bias", bias)
+
+    add_node  = oh.make_node("Add",  inputs=["X", "bias"], outputs=["add_Y"])
+    relu_node = oh.make_node("Relu", inputs=["add_Y"],     outputs=["Y"])
+
+    graph = oh.make_graph(
+        nodes=[add_node, relu_node],
+        name="large_tensor",
+        inputs=[X],
+        outputs=[add_Y, Y],     # tap pre-activation as first output
+        initializer=[bias_init],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "large_tensor.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 11: unsupported op (Conv)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
@@ -190,6 +435,13 @@ def main():
     make_single_add(args.out_dir)
     make_relu_chain(args.out_dir)
     make_mixed_ops(args.out_dir)
+    make_two_input_add(args.out_dir)
+    make_two_input_chain(args.out_dir)
+    make_two_output_tap(args.out_dir)
+    make_two_output_chain(args.out_dir)
+    make_batch_relu(args.out_dir)
+    make_matrix_ops(args.out_dir)
+    make_large_tensor(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 

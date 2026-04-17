@@ -716,5 +716,304 @@ class TestCLI(unittest.TestCase):
             self.assertIn("test_inference PASSED", t)
 
 
+# ------------------------------------------------------------------ #
+# Two-input model tests                                               #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestTwoInputModels(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # Header: both inputs appear as size macros and in inference_run()
+    def test_two_input_add_size_macros(self):
+        g, cg = self._gen("two_input_add.onnx")
+        h = cg.generate_header()
+        self.assertIn("INFERENCE_A_SIZE", h)
+        self.assertIn("INFERENCE_B_SIZE", h)
+        self.assertIn("INFERENCE_Y_SIZE", h)
+
+    def test_two_input_add_run_signature(self):
+        g, cg = self._gen("two_input_add.onnx")
+        h = cg.generate_header()
+        # inference_run must accept both A and B as buf parameters
+        self.assertIn("inference_buf_t *A", h)
+        self.assertIn("inference_buf_t *B", h)
+
+    def test_two_input_chain_size_macros(self):
+        g, cg = self._gen("two_input_chain.onnx")
+        h = cg.generate_header()
+        self.assertIn("INFERENCE_A_SIZE", h)
+        self.assertIn("INFERENCE_B_SIZE", h)
+
+    # Source: both inputs are passed through to run_op
+    def test_two_input_add_op_in_source(self):
+        g, cg = self._gen("two_input_add.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+
+    def test_two_input_chain_ops_in_source(self):
+        g, cg = self._gen("two_input_chain.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_RELU", s)
+
+    # Generated test program: alloc buffers for both runtime inputs
+    def test_two_input_add_test_allocs(self):
+        g, cg = self._gen("two_input_add.onnx")
+        t = cg.generate_test()
+        self.assertIn("inference_buf_alloc(INFERENCE_A_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_B_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_Y_SIZE)", t)
+
+    def test_two_input_chain_test_allocs(self):
+        g, cg = self._gen("two_input_chain.onnx")
+        t = cg.generate_test()
+        self.assertIn("inference_buf_alloc(INFERENCE_A_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_B_SIZE)", t)
+
+    # Graph-level input count
+    def test_two_input_add_has_two_inputs(self):
+        g, _ = self._gen("two_input_add.onnx")
+        self.assertEqual(len(g.input_tensors), 2)
+
+    def test_two_input_chain_has_two_inputs(self):
+        g, _ = self._gen("two_input_chain.onnx")
+        self.assertEqual(len(g.input_tensors), 2)
+
+
+# ------------------------------------------------------------------ #
+# Two-output model tests                                              #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestTwoOutputModels(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # Graph topology
+    def test_tap_has_one_input(self):
+        g, _ = self._gen("two_output_tap.onnx")
+        self.assertEqual(len(g.input_tensors), 1)
+
+    def test_tap_has_two_outputs(self):
+        g, _ = self._gen("two_output_tap.onnx")
+        self.assertEqual(len(g.output_tensors), 2)
+
+    def test_tap_no_intermediates(self):
+        # add_Y is a graph output, so no intermediate buffers are allocated
+        g, _ = self._gen("two_output_tap.onnx")
+        self.assertEqual(len(g.intermediate_tensors), 0)
+
+    def test_chain_has_one_input(self):
+        g, _ = self._gen("two_output_chain.onnx")
+        self.assertEqual(len(g.input_tensors), 1)
+
+    def test_chain_has_two_outputs(self):
+        g, _ = self._gen("two_output_chain.onnx")
+        self.assertEqual(len(g.output_tensors), 2)
+
+    def test_chain_has_intermediate_buffer(self):
+        # mul_Y is between the two tapped outputs — must be allocated internally
+        g, _ = self._gen("two_output_chain.onnx")
+        interm_names = [t.c_name for t in g.intermediate_tensors]
+        self.assertIn("mul_Y", interm_names)
+
+    # Header: both outputs appear as size macros and in inference_run()
+    def test_tap_size_macros(self):
+        _, cg = self._gen("two_output_tap.onnx")
+        h = cg.generate_header()
+        self.assertIn("INFERENCE_ADD_Y_SIZE", h)
+        self.assertIn("INFERENCE_RELU_Y_SIZE", h)
+
+    def test_tap_run_signature(self):
+        _, cg = self._gen("two_output_tap.onnx")
+        h = cg.generate_header()
+        self.assertIn("inference_buf_t *add_Y", h)
+        self.assertIn("inference_buf_t *relu_Y", h)
+
+    def test_chain_run_signature(self):
+        _, cg = self._gen("two_output_chain.onnx")
+        h = cg.generate_header()
+        self.assertIn("inference_buf_t *add_Y", h)
+        self.assertIn("inference_buf_t *clip_Y", h)
+
+    # Source: ops are scheduled correctly
+    def test_tap_ops_in_source(self):
+        _, cg = self._gen("two_output_tap.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_RELU", s)
+
+    def test_chain_ops_in_source(self):
+        _, cg = self._gen("two_output_chain.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_MUL", s)
+        self.assertIn("VECTOROP_RELU6", s)
+
+    # Generated test program: allocates buffers for both outputs
+    def test_tap_test_allocs_both_outputs(self):
+        _, cg = self._gen("two_output_tap.onnx")
+        t = cg.generate_test()
+        self.assertIn("inference_buf_alloc(INFERENCE_ADD_Y_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_RELU_Y_SIZE)", t)
+
+    def test_chain_test_allocs_both_outputs(self):
+        _, cg = self._gen("two_output_chain.onnx")
+        t = cg.generate_test()
+        self.assertIn("inference_buf_alloc(INFERENCE_ADD_Y_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_CLIP_Y_SIZE)", t)
+
+    def test_tap_test_prints_both_outputs(self):
+        _, cg = self._gen("two_output_tap.onnx")
+        t = cg.generate_test()
+        self.assertIn("Output 'add_Y'", t)
+        self.assertIn("Output 'relu_Y'", t)
+
+
+# ------------------------------------------------------------------ #
+# 2D tensor model tests                                               #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestTwoDimModels(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # Shape is correctly parsed and stored
+    def test_batch_relu_input_shape(self):
+        g, _ = self._gen("batch_relu.onnx")
+        self.assertEqual(g.input_tensors[0].shape, [4, 64])
+
+    def test_batch_relu_output_shape(self):
+        g, _ = self._gen("batch_relu.onnx")
+        self.assertEqual(g.output_tensors[0].shape, [4, 64])
+
+    def test_matrix_ops_input_shape(self):
+        g, _ = self._gen("matrix_ops.onnx")
+        shapes = [t.shape for t in g.input_tensors]
+        self.assertIn([8, 32], shapes)
+
+    # numel is the product of all dimensions
+    def test_batch_relu_numel(self):
+        g, _ = self._gen("batch_relu.onnx")
+        self.assertEqual(g.input_tensors[0].numel, 4 * 64)
+
+    def test_matrix_ops_numel(self):
+        g, _ = self._gen("matrix_ops.onnx")
+        self.assertEqual(g.input_tensors[0].numel, 8 * 32)
+
+    # Size macros reflect the flattened element count
+    def test_batch_relu_size_macro(self):
+        _, cg = self._gen("batch_relu.onnx")
+        h = cg.generate_header()
+        self.assertIn(f"INFERENCE_X_SIZE", h)
+        self.assertIn(str(4 * 64), h)
+
+    def test_matrix_ops_size_macros(self):
+        _, cg = self._gen("matrix_ops.onnx")
+        h = cg.generate_header()
+        self.assertIn(str(8 * 32), h)
+
+    # Shape annotation appears in comments
+    def test_batch_relu_shape_in_header_comment(self):
+        _, cg = self._gen("batch_relu.onnx")
+        h = cg.generate_header()
+        self.assertIn("shape=[4, 64]", h)
+
+    def test_matrix_ops_shape_in_header_comment(self):
+        _, cg = self._gen("matrix_ops.onnx")
+        h = cg.generate_header()
+        self.assertIn("shape=[8, 32]", h)
+
+    # Ops are scheduled correctly
+    def test_batch_relu_ops(self):
+        _, cg = self._gen("batch_relu.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_RELU", s)
+
+    def test_matrix_ops_ops(self):
+        _, cg = self._gen("matrix_ops.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_MUL", s)
+        self.assertIn("VECTOROP_RELU6", s)
+
+
+# ------------------------------------------------------------------ #
+# Large tensor model tests                                            #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestLargeTensorModel(unittest.TestCase):
+
+    _NUMEL = 64 * 64 * 16 * 16   # 1 048 576
+
+    def _gen(self):
+        g  = OnnxGraph(_model("large_tensor.onnx"))
+        cg = CodeGenerator(g, model_path=_model("large_tensor.onnx"))
+        return g, cg
+
+    def test_input_shape(self):
+        g, _ = self._gen()
+        self.assertEqual(g.input_tensors[0].shape, [64, 64, 16, 16])
+
+    def test_output_shapes(self):
+        g, _ = self._gen()
+        for t in g.output_tensors:
+            self.assertEqual(t.shape, [64, 64, 16, 16])
+
+    def test_numel(self):
+        g, _ = self._gen()
+        self.assertEqual(g.input_tensors[0].numel, self._NUMEL)
+
+    def test_two_outputs(self):
+        g, _ = self._gen()
+        self.assertEqual(len(g.output_tensors), 2)
+
+    def test_no_intermediates(self):
+        # add_Y is a graph output, so no intermediate buffers are needed
+        g, _ = self._gen()
+        self.assertEqual(len(g.intermediate_tensors), 0)
+
+    def test_size_macros_value(self):
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertIn(f"{self._NUMEL}u", h)
+
+    def test_shape_in_comment(self):
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertIn("shape=[64, 64, 16, 16]", h)
+
+    def test_pool_size_covers_all_buffers(self):
+        # X + add_Y + Y + bias weight, each 2 MB => 8 MB total
+        _, cg = self._gen()
+        pool = cg._compute_pool_bytes()
+        self.assertGreaterEqual(pool, self._NUMEL * 2 * 4)  # at least 4 buffers
+
+    def test_ops_scheduled(self):
+        _, cg = self._gen()
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_RELU", s)
+
+    def test_test_allocs_both_outputs(self):
+        _, cg = self._gen()
+        t = cg.generate_test()
+        self.assertIn("inference_buf_alloc(INFERENCE_ADD_Y_SIZE)", t)
+        self.assertIn("inference_buf_alloc(INFERENCE_Y_SIZE)", t)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
