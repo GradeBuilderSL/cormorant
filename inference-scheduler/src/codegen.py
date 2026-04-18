@@ -44,7 +44,7 @@ from typing import List
 
 from .graph  import OnnxGraph
 from .tensor import TensorInfo, LARGE_WEIGHT_THRESHOLD
-from .nodes  import OP_NAMES
+from .nodes  import OP_NAMES, _ALIGN_BYTES, _BYTES_PER_ELEM, _ALIGN_ELEMS
 
 
 # ------------------------------------------------------------------ #
@@ -96,6 +96,56 @@ class CodeGenerator:
         self._graph               = graph
         self._model_path          = model_path
         self._embed_large_weights = embed_large_weights
+        # Precompute padded allocation sizes for all tensors (accounts for
+        # broadcast alignment gaps).  Computed once; used by header, init,
+        # and pool-size calculations.
+        self._alloc_sizes         = self._compute_alloc_sizes()
+
+    def _compute_alloc_sizes(self) -> dict:
+        """
+        Return {onnx_name: alloc_size_in_elements} for every tensor that
+        needs a DMA buffer, accounting for broadcast alignment padding.
+
+        For non-broadcast tensors: alloc_size == t.numel.
+        For advancing buffers in a broadcast node: outer_count * aligned_chunk.
+        For repeating buffers in a broadcast node: aligned_chunk (one block).
+        When a tensor appears in multiple nodes the maximum size is used.
+        """
+        sizes: dict = {}
+
+        # Seed with natural sizes
+        all_tensors = (
+            self._graph.weight_tensors
+            + self._graph.intermediate_tensors
+            + self._graph.input_tensors
+            + self._graph.output_tensors
+        )
+        for t in all_tensors:
+            sizes[t.onnx_name] = t.numel
+
+        # Override for nodes that use broadcasting
+        for sn in self._graph.nodes:
+            if sn.outer_count <= 1:
+                continue
+            total = sn.outer_count * sn.aligned_chunk_size
+
+            # Output always advances through the full padded range
+            sizes[sn.output.onnx_name] = max(
+                sizes.get(sn.output.onnx_name, 0), total
+            )
+            # Input a
+            a_size = total if sn.a_advances else sn.aligned_chunk_size
+            sizes[sn.inputs[0].onnx_name] = max(
+                sizes.get(sn.inputs[0].onnx_name, 0), a_size
+            )
+            # Input b (binary ops only)
+            if sn.arity == 2:
+                b_size = total if sn.b_advances else sn.aligned_chunk_size
+                sizes[sn.inputs[1].onnx_name] = max(
+                    sizes.get(sn.inputs[1].onnx_name, 0), b_size
+                )
+
+        return sizes
 
     # ---------------------------------------------------------------- #
     # Public entry points                                               #
@@ -156,10 +206,16 @@ class CodeGenerator:
         Allocates input/output DMA buffers, fills inputs with a ramp
         (element i = i/256.0 in ap_fixed<16,8> encoding), runs inference,
         and prints the first 8 output values.  Exit code 0 = success.
+
+        For broadcast models, inputs are filled chunk-by-chunk (skipping
+        alignment gap elements), and outputs are printed chunk-by-chunk so
+        that gap elements — which VectorOPKernel never writes — are not
+        included in the output.
         """
-        graph   = self._graph
-        inputs  = graph.input_tensors
-        outputs = graph.output_tensors
+        graph     = self._graph
+        inputs    = graph.input_tensors
+        outputs   = graph.output_tensors
+        bcast_map = self._broadcast_io_map()  # onnx_name → (n, chunk_macro, stride_macro)
 
         # Variable declarations at top of main()
         decl_lines = []
@@ -182,37 +238,78 @@ class CodeGenerator:
             alloc_lines.append("    }")
 
         # Fill each input with a ramp: raw uint16 value i = i/256.0
+        # For broadcasting inputs, iterate chunk-by-chunk so gap elements
+        # (alignment padding between data blocks) are left untouched.
         fill_lines = []
         for t in inputs:
-            macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
-            fill_lines += [
-                f"    {{",
-                f"        Data_t *p = inference_buf_ptr({t.c_name});",
-                f"        for (i = 0; i < {macro}; i++)",
-                f"            p[i] = (Data_t)(i & 0xFFFFu); /* i/256.0 */",
-                f"    }}",
-            ]
+            if t.onnx_name in bcast_map:
+                n, chunk_macro, stride_macro = bcast_map[t.onnx_name]
+                fill_lines += [
+                    f"    {{  /* '{t.c_name}' — broadcast input, fill data chunks only */",
+                    f"        Data_t   *p = inference_buf_ptr({t.c_name});",
+                    f"        unsigned  _chunk, _off;",
+                    f"        for (_chunk = 0u; _chunk < {n}u; _chunk++) {{",
+                    f"            _off = _chunk * {stride_macro};",
+                    f"            for (i = 0u; i < {chunk_macro}; i++)",
+                    f"                p[_off + i] = (Data_t)((_off + i) & 0xFFFFu); /* i/256.0 */",
+                    f"        }}",
+                    f"    }}",
+                ]
+            else:
+                macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
+                fill_lines += [
+                    f"    {{",
+                    f"        Data_t *p = inference_buf_ptr({t.c_name});",
+                    f"        for (i = 0u; i < {macro}; i++)",
+                    f"            p[i] = (Data_t)(i & 0xFFFFu); /* i/256.0 */",
+                    f"    }}",
+                ]
 
         # inference_run() call
         run_args = ", ".join(t.c_name for t in inputs + outputs)
 
-        # Print first ≤8 elements of each output
+        # Print first ≤8 elements of each output.
+        # For broadcasting outputs, iterate chunk-by-chunk so alignment gap
+        # elements — never written by VectorOPKernel — are skipped.
         print_lines = []
         for t in outputs:
-            macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
-            print_lines += [
-                f"    {{",
-                f"        Data_t   *p   = inference_buf_ptr({t.c_name});",
-                f"        unsigned  lim = ({macro} < 8u) ? {macro} : 8u;",
-                f"        printf(\"Output '{t.onnx_name}'"
-                f" (%u elem, first %u):\\n\", (unsigned){macro}, lim);",
-                f"        for (i = 0; i < lim; i++) {{",
-                f"            int16_t s = (int16_t)p[i];",
-                f"            printf(\"  [%u] 0x%04X  (%.4f)\\n\",",
-                f"                   i, (unsigned)p[i], (double)s / 256.0);",
-                f"        }}",
-                f"    }}",
-            ]
+            if t.onnx_name in bcast_map:
+                n, chunk_macro, stride_macro = bcast_map[t.onnx_name]
+                print_lines += [
+                    f"    {{  /* '{t.c_name}' — broadcast output, print data chunks only */",
+                    f"        Data_t   *p     = inference_buf_ptr({t.c_name});",
+                    f"        unsigned  numel = {n}u * {chunk_macro};",
+                    f"        unsigned  lim   = (numel < 8u) ? numel : 8u;",
+                    f"        unsigned  shown = 0u, _chunk, _off;",
+                    f"        printf(\"Output '{t.onnx_name}' (%u elem, first %u):\\n\","
+                    f" numel, lim);",
+                    f"        for (_chunk = 0u; _chunk < {n}u && shown < lim; _chunk++) {{",
+                    f"            _off = _chunk * {stride_macro};",
+                    f"            for (i = 0u; i < {chunk_macro} && shown < lim;"
+                    f" i++, shown++) {{",
+                    f"                int16_t s = (int16_t)p[_off + i];",
+                    f"                printf(\"  [%u] 0x%04X  (%.4f)\\n\",",
+                    f"                       shown, (unsigned)p[_off + i],"
+                    f" (double)s / 256.0);",
+                    f"            }}",
+                    f"        }}",
+                    f"    }}",
+                ]
+            else:
+                macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
+                print_lines += [
+                    f"    {{",
+                    f"        Data_t   *p   = inference_buf_ptr({t.c_name});",
+                    f"        unsigned  lim = ({macro} < 8u) ? {macro} : 8u;",
+                    f"        printf(\"Output '{t.onnx_name}'"
+                    f" (%u elem, first %u):\\n\", (unsigned){macro}, lim);",
+                    f"        for (i = 0u; i < lim; i++) {{",
+                    f"            int16_t s = (int16_t)p[i];",
+                    f"            printf(\"  [%u] 0x%04X  (%.4f)\\n\",",
+                    f"                   i, (unsigned)p[i], (double)s / 256.0);",
+                    f"        }}",
+                    f"    }}",
+                ]
 
         # Cleanup label: free all I/O buffers (NULL-safe), then deinit.
         cleanup_lines = []
@@ -505,19 +602,18 @@ class CodeGenerator:
         per buffer, rounded up to a 4 KiB page boundary.
 
         Covers: weight tensors + intermediate tensors + model inputs + outputs.
+        Uses _alloc_sizes (which accounts for broadcast alignment padding) and
+        _BYTES_PER_ELEM so the result is correct regardless of the data type.
         Used to size the u-dma-buf pool and advertised as
         INFERENCE_BUF_POOL_SIZE_BYTES in the generated header.
         """
         def _align64(n: int) -> int:
             return (n + 63) & ~63
 
-        total = 0
-        for t in (self._graph.weight_tensors
-                  + self._graph.intermediate_tensors
-                  + self._graph.input_tensors
-                  + self._graph.output_tensors):
-            total += _align64(t.numel * 2)   # INFERENCE_BYTES_PER_ELEM = 2
-
+        total = sum(
+            _align64(size * _BYTES_PER_ELEM)
+            for size in self._alloc_sizes.values()
+        )
         page = 4096
         return (total + page - 1) & ~(page - 1)
 
@@ -537,6 +633,28 @@ class CodeGenerator:
         """
         return tensor.to_dat_bytes()
 
+    def _broadcast_io_map(self) -> dict:
+        """
+        Returns {onnx_name → (outer_count, chunk_macro, stride_macro)} for
+        every I/O tensor (input or output) that advances through a broadcast
+        node.  Repeating tensors (e.g. a bias that stays at offset 0 each
+        iteration) are not included — they don't need strided fill/print logic.
+        """
+        result = {}
+        for sn in self._graph.nodes:
+            if sn.outer_count <= 1:
+                continue
+            c_up         = sn.output.c_name.upper()
+            chunk_macro  = f"INFERENCE_{c_up}_CHUNK"
+            stride_macro = f"INFERENCE_{c_up}_CHUNK_STRIDE"
+            n = sn.outer_count
+            result[sn.output.onnx_name] = (n, chunk_macro, stride_macro)
+            if sn.a_advances:
+                result[sn.inputs[0].onnx_name] = (n, chunk_macro, stride_macro)
+            if sn.arity == 2 and sn.b_advances:
+                result[sn.inputs[1].onnx_name] = (n, chunk_macro, stride_macro)
+        return result
+
     def _header_api(self) -> str:
         graph   = self._graph
         inputs  = graph.input_tensors
@@ -547,17 +665,80 @@ class CodeGenerator:
             "/* ap_fixed<16,8>: 16-bit two's-complement, value = (int16_t)bits / 256.0 */"
         )
         lines.append("typedef uint16_t Data_t;")
-        lines.append("#define INFERENCE_BYTES_PER_ELEM  2u")
+        lines.append(f"#define INFERENCE_BYTES_PER_ELEM  {_BYTES_PER_ELEM}u")
+        lines.append("")
+        lines.append(
+            "/* AXI burst alignment — every broadcast chunk stride is a multiple\n"
+            " * of INFERENCE_ALIGN_BYTES so each kernel invocation starts at an\n"
+            " * aligned physical address.  Derived from the two macros above;\n"
+            " * never hardcode the element count directly. */"
+        )
+        lines.append(f"#define INFERENCE_ALIGN_BYTES  {_ALIGN_BYTES}u")
+        lines.append(
+            "#define INFERENCE_ALIGN_ELEMS  "
+            "(INFERENCE_ALIGN_BYTES / INFERENCE_BYTES_PER_ELEM)"
+        )
+        lines.append(
+            "#define INFERENCE_ALIGN_UP(n)  \\\n"
+            "    (((n) + INFERENCE_ALIGN_ELEMS - 1u) & ~(INFERENCE_ALIGN_ELEMS - 1u))"
+        )
         lines.append("")
 
-        # Array-size macros — let callers size their buffers without magic numbers
+        # ---- collect broadcast info for the SIZE-macro section ----
+        # Repeating tensors (weights / internal buffers) do not appear in
+        # the public header SIZE macros.
+        bcast_map       = self._broadcast_io_map()   # onnx_name → (n, chunk_macro, stride_macro)
+        broadcast_nodes = [sn for sn in graph.nodes if sn.outer_count > 1]
+
+        # ---- Array-size macros ----
+        # Emit CHUNK / CHUNK_STRIDE macros first (referenced by SIZE macros below).
         lines.append(_banner("Array size constants"))
+        if broadcast_nodes:
+            lines.append("/* Broadcast chunk macros (one set per broadcast op).\n"
+                         " * CHUNK        = data elements per kernel call\n"
+                         " * CHUNK_STRIDE = INFERENCE_ALIGN_UP(CHUNK) — padded stride;\n"
+                         " *               gap elements between data blocks are never\n"
+                         " *               accessed by VectorOPKernel. */")
+            for sn in broadcast_nodes:
+                c_up = sn.output.c_name.upper()
+                chunk_macro  = f"INFERENCE_{c_up}_CHUNK"
+                stride_macro = f"INFERENCE_{c_up}_CHUNK_STRIDE"
+                lines.append(
+                    f"#define {chunk_macro:<44} {sn.chunk_size}u"
+                    f"  /* shape={sn.output.shape}, outer_count={sn.outer_count} */"
+                )
+                lines.append(
+                    f"#define {stride_macro:<44} "
+                    f"INFERENCE_ALIGN_UP({chunk_macro})"
+                )
+            lines.append("")
+
         for t in inputs:
             macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
-            lines.append(f"#define {macro:<40} {t.numel}u  /* shape={t.shape} */")
+            if t.onnx_name in bcast_map:
+                n, _chunk_macro, stride_macro = bcast_map[t.onnx_name]
+                size_expr = f"({n}u * {stride_macro})"
+                lines.append(
+                    f"#define {macro:<40} {size_expr}"
+                    f"  /* shape={t.shape} */"
+                )
+            else:
+                lines.append(
+                    f"#define {macro:<40} {t.numel}u  /* shape={t.shape} */"
+                )
         for t in outputs:
             macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
-            lines.append(f"#define {macro:<40} {t.numel}u  /* shape={t.shape} */")
+            if t.onnx_name in bcast_map:
+                n, _chunk_macro, stride_macro = bcast_map[t.onnx_name]
+                size_expr = f"({n}u * {stride_macro})"
+                lines.append(
+                    f"#define {macro:<40} {size_expr}"
+                    f"  /* shape={t.shape} */"
+                )
+            else:
+                lines.append(
+                    f"#define {macro:<40} {t.numel}u  /* shape={t.shape} */"
+                )
 
         # DMA buffer pool size
         pool_bytes = self._compute_pool_bytes()
@@ -782,47 +963,104 @@ class CodeGenerator:
         )
 
     def _run_op_helper(self) -> str:
-        return (
-            _banner("run_op() — configure and execute one VectorOPKernel call") +
-            "/*\n"
-            " * run_op() — program AXI-Lite registers with physical addresses,\n"
-            " *             maintain cache coherence, start the kernel, and poll.\n"
-            " *\n"
-            " * The kernel's AXI master reads/writes DDR using PHYSICAL addresses;\n"
-            " * inference_buf_phys() provides the address to program into the registers.\n"
-            " * inference_buf_ptr() provides the virtual address for CPU cache ops.\n"
-            " *\n"
-            " *   a     input buffer A  (always required)\n"
-            " *   b     input buffer B  (NULL for unary ops: RELU, RELU6)\n"
-            " *   c     output buffer C (must not alias a or b)\n"
-            " *   size  number of elements\n"
-            " *   op    VECTOROP_* constant\n"
-            " */\n"
-            "static void run_op(\n"
-            "    inference_buf_t *a,\n"
-            "    inference_buf_t *b,\n"
-            "    inference_buf_t *c,\n"
-            "    unsigned         size,\n"
-            "    unsigned         op)\n"
-            "{\n"
-            "    XVectoropkernel_Set_a(&s_kernel, inference_buf_phys(a));\n"
-            "    XVectoropkernel_Set_b(&s_kernel, b ? inference_buf_phys(b) : (u64)0);\n"
-            "    XVectoropkernel_Set_c(&s_kernel, inference_buf_phys(c));\n"
-            "    XVectoropkernel_Set_size(&s_kernel, size);\n"
-            "    XVectoropkernel_Set_op(&s_kernel, op);\n"
-            "\n"
-            "    /* Sync inputs: flush CPU cache / XRT BO to device before AXI master reads */\n"
-            "    inference_buf_sync_to_device(a);\n"
-            "    if (b != NULL)\n"
-            "        inference_buf_sync_to_device(b);\n"
-            "\n"
-            "    XVectoropkernel_Start(&s_kernel);\n"
-            "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
-            "\n"
-            "    /* Sync output: invalidate CPU cache / XRT BO from device after AXI master writes */\n"
-            "    inference_buf_sync_from_device(c);\n"
-            "}\n"
-        )
+        nodes          = self._graph.nodes
+        need_run_op    = any(sn.outer_count == 1 for sn in nodes)
+        need_run_op_at = any(sn.outer_count >  1 for sn in nodes)
+
+        if need_run_op and need_run_op_at:
+            title = "run_op() / run_op_at() — VectorOPKernel dispatch helpers"
+        elif need_run_op_at:
+            title = "run_op_at() — VectorOPKernel dispatch helper"
+        else:
+            title = "run_op() — VectorOPKernel dispatch helper"
+
+        parts = [_banner(title)]
+
+        if need_run_op:
+            parts.append(
+                "/*\n"
+                " * run_op() — program AXI-Lite registers with physical addresses,\n"
+                " *             maintain cache coherence, start the kernel, and poll.\n"
+                " *\n"
+                " * The kernel's AXI master reads/writes DDR using PHYSICAL addresses;\n"
+                " * inference_buf_phys() provides the address to program into the registers.\n"
+                " * inference_buf_ptr() provides the virtual address for CPU cache ops.\n"
+                " *\n"
+                " *   a     input buffer A  (always required)\n"
+                " *   b     input buffer B  (NULL for unary ops: RELU, RELU6)\n"
+                " *   c     output buffer C (must not alias a or b)\n"
+                " *   size  number of elements\n"
+                " *   op    VECTOROP_* constant\n"
+                " */\n"
+                "static void run_op(\n"
+                "    inference_buf_t *a,\n"
+                "    inference_buf_t *b,\n"
+                "    inference_buf_t *c,\n"
+                "    unsigned         size,\n"
+                "    unsigned         op)\n"
+                "{\n"
+                "    XVectoropkernel_Set_a(&s_kernel, inference_buf_phys(a));\n"
+                "    XVectoropkernel_Set_b(&s_kernel, b ? inference_buf_phys(b) : (u64)0);\n"
+                "    XVectoropkernel_Set_c(&s_kernel, inference_buf_phys(c));\n"
+                "    XVectoropkernel_Set_size(&s_kernel, size);\n"
+                "    XVectoropkernel_Set_op(&s_kernel, op);\n"
+                "\n"
+                "    /* Sync inputs: flush CPU cache / XRT BO to device before AXI master reads */\n"
+                "    inference_buf_sync_to_device(a);\n"
+                "    if (b != NULL)\n"
+                "        inference_buf_sync_to_device(b);\n"
+                "\n"
+                "    XVectoropkernel_Start(&s_kernel);\n"
+                "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
+                "\n"
+                "    /* Sync output: invalidate CPU cache / XRT BO from device after AXI master writes */\n"
+                "    inference_buf_sync_from_device(c);\n"
+                "}\n"
+            )
+
+        if need_run_op_at:
+            parts.append(
+                "/*\n"
+                " * run_op_at() — offset-based dispatch for broadcasting loops.\n"
+                " *\n"
+                " * Same as run_op() but adds element offsets to the physical addresses\n"
+                " * so each loop iteration targets a different chunk of the buffers.\n"
+                " * Cache sync is the CALLER'S responsibility (done once per loop, not\n"
+                " * per iteration).\n"
+                " *\n"
+                " * Offsets are in elements; converted to bytes using\n"
+                " * INFERENCE_BYTES_PER_ELEM so the arithmetic is correct regardless\n"
+                " * of the element data type.\n"
+                " *\n"
+                " *   a / b / c   buffer pointers (b may be NULL for unary ops)\n"
+                " *   a_off / b_off / c_off   element offset into each buffer\n"
+                " *   size        elements to process in this invocation\n"
+                " *   op          VECTOROP_* constant\n"
+                " */\n"
+                "static void run_op_at(\n"
+                "    inference_buf_t *a, unsigned a_off,\n"
+                "    inference_buf_t *b, unsigned b_off,\n"
+                "    inference_buf_t *c, unsigned c_off,\n"
+                "    unsigned size, unsigned op)\n"
+                "{\n"
+                "    XVectoropkernel_Set_a(&s_kernel,\n"
+                "        inference_buf_phys(a)"
+                " + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM);\n"
+                "    XVectoropkernel_Set_b(&s_kernel,\n"
+                "        b ? inference_buf_phys(b)"
+                " + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM\n"
+                "          : (uint64_t)0);\n"
+                "    XVectoropkernel_Set_c(&s_kernel,\n"
+                "        inference_buf_phys(c)"
+                " + (uint64_t)c_off * INFERENCE_BYTES_PER_ELEM);\n"
+                "    XVectoropkernel_Set_size(&s_kernel, size);\n"
+                "    XVectoropkernel_Set_op(&s_kernel, op);\n"
+                "    XVectoropkernel_Start(&s_kernel);\n"
+                "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
+                "}\n"
+            )
+
+        return "".join(parts)
 
     def _load_weight_helper(self) -> str:
         """
@@ -886,13 +1124,16 @@ class CodeGenerator:
                 "    /* Allocate DMA buffers for weights */"
             )
             for t in weights:
+                alloc_size = self._alloc_sizes[t.onnx_name]
                 alloc_lines.append(
-                    f"    {t.c_name} = inference_buf_alloc({t.numel}u);"
+                    f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
                 )
                 alloc_lines.append(
                     f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
                 )
                 if t.onnx_name in external:
+                    # Large weight: load data (t.numel elements) into the
+                    # buffer (alloc_size elements, may be larger due to padding)
                     alloc_lines.append(
                         f"    if (_load_weight({t.c_name},"
                         f" \"{t.c_name}\", {t.numel}u) != 0) {{ rc = -1; goto fail; }}"
@@ -907,8 +1148,9 @@ class CodeGenerator:
         if intermediates:
             alloc_lines.append("    /* Allocate intermediate buffers */")
             for t in intermediates:
+                alloc_size = self._alloc_sizes[t.onnx_name]
                 alloc_lines.append(
-                    f"    {t.c_name} = inference_buf_alloc({t.numel}u);"
+                    f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
                 )
                 alloc_lines.append(
                     f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"

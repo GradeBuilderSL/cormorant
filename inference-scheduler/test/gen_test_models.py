@@ -18,6 +18,8 @@ Models produced:
   sub_bias.onnx             single Sub with a constant offset: X - mean -> Y
   div_scale.onnx            single Div with a constant scale: X / std -> Y
   normalize.onnx            Sub then Div: (X - mean) / std -> Y  (mean/std normalisation)
+  broadcast_aligned.onnx    X[8,16] + bias[16] -> Y[8,16]  (chunk=16 elems, naturally aligned)
+  broadcast_unaligned.onnx  X[4,6]  + bias[6]  -> Y[4,6]   (chunk=6 elems, needs padding to 8)
   unsupported.onnx          Conv node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
@@ -552,7 +554,70 @@ def make_normalize(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 16: unsupported op (Conv)                                    #
+# Model 16: broadcasting — chunk naturally 16-byte aligned           #
+#   X[8, 16] + bias[16] -> Y[8, 16]                                  #
+#   chunk = 16 elements × 2 bytes = 32 bytes (multiple of 16 → no gap)
+# ------------------------------------------------------------------ #
+
+def make_broadcast_aligned(out_dir: str) -> None:
+    """
+    Bias [16] broadcasts over the leading dimension of X [8, 16].
+    chunk_size = 16 elements; with 2-byte elements chunk_bytes = 32,
+    which is a multiple of INFERENCE_ALIGN_BYTES (16) so aligned_chunk == chunk.
+    outer_count = 8.
+    """
+    ROWS, COLS = 8, 16
+    bias = np.ones(COLS, dtype=np.float32) * 0.5
+
+    X = _float32("X", [ROWS, COLS])
+    Y = _float32("Y", [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Add", ["X", "bias"], ["Y"])],
+        name="broadcast_aligned",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_aligned.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 17: broadcasting — chunk NOT 16-byte aligned (needs padding) #
+#   X[4, 6] + bias[6] -> Y[4, 6]                                     #
+#   chunk = 6 elements × 2 bytes = 12 bytes → padded to 8 elems (16 B)
+# ------------------------------------------------------------------ #
+
+def make_broadcast_unaligned(out_dir: str) -> None:
+    """
+    Bias [6] broadcasts over the leading dimension of X [4, 6].
+    chunk_size = 6 elements; with 2-byte elements chunk_bytes = 12,
+    NOT a multiple of INFERENCE_ALIGN_BYTES (16), so aligned_chunk = 8
+    (gap of 2 unused elements per block).
+    outer_count = 4.
+    """
+    ROWS, COLS = 4, 6
+    bias = np.ones(COLS, dtype=np.float32) * 0.25
+
+    X = _float32("X", [ROWS, COLS])
+    Y = _float32("Y", [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Add", ["X", "bias"], ["Y"])],
+        name="broadcast_unaligned",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_unaligned.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 18: unsupported op (Conv)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
@@ -613,6 +678,8 @@ def main():
     make_sub_bias(args.out_dir)
     make_div_scale(args.out_dir)
     make_normalize(args.out_dir)
+    make_broadcast_aligned(args.out_dir)
+    make_broadcast_unaligned(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 
