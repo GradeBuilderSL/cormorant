@@ -1,0 +1,12 @@
+"""C code generator package for the inference scheduler."""
+
+from ._core     import _CoreMixin
+from ._header   import _HeaderMixin
+from ._source   import _SourceMixin
+from ._buf_impl import _BufImplMixin
+from ._test     import _TestMixin
+from ._cmake    import _CmakeMixin
+
+
+class CodeGenerator(_HeaderMixin, _SourceMixin, _BufImplMixin, _TestMixin, _CmakeMixin, _CoreMixin):
+    """C code generator for the inference scheduler.  See _core.py for __init__."""
