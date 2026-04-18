@@ -1088,16 +1088,6 @@ void inference_buf_read_float(const inference_buf_t *buf,
 #include <stdio.h>
 #include <xrt.h>
 
-/* XRT verbosity level 0 = quiet */
-#ifndef XCL_QUIET
-#  define XCL_QUIET 0
-#endif
-
-/* Sentinel for a failed xclAllocBO — same as XRT's NULLBO */
-#ifndef NULLBO
-#  define NULLBO ((unsigned)(-1))
-#endif
-
 static xclDeviceHandle s_xrt_dev = NULL;
 
 int inference_buf_pool_init(void)
@@ -1166,6 +1156,7 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
 void inference_buf_free(inference_buf_t *buf)
 {
     if (buf) {
+        xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
         xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
         free(buf);
     }
