@@ -85,9 +85,10 @@ _ONNX_OP_MAP = {
 # _ALIGN_ELEMS is derived and must not be hardcoded elsewhere.       #
 # ------------------------------------------------------------------ #
 
-_ALIGN_BYTES    = 16   # AXI burst alignment requirement (hardware-fixed)
-_BYTES_PER_ELEM = 2    # must match INFERENCE_BYTES_PER_ELEM in inference.h
-_ALIGN_ELEMS    = _ALIGN_BYTES // _BYTES_PER_ELEM   # derived; never hardcode this
+_ALIGN_BYTES = 16   # AXI burst alignment requirement (hardware-fixed)
+# _BYTES_PER_ELEM and _ALIGN_ELEMS are data-type-dependent.
+# They are injected per-node via ScheduledNode.from_onnx_node(align_elems=...)
+# rather than kept as module-level constants.
 
 
 # ------------------------------------------------------------------ #
@@ -114,7 +115,7 @@ def _get_clip_bounds(node: onnx.NodeProto) -> Tuple[Optional[float], Optional[fl
 # ------------------------------------------------------------------ #
 
 def _broadcast_info(
-    t: TensorInfo, output: TensorInfo
+    t: TensorInfo, output: TensorInfo, align_elems: int = 8
 ) -> Tuple[int, int, int, bool]:
     """
     Compute how tensor *t* broadcasts to *output*.
@@ -124,7 +125,7 @@ def _broadcast_info(
       outer_count         Number of loop iterations.  1 = no broadcast
                           (t covers the whole output in one call).
       chunk_size          t.numel — data elements in one chunk.
-      aligned_chunk_size  chunk_size rounded up to _ALIGN_ELEMS so every
+      aligned_chunk_size  chunk_size rounded up to align_elems so every
                           loop iteration starts at an INFERENCE_ALIGN_BYTES-
                           aligned physical address.  May be > chunk_size,
                           producing gap elements between data blocks.
@@ -179,10 +180,10 @@ def _broadcast_info(
                 f"dimension {td} does not match output dimension {od} and is not 1."
             )
 
-    # Round chunk up to _ALIGN_ELEMS so each iteration's physical start address
+    # Round chunk up to align_elems so each iteration's physical start address
     # is INFERENCE_ALIGN_BYTES-aligned.  The extra elements are gap/padding and
     # are never read or written by VectorOPKernel.
-    aligned_chunk_size = (chunk_size + _ALIGN_ELEMS - 1) & ~(_ALIGN_ELEMS - 1)
+    aligned_chunk_size = (chunk_size + align_elems - 1) & ~(align_elems - 1)
 
     return (outer_count, chunk_size, aligned_chunk_size, False)
 
@@ -195,12 +196,13 @@ def _broadcast_info(
 class ScheduledNode:
     """One ONNX operator mapped to one or more VectorOPKernel invocations."""
 
-    onnx_node:  onnx.NodeProto
-    op_code:    int                   # OP_ADD … OP_RELU6
-    arity:      int                   # 1 = unary, 2 = binary
-    inputs:     List[TensorInfo]      # resolved input tensors
-    output:     TensorInfo            # single output tensor
-    index:      int = 0               # sequential index in graph
+    onnx_node:   onnx.NodeProto
+    op_code:     int                   # OP_ADD … OP_RELU6
+    arity:       int                   # 1 = unary, 2 = binary
+    inputs:      List[TensorInfo]      # resolved input tensors
+    output:      TensorInfo            # single output tensor
+    index:       int = 0               # sequential index in graph
+    align_elems: int = 8               # elements per AXI alignment boundary
 
     # ------------------------------------------------------------------ #
     # Broadcast fields — populated by validate()                          #
@@ -222,9 +224,10 @@ class ScheduledNode:
     @classmethod
     def from_onnx_node(
         cls,
-        node:    onnx.NodeProto,
-        tensors: dict,           # name → TensorInfo
-        index:   int,
+        node:        onnx.NodeProto,
+        tensors:     dict,           # name → TensorInfo
+        index:       int,
+        align_elems: int = 8,
     ) -> "ScheduledNode":
         op_type = node.op_type
 
@@ -269,6 +272,7 @@ class ScheduledNode:
             inputs=inputs,
             output=output,
             index=index,
+            align_elems=align_elems,
         )
         sn.validate()
         return sn
@@ -332,8 +336,9 @@ class ScheduledNode:
 
         else:
             # Binary ops: check each input for trailing-contiguous broadcast.
-            a_outer, _, _, a_advances = _broadcast_info(self.inputs[0], self.output)
-            b_outer, _, _, b_advances = _broadcast_info(self.inputs[1], self.output)
+            ae = self.align_elems
+            a_outer, _, _, a_advances = _broadcast_info(self.inputs[0], self.output, ae)
+            b_outer, _, _, b_advances = _broadcast_info(self.inputs[1], self.output, ae)
 
             if not a_advances and not b_advances:
                 raise SchedulerError(
@@ -345,7 +350,7 @@ class ScheduledNode:
             outer_count = max(a_outer, b_outer)
             chunk_size  = self.output.numel // outer_count
             aligned_chunk_size = (
-                (chunk_size + _ALIGN_ELEMS - 1) & ~(_ALIGN_ELEMS - 1)
+                (chunk_size + ae - 1) & ~(ae - 1)
             )
 
             self.outer_count        = outer_count

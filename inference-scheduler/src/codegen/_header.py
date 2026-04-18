@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..nodes  import _ALIGN_BYTES, _BYTES_PER_ELEM, _ALIGN_ELEMS
+from ..nodes  import _ALIGN_BYTES
 from ._banners import _banner
 
 
@@ -37,12 +37,11 @@ class _HeaderMixin:
         inputs  = graph.input_tensors
         outputs = graph.output_tensors
 
+        dtype = self._dtype
         lines = [_banner("Data type")]
-        lines.append(
-            "/* ap_fixed<16,8>: 16-bit two's-complement, value = (int16_t)bits / 256.0 */"
-        )
-        lines.append("typedef uint16_t Data_t;")
-        lines.append(f"#define INFERENCE_BYTES_PER_ELEM  {_BYTES_PER_ELEM}u")
+        lines.append(dtype.c_typedef_comment())
+        lines.append(f"typedef {dtype.c_type} Data_t;")
+        lines.append(f"#define INFERENCE_BYTES_PER_ELEM  {dtype.bytes_per_elem}u")
         lines.append("")
         lines.append(
             "/* AXI burst alignment — every broadcast chunk stride is a multiple\n"

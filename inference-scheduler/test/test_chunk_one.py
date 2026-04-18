@@ -6,7 +6,6 @@ import unittest
 from helpers import _model, _models_exist
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
-from src.nodes   import _ALIGN_ELEMS
 
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -38,10 +37,9 @@ class TestChunkOne(unittest.TestCase):
         self.assertEqual(g.nodes[0].chunk_size, 1)
 
     def test_aligned_chunk_equals_align_elems(self):
-        """aligned_chunk_size must round 1 up to _ALIGN_ELEMS (8)."""
+        """aligned_chunk_size must round 1 up to align_elems (8 for ap_fixed<16,8>)."""
         g, _ = self._gen()
         sn = g.nodes[0]
-        self.assertEqual(sn.aligned_chunk_size, _ALIGN_ELEMS)
         self.assertEqual(sn.aligned_chunk_size, 8)
 
     def test_gap_is_seven(self):

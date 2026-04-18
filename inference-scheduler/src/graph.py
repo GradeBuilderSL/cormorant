@@ -25,6 +25,7 @@ from onnx import shape_inference, TensorProto
 
 from .tensor import TensorInfo
 from .nodes  import ScheduledNode, SchedulerError
+from .dtype  import DataType, AP_FIXED_16_8
 
 
 # ------------------------------------------------------------------ #
@@ -71,9 +72,12 @@ def _shape_from_type_proto(tp: onnx.TypeProto) -> List[int]:
 class OnnxGraph:
     """Parsed, validated, and resolved ONNX computation graph."""
 
-    def __init__(self, model_path: str) -> None:
+    def __init__(self, model_path: str,
+                 dtype: DataType = None) -> None:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
+        _dtype      = dtype if dtype is not None else AP_FIXED_16_8
+        align_elems = _dtype.align_elems
 
         # Load and validate
         model = onnx.load(model_path)
@@ -157,7 +161,7 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         self._nodes: List[ScheduledNode] = []
         for idx, node in enumerate(graph.node):
-            sn = ScheduledNode.from_onnx_node(node, self._tensors, idx)
+            sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
 
     # ------------------------------------------------------------------ #

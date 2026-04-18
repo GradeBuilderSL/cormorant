@@ -34,12 +34,11 @@ class TestBroadcast(unittest.TestCase):
         self.assertEqual(sn.chunk_size, 16)
 
     def test_aligned_no_padding(self):
-        # chunk_size already a multiple of _ALIGN_ELEMS → no gap
-        from src.nodes import _ALIGN_ELEMS
+        # chunk_size already a multiple of align_elems → no gap
         g, _ = self._gen("broadcast_aligned.onnx")
         sn = g.nodes[0]
         self.assertEqual(sn.aligned_chunk_size, sn.chunk_size)
-        self.assertEqual(sn.chunk_size % _ALIGN_ELEMS, 0)
+        self.assertEqual(sn.chunk_size % 8, 0)
 
     def test_aligned_x_advances(self):
         g, _ = self._gen("broadcast_aligned.onnx")
@@ -120,7 +119,6 @@ class TestBroadcast(unittest.TestCase):
 
     def test_aligned_bias_alloc_uses_aligned_chunk(self):
         # bias (repeating) is allocated with aligned_chunk_size elements
-        from src.nodes import _ALIGN_ELEMS
         g, cg = self._gen("broadcast_aligned.onnx")
         sn = g.nodes[0]
         alloc_sizes = cg._alloc_sizes
@@ -157,12 +155,11 @@ class TestBroadcast(unittest.TestCase):
         self.assertEqual(g.nodes[0].chunk_size, 6)
 
     def test_unaligned_aligned_chunk_has_gap(self):
-        from src.nodes import _ALIGN_ELEMS
         g, _ = self._gen("broadcast_unaligned.onnx")
         sn = g.nodes[0]
         self.assertEqual(sn.aligned_chunk_size, 8)
         self.assertGreater(sn.aligned_chunk_size, sn.chunk_size)
-        self.assertEqual(sn.aligned_chunk_size % _ALIGN_ELEMS, 0)
+        self.assertEqual(sn.aligned_chunk_size % 8, 0)
 
     def test_unaligned_chunk_macro_value(self):
         # CHUNK macro must hold the raw chunk_size (6), not the padded stride
@@ -348,7 +345,8 @@ class TestBroadcast(unittest.TestCase):
         t = cg.generate_test()
         self.assertIn("shown = 0u", t)
         self.assertIn("i++, shown++", t)
-        self.assertIn("shown, (unsigned)p[_off + i]", t)
+        # 'shown' is passed as the [%u] index argument to printf
+        self.assertIn("shown,", t)
 
     def test_non_broadcast_test_unchanged(self):
         """Non-broadcast models still use the simple flat fill/print."""

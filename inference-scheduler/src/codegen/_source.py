@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes  import OP_NAMES, _ALIGN_BYTES, _BYTES_PER_ELEM, _ALIGN_ELEMS
+from ..nodes  import OP_NAMES, _ALIGN_BYTES
 from ..tensor import LARGE_WEIGHT_THRESHOLD
 from ._banners import _banner, _file_banner
 
@@ -68,9 +68,9 @@ class _SourceMixin:
                 parts.append(t.emit_large_weight_ptr_decl())
             elif t.onnx_name in strided:
                 outer_count, aligned_chunk = strided[t.onnx_name]
-                parts.append(t.emit_weight_decl_strided(outer_count, aligned_chunk))
+                parts.append(t.emit_weight_decl_strided(outer_count, aligned_chunk, self._dtype))
             else:
-                parts.append(t.emit_weight_decl())
+                parts.append(t.emit_weight_decl(self._dtype))
             parts.append("")
         return "\n".join(parts)
 

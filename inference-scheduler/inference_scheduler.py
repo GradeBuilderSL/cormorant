@@ -39,10 +39,11 @@ import sys
 # Allow running from the project root without installing the package
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.graph   import OnnxGraph
-from src.codegen import CodeGenerator
-from src.nodes   import SchedulerError
-from src.tensor  import LARGE_WEIGHT_THRESHOLD
+from src.graph            import OnnxGraph
+from src.codegen          import CodeGenerator
+from src.codegen._simulate import LARGE_EXPECTED_THRESHOLD
+from src.nodes            import SchedulerError
+from src.tensor           import LARGE_WEIGHT_THRESHOLD
 
 
 # All five driver files — CMakeLists.txt selects sinit.c or linux.c at
@@ -125,6 +126,17 @@ def parse_args(argv=None):
             f"Produces a larger but fully self-contained C file."
         ),
     )
+    p.add_argument(
+        "--embed-large-expected",
+        action="store_true",
+        default=False,
+        help=(
+            f"Embed all GT expected arrays as C arrays in test_inference.c, even "
+            f"those exceeding the {LARGE_EXPECTED_THRESHOLD}-element threshold that "
+            f"would normally be written to external expected/*.dat files. "
+            f"Produces a larger but fully self-contained test file."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -202,7 +214,8 @@ def main(argv=None):
     # ---------------------------------------------------------------- #
     try:
         gen        = CodeGenerator(graph=graph, model_path=args.model,
-                                   embed_large_weights=args.embed_large_weights)
+                                   embed_large_weights=args.embed_large_weights,
+                                   embed_large_expected=args.embed_large_expected)
         header     = gen.generate_header()
         source     = gen.generate_source()
         buf_impl   = gen.generate_buf_impl()
@@ -236,6 +249,20 @@ def main(argv=None):
                 f.write(gen.generate_weight_dat(t))
         print(f"Weights    : {len(large_weights)} large weight(s) written to"
               f" {weights_dir}/", file=sys.stderr)
+
+    # ---------------------------------------------------------------- #
+    # 5c. External expected GT .dat files (large outputs)               #
+    # ---------------------------------------------------------------- #
+    large_expected = gen.large_expected_tensors
+    if large_expected:
+        expected_dir = os.path.join(out_dir, "expected")
+        os.makedirs(expected_dir, exist_ok=True)
+        for t in large_expected:
+            dat_path = os.path.join(expected_dir, f"{t.c_name}.dat")
+            with open(dat_path, "wb") as f:
+                f.write(gen.generate_expected_dat(t))
+        print(f"Expected   : {len(large_expected)} large GT array(s) written to"
+              f" {expected_dir}/", file=sys.stderr)
 
     # ---------------------------------------------------------------- #
     # 6. Driver sources                                                 #
@@ -282,6 +309,8 @@ def main(argv=None):
     ]
     if large_weights:
         report_items.append("weights/")
+    if large_expected:
+        report_items.append("expected/")
     for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)
 

@@ -1,0 +1,345 @@
+"""
+Data-type abstraction for the inference scheduler.
+
+A DataType object captures everything the Python code generator and simulator
+need to know about the element type used in DMA buffers:
+
+  - How many bytes each element occupies and the derived AXI alignment
+  - How to quantize float64 simulation values to the nearest representable value
+  - How the C test harness fills ramp inputs (matching the C cast semantics)
+  - How to encode float64 values back into the raw storage dtype (for expected
+    arrays embedded in test_inference.c, and for external .dat weight files)
+  - What C type declarations and display expressions to emit
+
+Supported types
+---------------
+  AP_FIXED_16_8   ap_fixed<16,8>   — 16-bit signed fixed-point, 8 fractional bits
+  FLOAT32         float            — IEEE 754 single precision
+
+Adding a new type
+-----------------
+Subclass DataType and implement the abstract methods.  Then pass the instance
+to OnnxGraph and CodeGenerator:
+
+    g  = OnnxGraph("model.onnx", dtype=MY_DTYPE)
+    cg = CodeGenerator(g, "model.onnx", dtype=MY_DTYPE)
+"""
+
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import List
+import numpy as np
+
+# AXI burst-alignment requirement: every broadcast-chunk start address must be
+# a multiple of this many bytes.  Hardware-fixed; does not change with dtype.
+ALIGN_BYTES: int = 16
+
+
+class DataType(ABC):
+    """Abstract base for element data types used in inference buffers."""
+
+    # ------------------------------------------------------------------ #
+    # Properties every subclass must expose                                #
+    # ------------------------------------------------------------------ #
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable name, e.g. 'ap_fixed<16,8>'."""
+
+    @property
+    @abstractmethod
+    def bytes_per_elem(self) -> int:
+        """Bytes per element in DMA buffers."""
+
+    @property
+    @abstractmethod
+    def c_type(self) -> str:
+        """C typedef target, e.g. 'uint16_t' or 'float'."""
+
+    @property
+    @abstractmethod
+    def c_array_type(self) -> str:
+        """C type for static ROM / expected arrays, e.g. 'uint16_t' or 'float'."""
+
+    @property
+    @abstractmethod
+    def np_storage(self) -> np.dtype:
+        """Numpy dtype for raw DMA buffer contents."""
+
+    @property
+    def align_elems(self) -> int:
+        """Number of elements per AXI alignment boundary (ALIGN_BYTES / bytes_per_elem)."""
+        return ALIGN_BYTES // self.bytes_per_elem
+
+    # ------------------------------------------------------------------ #
+    # Simulation operations                                                #
+    # ------------------------------------------------------------------ #
+
+    @abstractmethod
+    def quantize(self, x: np.ndarray) -> np.ndarray:
+        """
+        Round float64 array x to the nearest value representable in this
+        type (saturation + rounding).  Returns float64.
+
+        For fixed-point types this clips to [min, max] and rounds to the
+        fractional grid.  For floating-point types this is typically a
+        no-op (or a float32 round-trip to match hardware precision).
+        """
+
+    @abstractmethod
+    def ramp_to_float(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Convert int64 DMA buffer positions to float64 values, matching
+        the pattern written by the C test harness:
+
+            p[pos] = (Data_t)(pos & mask);
+
+        where mask depends on the storage width.  Returns float64.
+        """
+
+    @abstractmethod
+    def float_to_storage(self, x: np.ndarray) -> np.ndarray:
+        """
+        Encode float64 values to the raw storage dtype (np_storage), applying
+        saturation/rounding as needed.  Returns an array with
+        dtype == self.np_storage.
+        """
+
+    # ------------------------------------------------------------------ #
+    # Weight encoding                                                      #
+    # ------------------------------------------------------------------ #
+
+    def encode_weight(self, data: np.ndarray) -> List[str]:
+        """
+        Encode a weight array as a list of C literal strings suitable for
+        embedding in a static ROM array.  The order matches data.flatten().
+
+        Example (ap_fixed<16,8>):  ["0x0100", "0x0080", ...]
+        Example (float32):         ["0.25000000f", "0.50000000f", ...]
+        """
+        storage = self.float_to_storage(data.flatten().astype(np.float64))
+        return [self.format_literal(v) for v in storage]
+
+    @abstractmethod
+    def dat_bytes(self, data: np.ndarray) -> bytes:
+        """
+        Serialise a weight array to raw little-endian bytes for external
+        .dat files.  Loaded at runtime via fread() into a DMA buffer.
+        """
+
+    # ------------------------------------------------------------------ #
+    # Code-generation helpers                                              #
+    # ------------------------------------------------------------------ #
+
+    @abstractmethod
+    def c_display(self, ptr: str, idx: str) -> str:
+        """
+        C expression that evaluates to a double suitable for printf("%.4f").
+
+        Examples:
+          ap_fixed<16,8>  →  "(double)(int16_t)ptr[idx] / 256.0"
+          float32         →  "(double)ptr[idx]"
+        """
+
+    @abstractmethod
+    def c_fill_rhs(self, pos_expr: str) -> str:
+        """
+        Right-hand side of the C ramp-fill assignment:
+
+            p[pos] = <c_fill_rhs(pos_expr)>;
+
+        Examples:
+          ap_fixed<16,8>  →  "(Data_t)(pos & 0xFFFFu)  /* pos/256.0 */"
+          float32         →  "(Data_t)(pos & 0xFFFFu)"
+        """
+
+    def format_literal(self, storage_val) -> str:
+        """
+        Format a single storage value as a C array literal string.
+        Default: hex for integer storage types.
+        """
+        nbytes = self.bytes_per_elem
+        width  = nbytes * 2   # hex digits
+        return f"0x{int(storage_val) & ((1 << nbytes * 8) - 1):0{width}X}"
+
+    def c_typedef_comment(self) -> str:
+        """One-line comment for the Data_t typedef in the generated header."""
+        return f"/* {self.name} */"
+
+
+# ------------------------------------------------------------------ #
+# ap_fixed<W, I>                                                      #
+# ------------------------------------------------------------------ #
+
+class ApFixed(DataType):
+    """
+    ap_fixed<W, I> — Xilinx HLS arbitrary-precision signed fixed-point.
+
+    W  total bits (must be 8, 16, or 32)
+    I  integer bits, including sign bit; fractional bits F = W - I
+
+    Representable range : [-2^(I-1),  2^(I-1) - 2^(-F)]
+    Quantization step   : 2^(-F) = 1 / 2^F
+
+    Storage format in DMA buffers: W-bit two's-complement integer
+    (same as C ap_fixed<W,I> in-memory layout).
+    """
+
+    _SUPPORTED_WIDTHS = {8: np.uint8, 16: np.uint16, 32: np.uint32}
+    _SIGNED_NP        = {8: np.int8,  16: np.int16,  32: np.int32}
+    _C_TYPES          = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t"}
+
+    def __init__(self, W: int, I: int) -> None:
+        if W not in self._SUPPORTED_WIDTHS:
+            raise ValueError(f"ApFixed: W={W} not supported; choose from {sorted(self._SUPPORTED_WIDTHS)}")
+        if I < 1 or I >= W:
+            raise ValueError(f"ApFixed: I={I} out of range for W={W}; need 1 <= I < W")
+        self._W = W
+        self._I = I
+        self._F = W - I
+        self._scale   = float(1 << self._F)   # 2^F
+        self._min_val = -float(1 << (I - 1))
+        self._max_val =  float((1 << (I - 1))) - 1.0 / self._scale
+        self._mask    = (1 << W) - 1           # e.g. 0xFFFF for W=16
+        self._np_uint = self._SUPPORTED_WIDTHS[W]
+        self._np_int  = self._SIGNED_NP[W]
+
+    # Properties
+    @property
+    def name(self) -> str:
+        return f"ap_fixed<{self._W},{self._I}>"
+
+    @property
+    def bytes_per_elem(self) -> int:
+        return self._W // 8
+
+    @property
+    def c_type(self) -> str:
+        return self._C_TYPES[self._W]
+
+    @property
+    def c_array_type(self) -> str:
+        return self._C_TYPES[self._W]
+
+    @property
+    def np_storage(self) -> np.dtype:
+        return self._np_uint
+
+    # Simulation
+    def quantize(self, x: np.ndarray) -> np.ndarray:
+        clipped = np.clip(x.astype(np.float64), self._min_val, self._max_val)
+        return np.round(clipped * self._scale) / self._scale
+
+    def ramp_to_float(self, positions: np.ndarray) -> np.ndarray:
+        # p[pos] = (Data_t)(pos & mask)  →  interpret bit pattern as signed int
+        uint_vals = (positions & self._mask).astype(self._np_uint)
+        int_vals  = uint_vals.view(self._np_int)
+        return int_vals.astype(np.float64) / self._scale
+
+    def float_to_storage(self, x: np.ndarray) -> np.ndarray:
+        # Clip before rounding so out-of-range weight values saturate correctly.
+        clipped  = np.clip(x.astype(np.float64), self._min_val, self._max_val)
+        int_vals = np.round(clipped * self._scale).astype(self._np_int)
+        return int_vals.view(self._np_uint)
+
+    def dat_bytes(self, data: np.ndarray) -> bytes:
+        storage = self.float_to_storage(data.flatten().astype(np.float64))
+        # Force little-endian for cross-platform .dat files
+        return storage.astype(storage.dtype.newbyteorder('<')).tobytes()
+
+    # Code generation
+    def c_display(self, ptr: str, idx: str) -> str:
+        int_t = f"int{self._W}_t"
+        scale = f"{self._scale:.1f}"
+        return f"(double)({int_t}){ptr}[{idx}] / {scale}"
+
+    def c_fill_rhs(self, pos_expr: str) -> str:
+        mask  = f"0x{self._mask:0{self._W // 4}X}u"
+        scale = f"{self._scale:.1f}"
+        return f"(Data_t)({pos_expr} & {mask})  /* {pos_expr}/{scale} */"
+
+    def format_literal(self, storage_val: int) -> str:
+        width = self._W // 4   # hex digits
+        return f"0x{int(storage_val) & self._mask:0{width}X}"
+
+    def c_typedef_comment(self) -> str:
+        int_t = f"int{self._W}_t"
+        scale = f"{self._scale:.1f}"
+        return (
+            f"/* {self.name}: {self._W}-bit two's-complement,"
+            f" value = ({int_t})bits / {scale} */"
+        )
+
+
+# ------------------------------------------------------------------ #
+# float32                                                             #
+# ------------------------------------------------------------------ #
+
+class Float32(DataType):
+    """
+    IEEE 754 single-precision floating-point.
+
+    The test ramp fill uses the same (Data_t)(pos & 0xFFFFu) pattern as for
+    ap_fixed, but the C cast means the integer value 0..65535 is converted
+    to the float 0.0..65535.0 (not a fractional encoding).  The quantize
+    operation is a float32 round-trip (to match hardware float32 precision).
+    """
+
+    @property
+    def name(self) -> str:
+        return "float32"
+
+    @property
+    def bytes_per_elem(self) -> int:
+        return 4
+
+    @property
+    def c_type(self) -> str:
+        return "float"
+
+    @property
+    def c_array_type(self) -> str:
+        return "float"
+
+    @property
+    def np_storage(self) -> np.dtype:
+        return np.float32
+
+    def quantize(self, x: np.ndarray) -> np.ndarray:
+        # Round-trip through float32 to match hardware precision
+        return x.astype(np.float32).astype(np.float64)
+
+    def ramp_to_float(self, positions: np.ndarray) -> np.ndarray:
+        # (float)(pos & 0xFFFFu) → small non-negative integer
+        return (positions & 0xFFFF).astype(np.float64)
+
+    def float_to_storage(self, x: np.ndarray) -> np.ndarray:
+        return x.astype(np.float32)
+
+    def dat_bytes(self, data: np.ndarray) -> bytes:
+        storage = self.float_to_storage(data.flatten().astype(np.float64))
+        return storage.astype('<f4').tobytes()
+
+    def c_display(self, ptr: str, idx: str) -> str:
+        return f"(double){ptr}[{idx}]"
+
+    def c_fill_rhs(self, pos_expr: str) -> str:
+        return f"(Data_t)({pos_expr} & 0xFFFFu)"
+
+    def format_literal(self, storage_val: float) -> str:
+        return f"{float(storage_val):.8g}f"
+
+    def c_typedef_comment(self) -> str:
+        return "/* float32: IEEE 754 single precision */"
+
+
+# ------------------------------------------------------------------ #
+# Pre-built singletons                                                #
+# ------------------------------------------------------------------ #
+
+AP_FIXED_16_8: DataType = ApFixed(16, 8)
+"""Default element type — ap_fixed<16,8>, 2 bytes, scale 256."""
+
+FLOAT32: DataType = Float32()
+"""IEEE 754 single precision, 4 bytes."""

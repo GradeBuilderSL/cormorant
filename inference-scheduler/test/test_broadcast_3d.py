@@ -6,7 +6,6 @@ import unittest
 from helpers import _model, _models_exist
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
-from src.nodes   import _ALIGN_ELEMS
 
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -14,7 +13,7 @@ class TestBroadcast3D(unittest.TestCase):
     """
     Model: X[2,3,4] + bias[4] -> Y[2,3,4]
 
-    The trailing dimension is 4 (< _ALIGN_ELEMS=8) so aligned_chunk_size = 8.
+    The trailing dimension is 4 (< align_elems=8) so aligned_chunk_size = 8.
     outer_count = 2*3 = 6 — verifies that the scheduler correctly flattens
     all leading dimensions into the outer loop.
     """
@@ -42,10 +41,9 @@ class TestBroadcast3D(unittest.TestCase):
         self.assertEqual(g.nodes[0].chunk_size, 4)
 
     def test_aligned_chunk_is_align_elems(self):
-        """chunk=4 rounds up to _ALIGN_ELEMS=8."""
+        """chunk=4 rounds up to align_elems=8 (for ap_fixed<16,8>)."""
         g, _ = self._gen()
         sn = g.nodes[0]
-        self.assertEqual(sn.aligned_chunk_size, _ALIGN_ELEMS)
         self.assertEqual(sn.aligned_chunk_size, 8)
 
     # ---- alloc sizes ----------------------------------------------- #

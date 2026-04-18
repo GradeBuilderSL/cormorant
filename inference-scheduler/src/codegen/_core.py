@@ -39,11 +39,11 @@ registers; inference_buf_ptr() returns the virtual pointer for CPU access.
 
 from __future__ import annotations
 import os
-from typing import List
+from typing import List, Optional
 
 from ..graph  import OnnxGraph
 from ..tensor import TensorInfo, LARGE_WEIGHT_THRESHOLD
-from ..nodes  import _BYTES_PER_ELEM
+from ..dtype  import DataType, AP_FIXED_16_8
 from ._banners import _file_banner
 
 
@@ -51,10 +51,17 @@ class _CoreMixin:
     """Core state and shared helpers for CodeGenerator."""
 
     def __init__(self, graph: OnnxGraph, model_path: str,
-                 embed_large_weights: bool = False) -> None:
-        self._graph               = graph
-        self._model_path          = model_path
-        self._embed_large_weights = embed_large_weights
+                 embed_large_weights: bool = False,
+                 embed_large_expected: bool = False,
+                 dtype: Optional[DataType] = None) -> None:
+        self._graph                = graph
+        self._model_path           = model_path
+        self._embed_large_weights  = embed_large_weights
+        self._embed_large_expected = embed_large_expected
+        # Data type descriptor — controls encoding, quantization, and C type
+        # declarations.  Defaults to ap_fixed<16,8> (the standard KV260 type).
+        # Pass dtype=FLOAT32 (or any DataType subclass) for other types.
+        self._dtype               = dtype if dtype is not None else AP_FIXED_16_8
         # Precompute padded allocation sizes for all tensors (accounts for
         # broadcast alignment gaps).  Computed once; used by header, init,
         # and pool-size calculations.
@@ -176,15 +183,16 @@ class _CoreMixin:
 
         Covers: weight tensors + intermediate tensors + model inputs + outputs.
         Uses _alloc_sizes (which accounts for broadcast alignment padding) and
-        _BYTES_PER_ELEM so the result is correct regardless of the data type.
+        dtype.bytes_per_elem so the result is correct regardless of the data type.
         Used to size the u-dma-buf pool and advertised as
         INFERENCE_BUF_POOL_SIZE_BYTES in the generated header.
         """
         def _align64(n: int) -> int:
             return (n + 63) & ~63
 
+        bpe   = self._dtype.bytes_per_elem
         total = sum(
-            _align64(size * _BYTES_PER_ELEM)
+            _align64(size * bpe)
             for size in self._alloc_sizes.values()
         )
         page = 4096
@@ -201,10 +209,10 @@ class _CoreMixin:
     def generate_weight_dat(self, tensor: TensorInfo) -> bytes:
         """
         Return the raw binary content for weights/<c_name>.dat.
-        Little-endian uint16 values in the same ap_fixed<16,8> encoding
-        used by the C ROM arrays, suitable for fread() at runtime.
+        Encoded using the active dtype (little-endian), suitable for
+        fread() at runtime.
         """
-        return tensor.to_dat_bytes()
+        return tensor.to_dat_bytes(self._dtype)
 
     def _broadcast_io_map(self) -> dict:
         """

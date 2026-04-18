@@ -10,15 +10,11 @@ and knows how to emit:
 from __future__ import annotations
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 
-
-# ap_fixed<16,8> encoding: value v is stored as round(v * 2^8) in a
-# 16-bit two's-complement word.  Representable range: [-128, 127.99609375].
-_AP_FIXED_SCALE = 256.0          # 2^8
-_AP_FIXED_MIN   = -128.0
-_AP_FIXED_MAX   =  127.99609375  # 127 + 255/256
+if TYPE_CHECKING:
+    from .dtype import DataType
 
 
 def _sanitize_c_name(name: str) -> str:
@@ -31,21 +27,6 @@ def _sanitize_c_name(name: str) -> str:
     # Collapse runs of underscores for readability
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "tensor"
-
-
-def _float_to_apfixed_hex(arr: np.ndarray) -> List[str]:
-    """
-    Convert a numpy float array to a list of ap_fixed<16,8> hex literals.
-
-    The encoding is identical to how Xilinx HLS stores ap_fixed<16,8>
-    values in memory: each element is a 16-bit two's-complement integer
-    equal to round(v * 256), stored in little-endian order.
-    """
-    clipped = np.clip(arr.astype(np.float64), _AP_FIXED_MIN, _AP_FIXED_MAX)
-    scaled  = np.round(clipped * _AP_FIXED_SCALE).astype(np.int16)
-    # Reinterpret as uint16 for the hex display
-    bits    = scaled.view(np.uint16).flatten()
-    return [f"0x{v:04X}" for v in bits]
 
 
 # Weight tensors with more elements than this are written to external .dat
@@ -89,7 +70,7 @@ class TensorInfo:
     # Code emission                                                        #
     # ------------------------------------------------------------------ #
 
-    def emit_weight_decl(self) -> str:
+    def emit_weight_decl(self, dtype: "DataType") -> str:
         """
         Emit a ROM array (prefixed _rom_) plus a DMA buffer pointer initialised
         to NULL.  inference_init() allocates the DMA buffer and copies the ROM
@@ -104,21 +85,21 @@ class TensorInfo:
         if not self.is_weight:
             raise ValueError(f"Tensor '{self.onnx_name}' has no data")
 
-        hexvals = _float_to_apfixed_hex(self.data)
-        n       = len(hexvals)
+        literals = dtype.encode_weight(self.data)
+        n        = len(literals)
+        c_type   = dtype.c_array_type
 
         # Format 8 values per row for readability
         rows = []
         for i in range(0, n, 8):
-            chunk = hexvals[i:i+8]
-            rows.append("    " + ", ".join(chunk))
+            rows.append("    " + ", ".join(literals[i:i+8]))
         inner = ",\n".join(rows)
 
         return (
             f"/* ROM data for weight '{self.onnx_name}'"
             f"  shape={self.shape}  dtype={self.dtype}\n"
             f" * Copied into a DMA-capable buffer at inference_init(). */\n"
-            f"static const uint16_t _rom_{self.c_name}[{n}] = {{\n"
+            f"static const {c_type} _rom_{self.c_name}[{n}] = {{\n"
             f"{inner}\n"
             f"}};\n"
             f"/* DMA buffer pointer for '{self.onnx_name}' */\n"
@@ -127,7 +108,8 @@ class TensorInfo:
 
     def emit_weight_decl_strided(self,
                                  outer_count: int,
-                                 aligned_chunk_size: int) -> str:
+                                 aligned_chunk_size: int,
+                                 dtype: "DataType") -> str:
         """
         Emit a ROM array in strided layout for a weight that is used alongside
         a strided buffer in a non-broadcast run_op() call.
@@ -150,13 +132,15 @@ class TensorInfo:
         chunk_size = self.numel // outer_count
         gap        = aligned_chunk_size - chunk_size
         total      = outer_count * aligned_chunk_size
+        c_type     = dtype.c_array_type
 
-        hexvals = _float_to_apfixed_hex(self.data)
+        literals  = dtype.encode_weight(self.data)
+        zero_lit  = dtype.format_literal(0)
 
         padded: list = []
         for i in range(outer_count):
-            padded.extend(hexvals[i * chunk_size : (i + 1) * chunk_size])
-            padded.extend(["0x0000"] * gap)
+            padded.extend(literals[i * chunk_size : (i + 1) * chunk_size])
+            padded.extend([zero_lit] * gap)
 
         rows = []
         for i in range(0, len(padded), 8):
@@ -170,7 +154,7 @@ class TensorInfo:
             f" ({chunk_size} data + {gap} zero-pad per block).\n"
             f" * Co-input to a non-broadcast run_op() that processes a strided buffer;\n"
             f" * gap zeros ensure both operands are aligned at every block boundary. */\n"
-            f"static const uint16_t _rom_{self.c_name}[{total}] = {{\n"
+            f"static const {c_type} _rom_{self.c_name}[{total}] = {{\n"
             f"{inner}\n"
             f"}};\n"
             f"/* DMA buffer pointer for '{self.onnx_name}' */\n"
@@ -194,17 +178,15 @@ class TensorInfo:
             f"static inference_buf_t *{self.c_name} = NULL;"
         )
 
-    def to_dat_bytes(self) -> bytes:
+    def to_dat_bytes(self, dtype: "DataType") -> bytes:
         """
-        Serialise the weight tensor to raw little-endian uint16 bytes, identical
-        to the in-memory layout used by the C ROM arrays.  Written to
-        weights/<c_name>.dat by the scheduler and loaded at runtime by fread().
+        Serialise the weight tensor to raw little-endian bytes for external
+        .dat files.  Written to weights/<c_name>.dat by the scheduler and
+        loaded at runtime by fread().
         """
         if not self.is_weight:
             raise ValueError(f"Tensor '{self.onnx_name}' has no data")
-        clipped = np.clip(self.data.astype(np.float64), _AP_FIXED_MIN, _AP_FIXED_MAX)
-        scaled  = np.round(clipped * _AP_FIXED_SCALE).astype(np.int16)
-        return scaled.view(np.uint16).flatten().astype('<u2').tobytes()
+        return dtype.dat_bytes(self.data)
 
     def emit_buffer_decl(self) -> str:
         """

@@ -1,51 +1,44 @@
-"""Tests for ap_fixed<16,8> weight encoding (TestTensorEncoding)."""
+"""Tests for ap_fixed<16,8> weight encoding via DataType abstraction."""
 
 import os
 import sys
 import unittest
+import numpy as np
 
-from helpers import _model, _models_exist
+from src.dtype import AP_FIXED_16_8
 
 
 class TestTensorEncoding(unittest.TestCase):
-    """ap_fixed<16,8> weight encoding."""
+    """ap_fixed<16,8> weight encoding via AP_FIXED_16_8.encode_weight()."""
 
     def test_zero(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex
-        self.assertEqual(_float_to_apfixed_hex(np.array([0.0])), ["0x0000"])
+        self.assertEqual(AP_FIXED_16_8.encode_weight(np.array([0.0])), ["0x0000"])
 
     def test_one(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex
         # 1.0 * 256 = 256 = 0x0100
-        self.assertEqual(_float_to_apfixed_hex(np.array([1.0])), ["0x0100"])
+        self.assertEqual(AP_FIXED_16_8.encode_weight(np.array([1.0])), ["0x0100"])
 
     def test_minus_one(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex
         # -1.0 * 256 = -256 = 0xFF00 as uint16
-        self.assertEqual(_float_to_apfixed_hex(np.array([-1.0])), ["0xFF00"])
+        self.assertEqual(AP_FIXED_16_8.encode_weight(np.array([-1.0])), ["0xFF00"])
 
     def test_half(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex
         # 0.5 * 256 = 128 = 0x0080
-        self.assertEqual(_float_to_apfixed_hex(np.array([0.5])), ["0x0080"])
+        self.assertEqual(AP_FIXED_16_8.encode_weight(np.array([0.5])), ["0x0080"])
 
     def test_saturation_positive(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex, _AP_FIXED_MAX
-        hexvals  = _float_to_apfixed_hex(np.array([999.0]))
-        expected = _float_to_apfixed_hex(np.array([_AP_FIXED_MAX]))
-        self.assertEqual(hexvals, expected)
+        # Values above max saturate to the max representable value
+        max_val = 127.99609375   # ap_fixed<16,8> max: 127 + 255/256
+        encoded_saturated = AP_FIXED_16_8.encode_weight(np.array([999.0]))
+        encoded_max       = AP_FIXED_16_8.encode_weight(np.array([max_val]))
+        self.assertEqual(encoded_saturated, encoded_max)
 
     def test_saturation_negative(self):
-        import numpy as np
-        from src.tensor import _float_to_apfixed_hex, _AP_FIXED_MIN
-        hexvals  = _float_to_apfixed_hex(np.array([-999.0]))
-        expected = _float_to_apfixed_hex(np.array([_AP_FIXED_MIN]))
-        self.assertEqual(hexvals, expected)
+        # Values below min saturate to the min representable value
+        min_val = -128.0         # ap_fixed<16,8> min: -128
+        encoded_saturated = AP_FIXED_16_8.encode_weight(np.array([-999.0]))
+        encoded_min       = AP_FIXED_16_8.encode_weight(np.array([min_val]))
+        self.assertEqual(encoded_saturated, encoded_min)
 
 
 if __name__ == "__main__":
