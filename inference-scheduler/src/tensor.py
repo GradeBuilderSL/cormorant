@@ -48,6 +48,12 @@ def _float_to_apfixed_hex(arr: np.ndarray) -> List[str]:
     return [f"0x{v:04X}" for v in bits]
 
 
+# Weight tensors with more elements than this are written to external .dat
+# files and loaded at runtime via fread(), rather than embedded as C arrays.
+# 4096 elements = 8 KB in ap_fixed<16,8>; keeps generated C files small.
+LARGE_WEIGHT_THRESHOLD = 4096
+
+
 @dataclass
 class TensorInfo:
     onnx_name: str
@@ -73,6 +79,11 @@ class TensorInfo:
     @property
     def is_weight(self) -> bool:
         return self.data is not None
+
+    @property
+    def is_large_weight(self) -> bool:
+        """True when the weight should be stored in an external .dat file."""
+        return self.is_weight and self.numel > LARGE_WEIGHT_THRESHOLD
 
     # ------------------------------------------------------------------ #
     # Code emission                                                        #
@@ -113,6 +124,35 @@ class TensorInfo:
             f"/* DMA buffer pointer for '{self.onnx_name}' */\n"
             f"static inference_buf_t *{self.c_name} = NULL;"
         )
+
+    def emit_large_weight_ptr_decl(self) -> str:
+        """
+        For large weights: emit only the DMA buffer pointer (no ROM array).
+        The data is loaded at runtime from a .dat file.
+
+        Example:
+            /* External weight 'bias'  shape=[64,64,16,16]  numel=1048576
+             * Loaded at inference_init() from weights/bias.dat */
+            static inference_buf_t *bias = NULL;
+        """
+        return (
+            f"/* External weight '{self.onnx_name}'"
+            f"  shape={self.shape}  numel={self.numel}\n"
+            f" * Loaded at inference_init() from weights/{self.c_name}.dat */\n"
+            f"static inference_buf_t *{self.c_name} = NULL;"
+        )
+
+    def to_dat_bytes(self) -> bytes:
+        """
+        Serialise the weight tensor to raw little-endian uint16 bytes, identical
+        to the in-memory layout used by the C ROM arrays.  Written to
+        weights/<c_name>.dat by the scheduler and loaded at runtime by fread().
+        """
+        if not self.is_weight:
+            raise ValueError(f"Tensor '{self.onnx_name}' has no data")
+        clipped = np.clip(self.data.astype(np.float64), _AP_FIXED_MIN, _AP_FIXED_MAX)
+        scaled  = np.round(clipped * _AP_FIXED_SCALE).astype(np.int16)
+        return scaled.view(np.uint16).flatten().astype('<u2').tobytes()
 
     def emit_buffer_decl(self) -> str:
         """

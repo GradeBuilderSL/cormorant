@@ -13,6 +13,11 @@ Models produced:
   batch_relu.onnx           2D input [4, 64]: X+bias -> Relu -> Y  (batch of 4 rows)
   matrix_ops.onnx           2D input [8, 32]: A*B -> Relu6 -> Y  (two runtime inputs, matrix shape)
   large_tensor.onnx         4D input [64, 64, 16, 16] (1M elements): X+bias -> add_Y[out1] -> Relu -> Y[out2]
+  residual_add.onnx         minimal skip connection: Relu(X) -> relu_X, then X + relu_X -> Y
+  residual_chain.onnx       full residual block: X+bias -> Relu -> *scale -> result, then X+result -> Y
+  sub_bias.onnx             single Sub with a constant offset: X - mean -> Y
+  div_scale.onnx            single Div with a constant scale: X / std -> Y
+  normalize.onnx            Sub then Div: (X - mean) / std -> Y  (mean/std normalisation)
   unsupported.onnx          Conv node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
@@ -386,7 +391,168 @@ def make_large_tensor(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 11: unsupported op (Conv)                                    #
+# Model 11: minimal residual connection                              #
+#   Relu(X) -> relu_X                                                #
+#   X + relu_X -> Y          (skip: X bypasses the Relu branch)     #
+# ------------------------------------------------------------------ #
+
+def make_residual_add(out_dir: str) -> None:
+    """
+    Simplest residual block: one unary transform on the skip path,
+    then the input is added back.  X is used as input to two nodes:
+    the Relu and the final Add.
+    """
+    N = 128
+
+    X      = _float32("X",      [1, N])
+    relu_X = _float32("relu_X", [1, N])
+    Y      = _float32("Y",      [1, N])
+
+    relu_node = oh.make_node("Relu", inputs=["X"],          outputs=["relu_X"])
+    add_node  = oh.make_node("Add",  inputs=["relu_X", "X"], outputs=["Y"])
+
+    graph = oh.make_graph(
+        nodes=[relu_node, add_node],
+        name="residual_add",
+        inputs=[X],
+        outputs=[Y],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "residual_add.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 12: full residual block                                      #
+#   X + bias  -> add_X                                               #
+#   Relu(add_X) -> relu_X                                            #
+#   relu_X * scale -> mul_X                                          #
+#   X + mul_X -> Y           (skip: X bypasses the whole block)     #
+# ------------------------------------------------------------------ #
+
+def make_residual_chain(out_dir: str) -> None:
+    """
+    Residual block with bias shift, activation, and scaling on the
+    transform branch; the original X is added back at the end.
+    X is used as input to two nodes: the first Add and the last Add.
+    """
+    N     = 64
+    bias  = np.random.randn(1, N).astype(np.float32) * 0.1
+    scale = np.ones((1, N), dtype=np.float32) * 0.5
+
+    X     = _float32("X",     [1, N])
+    add_X = _float32("add_X", [1, N])
+    relu_X= _float32("relu_X",[1, N])
+    mul_X = _float32("mul_X", [1, N])
+    Y     = _float32("Y",     [1, N])
+
+    inits = [
+        _initializer("bias",  bias),
+        _initializer("scale", scale),
+    ]
+
+    nodes = [
+        oh.make_node("Add",  ["X",      "bias"],  ["add_X"]),
+        oh.make_node("Relu", ["add_X"],            ["relu_X"]),
+        oh.make_node("Mul",  ["relu_X", "scale"],  ["mul_X"]),
+        oh.make_node("Add",  ["X",      "mul_X"],  ["Y"]),
+    ]
+
+    graph = oh.make_graph(
+        nodes=nodes,
+        name="residual_chain",
+        inputs=[X],
+        outputs=[Y],
+        initializer=inits,
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "residual_chain.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 13: single Sub — X - mean -> Y                               #
+# ------------------------------------------------------------------ #
+
+def make_sub_bias(out_dir: str) -> None:
+    """Element-wise subtraction of a constant mean vector."""
+    N    = 256
+    mean = np.random.randn(1, N).astype(np.float32) * 0.1
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Sub", ["X", "mean"], ["Y"])],
+        name="sub_bias",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("mean", mean)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sub_bias.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 14: single Div — X / std -> Y                                #
+# ------------------------------------------------------------------ #
+
+def make_div_scale(out_dir: str) -> None:
+    """Element-wise division by a constant standard-deviation vector."""
+    N   = 256
+    std = np.abs(np.random.randn(1, N).astype(np.float32)) + 0.1  # keep > 0
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Div", ["X", "std"], ["Y"])],
+        name="div_scale",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("std", std)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "div_scale.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 15: Sub then Div — (X - mean) / std -> Y                    #
+#   Classic mean/std normalisation as a two-op chain.                #
+# ------------------------------------------------------------------ #
+
+def make_normalize(out_dir: str) -> None:
+    """Mean-centre then scale: two VectorOPKernel calls."""
+    N    = 256
+    mean = np.random.randn(1, N).astype(np.float32) * 0.1
+    std  = np.abs(np.random.randn(1, N).astype(np.float32)) + 0.1
+
+    X     = _float32("X",     [1, N])
+    sub_Y = _float32("sub_Y", [1, N])
+    Y     = _float32("Y",     [1, N])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Sub", ["X",     "mean"], ["sub_Y"]),
+            oh.make_node("Div", ["sub_Y", "std"],  ["Y"]),
+        ],
+        name="normalize",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("mean", mean),
+            _initializer("std",  std),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "normalize.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 16: unsupported op (Conv)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
@@ -442,6 +608,11 @@ def main():
     make_batch_relu(args.out_dir)
     make_matrix_ops(args.out_dir)
     make_large_tensor(args.out_dir)
+    make_residual_add(args.out_dir)
+    make_residual_chain(args.out_dir)
+    make_sub_bias(args.out_dir)
+    make_div_scale(args.out_dir)
+    make_normalize(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 

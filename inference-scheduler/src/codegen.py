@@ -43,7 +43,7 @@ import datetime
 from typing import List
 
 from .graph  import OnnxGraph
-from .tensor import TensorInfo
+from .tensor import TensorInfo, LARGE_WEIGHT_THRESHOLD
 from .nodes  import OP_NAMES
 
 
@@ -91,9 +91,11 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
 # ------------------------------------------------------------------ #
 
 class CodeGenerator:
-    def __init__(self, graph: OnnxGraph, model_path: str) -> None:
-        self._graph      = graph
-        self._model_path = model_path
+    def __init__(self, graph: OnnxGraph, model_path: str,
+                 embed_large_weights: bool = False) -> None:
+        self._graph               = graph
+        self._model_path          = model_path
+        self._embed_large_weights = embed_large_weights
 
     # ---------------------------------------------------------------- #
     # Public entry points                                               #
@@ -164,7 +166,9 @@ class CodeGenerator:
         for t in inputs + outputs:
             decl_lines.append(f"    inference_buf_t *{t.c_name} = NULL;")
 
-        # Buffer allocations with error handling
+        # Buffer allocations with goto-cleanup error handling.
+        # Each failure jumps to 'cleanup' which frees all I/O buffers
+        # (NULL-safe) and calls inference_deinit(), so no buffer leaks.
         alloc_lines = []
         for t in inputs + outputs:
             macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
@@ -174,8 +178,7 @@ class CodeGenerator:
                 f"        fprintf(stderr, "
                 f"\"inference_buf_alloc failed for '{t.c_name}'\\n\");"
             )
-            alloc_lines.append("        inference_deinit();")
-            alloc_lines.append("        return 1;")
+            alloc_lines.append("        rc = 1; goto cleanup;")
             alloc_lines.append("    }")
 
         # Fill each input with a ramp: raw uint16 value i = i/256.0
@@ -211,17 +214,16 @@ class CodeGenerator:
                 f"    }}",
             ]
 
-        # Free each buffer
-        free_lines = [
-            f"    inference_buf_free({t.c_name});"
-            for t in inputs + outputs
-        ]
+        # Cleanup label: free all I/O buffers (NULL-safe), then deinit.
+        cleanup_lines = []
+        for t in inputs + outputs:
+            cleanup_lines.append(f"    inference_buf_free({t.c_name});")
 
-        decl_str  = "\n".join(decl_lines)
-        alloc_str = "\n".join(alloc_lines)
-        fill_str  = "\n".join(fill_lines) if fill_lines else "    /* (no inputs) */"
-        print_str = "\n".join(print_lines)
-        free_str  = "\n".join(free_lines)
+        decl_str    = "\n".join(decl_lines)
+        alloc_str   = "\n".join(alloc_lines)
+        fill_str    = "\n".join(fill_lines) if fill_lines else "    /* (no inputs) */"
+        print_str   = "\n".join(print_lines)
+        cleanup_str = "\n".join(cleanup_lines)
 
         return (
             _file_banner("test_inference.c", graph, self._model_path) +
@@ -250,7 +252,7 @@ class CodeGenerator:
             "                                      : INFERENCE_TEST_INSTANCE;\n"
             f"{decl_str}\n"
             "    unsigned i;\n"
-            "    int      rc;\n"
+            "    int      rc = 0;\n"
             "\n"
             "    /* 1. Initialise: open UIO device, map DMA pool */\n"
             "    rc = inference_init(instance);\n"
@@ -273,12 +275,14 @@ class CodeGenerator:
             "    /* 5. Print first 8 output elements */\n"
             f"{print_str}\n"
             "\n"
-            "    /* 6. Teardown */\n"
-            f"{free_str}\n"
-            "    inference_deinit();\n"
+            "    if (rc == 0)\n"
+            "        printf(\"test_inference PASSED\\n\");\n"
             "\n"
-            "    printf(\"test_inference PASSED\\n\");\n"
-            "    return 0;\n"
+            "    /* 6. Teardown — reached on both success and alloc failure */\n"
+            "cleanup:\n"
+            f"{cleanup_str}\n"
+            "    inference_deinit();\n"
+            "    return rc;\n"
             "}\n"
         )
 
@@ -436,10 +440,23 @@ class CodeGenerator:
             f"endif()\n"
             f"\n"
             f"# -----------------------------------------------------------------------\n"
+            f"# External weight files (.dat) — loaded at runtime by inference_init()\n"
+            f"# -----------------------------------------------------------------------\n"
+            f"# INFERENCE_WEIGHTS_DIR is the directory that contains the weights/\n"
+            f"# subdirectory at runtime (where the binary looks for *.dat files).\n"
+            f"# Defaults to the build directory; override for install targets.\n"
+            f"set(INFERENCE_WEIGHTS_DIR \"${{CMAKE_CURRENT_SOURCE_DIR}}\"\n"
+            f"    CACHE PATH \"Runtime directory that contains the weights/ subdirectory\")\n"
+            f"target_compile_definitions(inference PRIVATE\n"
+            f"    INFERENCE_WEIGHTS_DIR=\"${{INFERENCE_WEIGHTS_DIR}}\")\n"
+            f"\n"
+            f"# -----------------------------------------------------------------------\n"
             f"# Install\n"
             f"# -----------------------------------------------------------------------\n"
             f"install(TARGETS inference ARCHIVE DESTINATION lib)\n"
             f"install(FILES include/inference.h DESTINATION include)\n"
+            f"install(DIRECTORY weights/ DESTINATION weights\n"
+            f"    FILES_MATCHING PATTERN \"*.dat\")\n"
             f"\n"
             f"# -----------------------------------------------------------------------\n"
             f"# Smoke test (requires hardware to run; built by default)\n"
@@ -503,6 +520,22 @@ class CodeGenerator:
 
         page = 4096
         return (total + page - 1) & ~(page - 1)
+
+    @property
+    def large_weight_tensors(self) -> List[TensorInfo]:
+        """Weight tensors stored as external .dat files.
+        Empty when embed_large_weights=True (all weights inlined)."""
+        if self._embed_large_weights:
+            return []
+        return [t for t in self._graph.weight_tensors if t.is_large_weight]
+
+    def generate_weight_dat(self, tensor: TensorInfo) -> bytes:
+        """
+        Return the raw binary content for weights/<c_name>.dat.
+        Little-endian uint16 values in the same ap_fixed<16,8> encoding
+        used by the C ROM arrays, suitable for fread() at runtime.
+        """
+        return tensor.to_dat_bytes()
 
     def _header_api(self) -> str:
         graph   = self._graph
@@ -681,11 +714,14 @@ class CodeGenerator:
     # ---------------------------------------------------------------- #
 
     def _source_includes(self) -> str:
+        stdio = '#include <stdio.h>    /* fopen, fread, snprintf */\n' \
+                if self.large_weight_tensors else ''
         return (
             _banner("Includes") +
             '#include "inference.h"\n'
             '#include "xvectoropkernel.h"\n'
             '#include <string.h>    /* memcpy */\n'
+            f'{stdio}'
             '\n'
             '/*\n'
             ' * Cache coherency between the CPU and the AXI DMA master is handled by\n'
@@ -711,9 +747,13 @@ class CodeGenerator:
         weights = self._graph.weight_tensors
         if not weights:
             return ""
+        external = {t.onnx_name for t in self.large_weight_tensors}
         parts = [_banner("Constant weight arrays (ONNX initializers)")]
         for t in weights:
-            parts.append(t.emit_weight_decl())
+            if t.onnx_name in external:
+                parts.append(t.emit_large_weight_ptr_decl())
+            else:
+                parts.append(t.emit_weight_decl())
             parts.append("")
         return "\n".join(parts)
 
@@ -784,6 +824,55 @@ class CodeGenerator:
             "}\n"
         )
 
+    def _load_weight_helper(self) -> str:
+        """
+        Emit the _load_weight() helper used by inference_init() to read a .dat
+        file into a DMA buffer.  Only included when the model has large weights.
+        """
+        return (
+            _banner("_load_weight() — read an external weight .dat file") +
+            "/*\n"
+            " * _load_weight() — open weights/<name>.dat and fread() its contents\n"
+            " * directly into the DMA buffer.  The .dat file contains raw little-\n"
+            " * endian uint16 values in the same ap_fixed<16,8> encoding used by\n"
+            " * the inline ROM arrays.\n"
+            " *\n"
+            " * INFERENCE_WEIGHTS_DIR is set by CMake (default \".\").\n"
+            " * Override at configure time: cmake -DINFERENCE_WEIGHTS_DIR=/path/to/weights\n"
+            " */\n"
+            "#ifndef INFERENCE_WEIGHTS_DIR\n"
+            "#  define INFERENCE_WEIGHTS_DIR  \".\"\n"
+            "#endif\n"
+            "\n"
+            "static int _load_weight(inference_buf_t *buf,\n"
+            "                        const char *name, unsigned n_elem)\n"
+            "{\n"
+            "    char path[512];\n"
+            "    FILE *f;\n"
+            "    size_t n_read;\n"
+            "\n"
+            "    snprintf(path, sizeof(path),\n"
+            "             INFERENCE_WEIGHTS_DIR \"/weights/%s.dat\", name);\n"
+            "    f = fopen(path, \"rb\");\n"
+            "    if (!f) {\n"
+            '        fprintf(stderr,\n'
+            '                "inference: cannot open weight file \'%s\'\\n", path);\n'
+            "        return -1;\n"
+            "    }\n"
+            "    n_read = fread(inference_buf_ptr(buf),\n"
+            "                  INFERENCE_BYTES_PER_ELEM, n_elem, f);\n"
+            "    fclose(f);\n"
+            "    if (n_read != (size_t)n_elem) {\n"
+            '        fprintf(stderr,\n'
+            '                "inference: short read from \'%s\':"\n'
+            '                " got %zu, expected %u\\n",\n'
+            '                path, n_read, n_elem);\n'
+            "        return -1;\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+
     def _init_function(self) -> str:
         graph         = self._graph
         weights       = graph.weight_tensors
@@ -792,18 +881,27 @@ class CodeGenerator:
         alloc_lines: List[str] = []
 
         if weights:
+            external = {t.onnx_name for t in self.large_weight_tensors}
             alloc_lines.append(
-                "    /* Allocate DMA buffers for weights and copy ROM data into them */"
+                "    /* Allocate DMA buffers for weights */"
             )
             for t in weights:
                 alloc_lines.append(
                     f"    {t.c_name} = inference_buf_alloc({t.numel}u);"
                 )
-                alloc_lines.append(f"    if (!{t.c_name}) return -1;")
                 alloc_lines.append(
-                    f"    memcpy(inference_buf_ptr({t.c_name}),"
-                    f" _rom_{t.c_name}, sizeof(_rom_{t.c_name}));"
+                    f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
                 )
+                if t.onnx_name in external:
+                    alloc_lines.append(
+                        f"    if (_load_weight({t.c_name},"
+                        f" \"{t.c_name}\", {t.numel}u) != 0) {{ rc = -1; goto fail; }}"
+                    )
+                else:
+                    alloc_lines.append(
+                        f"    memcpy(inference_buf_ptr({t.c_name}),"
+                        f" _rom_{t.c_name}, sizeof(_rom_{t.c_name}));"
+                    )
             alloc_lines.append("")
 
         if intermediates:
@@ -812,12 +910,27 @@ class CodeGenerator:
                 alloc_lines.append(
                     f"    {t.c_name} = inference_buf_alloc({t.numel}u);"
                 )
-                alloc_lines.append(f"    if (!{t.c_name}) return -1;")
+                alloc_lines.append(
+                    f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
+                )
             alloc_lines.append("")
 
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
+        # inference_deinit(): free owned buffers (safe on NULL), then close pool.
+        # Buffers must be freed before inference_buf_pool_deinit() because the
+        # Linux/XRT path needs the device handle open to call xclFreeBO().
+        deinit_free: List[str] = []
+        for t in weights + intermediates:
+            deinit_free.append(
+                f"    inference_buf_free({t.c_name}); {t.c_name} = NULL;"
+            )
+        deinit_body = ("\n".join(deinit_free) + "\n") if deinit_free else ""
+
+        load_helper = self._load_weight_helper() if self.large_weight_tensors else ""
+
         return (
+            load_helper +
             _banner("inference_init() / inference_deinit()") +
             "/* Internal: pool lifecycle — defined in inference_buf.c */\n"
             "int  inference_buf_pool_init(void);\n"
@@ -827,18 +940,24 @@ class CodeGenerator:
             "{\n"
             "    int rc;\n"
             "\n"
-            "    /* Initialise DMA buffer pool (Linux: no-op — each buffer\n"
-            "     * is individually allocated; bare-metal: no-op) */\n"
+            "    /* Initialise DMA buffer pool */\n"
             "    rc = inference_buf_pool_init();\n"
             "    if (rc != 0) return rc;\n"
             "\n"
             f"{alloc_str}"
             "    /* Initialise kernel driver */\n"
-            "    return XVectoropkernel_Initialize(&s_kernel, instance_name);\n"
+            "    rc = XVectoropkernel_Initialize(&s_kernel, instance_name);\n"
+            "    if (rc != 0) goto fail;\n"
+            "    return 0;\n"
+            "\n"
+            "fail:\n"
+            "    inference_deinit();\n"
+            "    return rc;\n"
             "}\n"
             "\n"
             "void inference_deinit(void)\n"
             "{\n"
+            f"{deinit_body}"
             "    inference_buf_pool_deinit();\n"
             "}\n"
         )
@@ -1031,6 +1150,7 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     memset(&props, 0, sizeof(props));
     if (xclGetBOProperties(s_xrt_dev, bo, &props) != 0) {
         fprintf(stderr, "inference: xclGetBOProperties failed\n");
+        xclUnmapBO(s_xrt_dev, bo, virt);
         xclFreeBO(s_xrt_dev, bo);
         free(buf);
         return NULL;

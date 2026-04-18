@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
 from src.nodes   import SchedulerError
+from src.tensor  import LARGE_WEIGHT_THRESHOLD
 
 
 # All five driver files — CMakeLists.txt selects sinit.c or linux.c at
@@ -111,6 +112,17 @@ def parse_args(argv=None):
             "Path to the XVectoropkernel driver source directory "
             "(contains xvectoropkernel.c, .h, _hw.h, _sinit.c, _linux.c). "
             "If omitted, driver/ is left empty with a README."
+        ),
+    )
+    p.add_argument(
+        "--embed-large-weights",
+        action="store_true",
+        default=False,
+        help=(
+            f"Embed all weight tensors as C arrays in inference.c, even those "
+            f"exceeding the {LARGE_WEIGHT_THRESHOLD}-element threshold that would "
+            f"normally be written to external weights/*.dat files. "
+            f"Produces a larger but fully self-contained C file."
         ),
     )
     return p.parse_args(argv)
@@ -189,7 +201,8 @@ def main(argv=None):
     # 4. Generate code                                                  #
     # ---------------------------------------------------------------- #
     try:
-        gen        = CodeGenerator(graph=graph, model_path=args.model)
+        gen        = CodeGenerator(graph=graph, model_path=args.model,
+                                   embed_large_weights=args.embed_large_weights)
         header     = gen.generate_header()
         source     = gen.generate_source()
         buf_impl   = gen.generate_buf_impl()
@@ -209,6 +222,20 @@ def main(argv=None):
     _write(os.path.join(out_dir, "src",     "inference_buf.c"),  buf_impl)
     _write(os.path.join(out_dir, "scripts", "check_inference_setup.sh"), setup_sh)
     _write(os.path.join(out_dir, "test",    "test_inference.c"), test_src)
+
+    # ---------------------------------------------------------------- #
+    # 5b. External weight .dat files (large tensors)                    #
+    # ---------------------------------------------------------------- #
+    large_weights = gen.large_weight_tensors
+    if large_weights:
+        weights_dir = os.path.join(out_dir, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+        for t in large_weights:
+            dat_path = os.path.join(weights_dir, f"{t.c_name}.dat")
+            with open(dat_path, "wb") as f:
+                f.write(gen.generate_weight_dat(t))
+        print(f"Weights    : {len(large_weights)} large weight(s) written to"
+              f" {weights_dir}/", file=sys.stderr)
 
     # ---------------------------------------------------------------- #
     # 6. Driver sources                                                 #
@@ -244,7 +271,7 @@ def main(argv=None):
     # ---------------------------------------------------------------- #
     print("", file=sys.stderr)
     print("Generated project:", file=sys.stderr)
-    for rel in [
+    report_items = [
         "CMakeLists.txt",
         "include/inference.h",
         "src/inference.c",
@@ -252,7 +279,10 @@ def main(argv=None):
         "test/test_inference.c",
         "scripts/check_inference_setup.sh",
         "driver/",
-    ]:
+    ]
+    if large_weights:
+        report_items.append("weights/")
+    for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)
 
     return 0

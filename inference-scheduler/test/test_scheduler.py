@@ -1015,5 +1015,331 @@ class TestLargeTensorModel(unittest.TestCase):
         self.assertIn("inference_buf_alloc(INFERENCE_Y_SIZE)", t)
 
 
+# ------------------------------------------------------------------ #
+# Residual connection model tests                                     #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestResidualModels(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # ---- residual_add: Relu(X) -> relu_X, X + relu_X -> Y ----------
+
+    def test_add_single_input(self):
+        g, _ = self._gen("residual_add.onnx")
+        self.assertEqual(len(g.input_tensors), 1)
+
+    def test_add_single_output(self):
+        g, _ = self._gen("residual_add.onnx")
+        self.assertEqual(len(g.output_tensors), 1)
+
+    def test_add_intermediate_relu_x(self):
+        # relu_X is the only intermediate — X and Y are boundary tensors
+        g, _ = self._gen("residual_add.onnx")
+        names = [t.c_name for t in g.intermediate_tensors]
+        self.assertIn("relu_X", names)
+        self.assertNotIn("X", names)
+        self.assertNotIn("Y", names)
+
+    def test_add_ops(self):
+        _, cg = self._gen("residual_add.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_RELU", s)
+        self.assertIn("VECTOROP_ADD", s)
+
+    def test_add_skip_in_source(self):
+        # The final Add must pass X (the original input) as one operand
+        _, cg = self._gen("residual_add.onnx")
+        s = cg.generate_source()
+        # run_op(relu_X, X, Y, ...) or run_op(X, relu_X, Y, ...)
+        self.assertIn("run_op(relu_X, X, Y,", s)
+
+    # ---- residual_chain: X+bias -> Relu -> *scale -> X+result -> Y -
+
+    def test_chain_single_input(self):
+        g, _ = self._gen("residual_chain.onnx")
+        self.assertEqual(len(g.input_tensors), 1)
+
+    def test_chain_single_output(self):
+        g, _ = self._gen("residual_chain.onnx")
+        self.assertEqual(len(g.output_tensors), 1)
+
+    def test_chain_intermediates(self):
+        g, _ = self._gen("residual_chain.onnx")
+        names = [t.c_name for t in g.intermediate_tensors]
+        self.assertIn("add_X",  names)
+        self.assertIn("relu_X", names)
+        self.assertIn("mul_X",  names)
+
+    def test_chain_ops(self):
+        _, cg = self._gen("residual_chain.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_RELU", s)
+        self.assertIn("VECTOROP_MUL", s)
+
+    def test_chain_skip_in_source(self):
+        # Final Add must use X as one of its operands (the skip connection)
+        _, cg = self._gen("residual_chain.onnx")
+        s = cg.generate_source()
+        self.assertIn("run_op(X, mul_X, Y,", s)
+
+    def test_chain_two_nodes_reference_X(self):
+        # X appears as an argument in exactly two run_op calls
+        _, cg = self._gen("residual_chain.onnx")
+        s = cg.generate_source()
+        import re
+        calls_with_X = [ln for ln in s.splitlines()
+                        if re.search(r'\brun_op\b.*\bX\b', ln)]
+        self.assertEqual(len(calls_with_X), 2)
+
+
+# ------------------------------------------------------------------ #
+# Large-weight external .dat file tests                               #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestLargeWeightDat(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # Threshold classification
+    def test_small_weight_not_large(self):
+        # single_add bias has 256 elements — well below threshold
+        _, cg = self._gen("single_add.onnx")
+        self.assertEqual(cg.large_weight_tensors, [])
+
+    def test_large_tensor_weight_is_large(self):
+        # large_tensor bias has 1 048 576 elements — above threshold
+        _, cg = self._gen("large_tensor.onnx")
+        self.assertEqual(len(cg.large_weight_tensors), 1)
+        self.assertEqual(cg.large_weight_tensors[0].c_name, "bias")
+
+    # Source: no ROM array for large weights
+    def test_no_rom_array_for_large_weight(self):
+        _, cg = self._gen("large_tensor.onnx")
+        s = cg.generate_source()
+        self.assertNotIn("_rom_bias", s)
+
+    def test_load_weight_helper_in_source(self):
+        _, cg = self._gen("large_tensor.onnx")
+        s = cg.generate_source()
+        self.assertIn("_load_weight(", s)
+        self.assertIn("fread(", s)
+
+    def test_stdio_included_for_large_weight(self):
+        _, cg = self._gen("large_tensor.onnx")
+        self.assertIn("#include <stdio.h>", cg.generate_source())
+
+    def test_stdio_not_included_without_large_weight(self):
+        _, cg = self._gen("single_add.onnx")
+        self.assertNotIn("#include <stdio.h>", cg.generate_source())
+
+    def test_load_weight_called_in_init(self):
+        _, cg = self._gen("large_tensor.onnx")
+        s = cg.generate_source()
+        self.assertIn('_load_weight(bias, "bias",', s)
+
+    def test_memcpy_not_used_for_large_weight(self):
+        _, cg = self._gen("large_tensor.onnx")
+        s = cg.generate_source()
+        # memcpy for _rom_bias must be absent; memcpy may be present for other reasons
+        self.assertNotIn("_rom_bias", s)
+
+    def test_extern_ptr_decl_in_source(self):
+        _, cg = self._gen("large_tensor.onnx")
+        s = cg.generate_source()
+        self.assertIn("External weight 'bias'", s)
+        self.assertIn("weights/bias.dat", s)
+
+    def test_weights_dir_in_cmake(self):
+        _, cg = self._gen("large_tensor.onnx")
+        cm = cg.generate_cmake()
+        self.assertIn("INFERENCE_WEIGHTS_DIR", cm)
+
+    def test_dat_bytes_correct_size(self):
+        _, cg = self._gen("large_tensor.onnx")
+        t = cg.large_weight_tensors[0]
+        data = cg.generate_weight_dat(t)
+        # 1 048 576 elements × 2 bytes each
+        self.assertEqual(len(data), 1048576 * 2)
+
+    def test_dat_bytes_type(self):
+        _, cg = self._gen("large_tensor.onnx")
+        t = cg.large_weight_tensors[0]
+        self.assertIsInstance(cg.generate_weight_dat(t), bytes)
+
+    def test_small_weight_still_inline(self):
+        # normalize has mean + std, each 256 elements — must stay as ROM arrays
+        _, cg = self._gen("normalize.onnx")
+        s = cg.generate_source()
+        self.assertIn("_rom_mean", s)
+        self.assertIn("_rom_std", s)
+        self.assertNotIn("_load_weight", s)
+
+    # CLI: weights/ directory written for large-weight models
+    def test_cli_writes_dat_file(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "inference_scheduler.py"),
+                 _model("large_tensor.onnx"), "--out-dir", td],
+                check=True, capture_output=True,
+            )
+            dat = os.path.join(td, "weights", "bias.dat")
+            self.assertTrue(os.path.isfile(dat))
+            self.assertEqual(os.path.getsize(dat), 1048576 * 2)
+
+    def test_cli_no_weights_dir_for_small_model(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "inference_scheduler.py"),
+                 _model("single_add.onnx"), "--out-dir", td],
+                check=True, capture_output=True,
+            )
+            self.assertFalse(os.path.isdir(os.path.join(td, "weights")))
+
+    # --embed-large-weights flag
+    def test_embed_flag_inlines_large_weight(self):
+        g  = OnnxGraph(_model("large_tensor.onnx"))
+        cg = CodeGenerator(g, model_path=_model("large_tensor.onnx"),
+                           embed_large_weights=True)
+        self.assertEqual(cg.large_weight_tensors, [])
+        s = cg.generate_source()
+        self.assertIn("_rom_bias", s)
+        self.assertNotIn("_load_weight", s)
+
+    def test_embed_flag_no_stdio(self):
+        g  = OnnxGraph(_model("large_tensor.onnx"))
+        cg = CodeGenerator(g, model_path=_model("large_tensor.onnx"),
+                           embed_large_weights=True)
+        self.assertNotIn("#include <stdio.h>", cg.generate_source())
+
+    def test_cli_embed_flag_no_dat_file(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "inference_scheduler.py"),
+                 _model("large_tensor.onnx"),
+                 "--out-dir", td, "--embed-large-weights"],
+                check=True, capture_output=True,
+            )
+            self.assertFalse(os.path.isdir(os.path.join(td, "weights")))
+
+    def test_cli_embed_flag_rom_array_in_source(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "inference_scheduler.py"),
+                 _model("large_tensor.onnx"),
+                 "--out-dir", td, "--embed-large-weights"],
+                check=True, capture_output=True,
+            )
+            with open(os.path.join(td, "src", "inference.c")) as f:
+                s = f.read()
+            self.assertIn("_rom_bias", s)
+            self.assertNotIn("_load_weight", s)
+
+
+# ------------------------------------------------------------------ #
+# Sub and Div model tests                                             #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestSubDivModels(unittest.TestCase):
+
+    def _gen(self, model_name: str):
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return g, cg
+
+    # sub_bias: X - mean -> Y
+    def test_sub_op_in_source(self):
+        _, cg = self._gen("sub_bias.onnx")
+        self.assertIn("VECTOROP_SUB", cg.generate_source())
+
+    def test_sub_no_other_ops(self):
+        _, cg = self._gen("sub_bias.onnx")
+        # Only VECTOROP_SUB should appear in run_op() call sites
+        import re
+        calls = re.findall(r'run_op\([^)]+\)', cg.generate_source())
+        ops_used = set(re.findall(r'VECTOROP_\w+', " ".join(calls)))
+        self.assertEqual(ops_used, {"VECTOROP_SUB"})
+
+    def test_sub_single_node(self):
+        g, _ = self._gen("sub_bias.onnx")
+        self.assertEqual(len(g.nodes), 1)
+
+    def test_sub_mean_is_weight(self):
+        g, _ = self._gen("sub_bias.onnx")
+        weight_names = [t.c_name for t in g.weight_tensors]
+        self.assertIn("mean", weight_names)
+
+    # div_scale: X / std -> Y
+    def test_div_op_in_source(self):
+        _, cg = self._gen("div_scale.onnx")
+        self.assertIn("VECTOROP_DIV", cg.generate_source())
+
+    def test_div_no_other_ops(self):
+        _, cg = self._gen("div_scale.onnx")
+        import re
+        calls = re.findall(r'run_op\([^)]+\)', cg.generate_source())
+        ops_used = set(re.findall(r'VECTOROP_\w+', " ".join(calls)))
+        self.assertEqual(ops_used, {"VECTOROP_DIV"})
+
+    def test_div_single_node(self):
+        g, _ = self._gen("div_scale.onnx")
+        self.assertEqual(len(g.nodes), 1)
+
+    def test_div_std_is_weight(self):
+        g, _ = self._gen("div_scale.onnx")
+        weight_names = [t.c_name for t in g.weight_tensors]
+        self.assertIn("std", weight_names)
+
+    # normalize: (X - mean) / std -> Y
+    def test_normalize_two_nodes(self):
+        g, _ = self._gen("normalize.onnx")
+        self.assertEqual(len(g.nodes), 2)
+
+    def test_normalize_sub_and_div_in_source(self):
+        _, cg = self._gen("normalize.onnx")
+        s = cg.generate_source()
+        self.assertIn("VECTOROP_SUB", s)
+        self.assertIn("VECTOROP_DIV", s)
+
+    def test_normalize_intermediate_sub_y(self):
+        g, _ = self._gen("normalize.onnx")
+        names = [t.c_name for t in g.intermediate_tensors]
+        self.assertIn("sub_Y", names)
+
+    def test_normalize_both_weights_present(self):
+        g, _ = self._gen("normalize.onnx")
+        weight_names = [t.c_name for t in g.weight_tensors]
+        self.assertIn("mean", weight_names)
+        self.assertIn("std",  weight_names)
+
+    def test_normalize_call_order(self):
+        # Sub run_op call must appear before Div run_op call
+        import re
+        _, cg = self._gen("normalize.onnx")
+        lines = cg.generate_source().splitlines()
+        call_lines = [l for l in lines if re.search(r'run_op\(', l)
+                      and re.search(r'VECTOROP_', l)]
+        ops_in_order = [re.search(r'VECTOROP_\w+', l).group() for l in call_lines]
+        self.assertEqual(ops_in_order, ["VECTOROP_SUB", "VECTOROP_DIV"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
