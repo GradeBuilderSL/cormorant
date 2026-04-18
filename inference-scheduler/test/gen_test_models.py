@@ -20,6 +20,13 @@ Models produced:
   normalize.onnx            Sub then Div: (X - mean) / std -> Y  (mean/std normalisation)
   broadcast_aligned.onnx    X[8,16] + bias[16] -> Y[8,16]  (chunk=16 elems, naturally aligned)
   broadcast_unaligned.onnx  X[4,6]  + bias[6]  -> Y[4,6]   (chunk=6 elems, needs padding to 8)
+  broadcast_mixed.onnx      X[4,6]  + bias[6]  -> Relu -> Y[4,6]  (broadcast Add + plain Relu)
+  broadcast_chain.onnx      X[4,6]  + bias[6]  -> Relu -> +X -> Y[4,6]  (stride propagates 2 levels)
+  broadcast_chain_bias.onnx X[4,6]  + bias[6]  -> Relu -> +bias2[4,6] -> Y[4,6]  (bias2 in strided ROM)
+  chunk_one.onnx            X[16,1] + bias[1]  -> Y[16,1]  (chunk=1, max gap: 7 zeros per block)
+  broadcast_3d.onnx         X[2,3,4]+ bias[4]  -> Y[2,3,4] (3D input, outer_count=6)
+  broadcast_tapped.onnx     X[4,6]  + bias[6]  -> add_Y[out1] -> Relu -> Y[out2] (broadcast output tapped)
+  clip_opset10.onnx         Clip(min=0,max=6) via opset-10 attributes (not input tensors)
   unsupported.onnx          Conv node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
@@ -617,7 +624,303 @@ def make_broadcast_unaligned(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 18: unsupported op (Conv)                                    #
+# Model 18: mixed broadcast + non-broadcast nodes                    #
+#   X[4,6] + bias[6] -> add_Y[4,6] (broadcast, chunk=6, padded to 8)#
+#   Relu(add_Y) -> Y[4,6]          (non-broadcast, plain run_op)     #
+# ------------------------------------------------------------------ #
+
+def make_broadcast_mixed(out_dir: str) -> None:
+    """
+    Bias [6] broadcasts over the leading dimension of X [4, 6] (same
+    unaligned chunk as broadcast_unaligned), then a Relu is applied.
+
+    Node 0 (Add):  outer_count=4, chunk=6, aligned_chunk=8 — emits run_op_at loop.
+    Node 1 (Relu): outer_count=1, chunk=24              — emits plain run_op call.
+
+    Both run_op() and run_op_at() must be emitted.
+    add_Y (intermediate) is allocated with the padded size (4*8=32 elements).
+    Y (output of Relu) uses plain numel (24 elements) — not padded.
+    """
+    ROWS, COLS = 4, 6
+    bias = np.ones(COLS, dtype=np.float32) * 0.25
+
+    X     = _float32("X",     [ROWS, COLS])
+    add_Y = _float32("add_Y", [ROWS, COLS])
+    Y     = _float32("Y",     [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add",  ["X", "bias"], ["add_Y"]),
+            oh.make_node("Relu", ["add_Y"],     ["Y"]),
+        ],
+        name="broadcast_mixed",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_mixed.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 19: broadcast chain — stride propagates through two levels   #
+#   X[4,6] + bias[6] -> add_Y[4,6]  (broadcast, chunk=6, padded=8)  #
+#   Relu(add_Y)       -> relu_Y[4,6] (non-broadcast, level-1 prop)   #
+#   relu_Y + X        -> Y[4,6]      (non-broadcast Add, level-2)    #
+# ------------------------------------------------------------------ #
+
+def make_broadcast_chain(out_dir: str) -> None:
+    """
+    Extends broadcast_mixed with a second non-broadcast layer to verify
+    that stride propagation works through multiple sequential layers.
+
+    Node 0 (Add):   broadcast, outer_count=4, chunk=6, aligned_chunk=8
+                    → emits run_op_at loop; add_Y alloc = 4*8 = 32
+    Node 1 (Relu):  non-broadcast, inherits add_Y's padded alloc (32)
+                    → emits run_op(add_Y, NULL, relu_Y, 32u, …)
+    Node 2 (Add):   non-broadcast, both inputs (relu_Y, X) have alloc=32
+                    → emits run_op(relu_Y, X, Y, 32u, …)
+
+    All four buffers (X, add_Y, relu_Y, Y) must have alloc=32.
+    INFERENCE_Y_SIZE = 4u * INFERENCE_ADD_Y_CHUNK_STRIDE.
+    """
+    ROWS, COLS = 4, 6
+    bias = np.ones(COLS, dtype=np.float32) * 0.25
+
+    X      = _float32("X",      [ROWS, COLS])
+    add_Y  = _float32("add_Y",  [ROWS, COLS])
+    relu_Y = _float32("relu_Y", [ROWS, COLS])
+    Y      = _float32("Y",      [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add",  ["X", "bias"],     ["add_Y"]),
+            oh.make_node("Relu", ["add_Y"],          ["relu_Y"]),
+            oh.make_node("Add",  ["relu_Y", "X"],   ["Y"]),
+        ],
+        name="broadcast_chain",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_chain.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 20: two broadcast adds separated by Relu                     #
+#   X[4,6] + bias[6]  -> add_Y[4,6]  (broadcast, chunk=6, padded=8) #
+#   Relu(add_Y)        -> relu_Y[4,6] (non-broadcast, bridge)        #
+#   relu_Y + bias2[6]  -> Y[4,6]      (broadcast, own chunk macros)  #
+# ------------------------------------------------------------------ #
+
+def make_broadcast_chain_bias(out_dir: str) -> None:
+    """
+    Same broadcast-Add → Relu chain as broadcast_chain, but the last layer
+    is a non-broadcast Add with a full-shape bias weight (bias2[4,6], 24 elements)
+    instead of a residual connection.
+
+    Node 0 (Add):   broadcast, outer_count=4, chunk=6, aligned_chunk=8
+                    → run_op_at loop; add_Y alloc = 4*8 = 32
+    Node 1 (Relu):  non-broadcast — run_op(add_Y, NULL, relu_Y, 32u, …)
+    Node 2 (Add):   non-broadcast — run_op(relu_Y, bias2, Y, 32u, …)
+
+    Because relu_Y has alloc=32 (strided layout with 2-element gaps per row),
+    bias2 must be stored in the same strided layout so run_op() can add
+    element-wise at every position.  The code generator emits bias2's ROM
+    array as 4 blocks of 8 uint16 values: 6 data elements followed by 2
+    zero-padded gap elements per block (32 elements total).
+
+    All four data buffers (X, add_Y, relu_Y, Y) and bias2 have alloc=32.
+    """
+    ROWS, COLS = 4, 6
+    bias  = np.ones(COLS,          dtype=np.float32) * 0.25
+    bias2 = np.ones((ROWS, COLS),  dtype=np.float32) * 0.5
+
+    X      = _float32("X",      [ROWS, COLS])
+    add_Y  = _float32("add_Y",  [ROWS, COLS])
+    relu_Y = _float32("relu_Y", [ROWS, COLS])
+    Y      = _float32("Y",      [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add",  ["X", "bias"],      ["add_Y"]),
+            oh.make_node("Relu", ["add_Y"],           ["relu_Y"]),
+            oh.make_node("Add",  ["relu_Y", "bias2"], ["Y"]),
+        ],
+        name="broadcast_chain_bias",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("bias",  bias),
+            _initializer("bias2", bias2),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_chain_bias.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 21: maximum alignment gap — chunk=1, gap=7 elements per row  #
+#   X[16,1] + bias[1] -> Y[16,1]                                     #
+# ------------------------------------------------------------------ #
+
+def make_chunk_one(out_dir: str) -> None:
+    """
+    Bias [1] broadcasts over the leading dimension of X [16, 1].
+    chunk_size = 1 element; aligned_chunk = 8 (gap = 7 per block).
+    This is the worst-case alignment ratio: 7 out of every 8 slots
+    in each buffer block are gap padding.
+
+    outer_count  = 16
+    chunk_size   = 1
+    aligned_chunk= 8  (= _ALIGN_ELEMS)
+    alloc(X)     = 16 * 8 = 128 elements
+    alloc(bias)  = 8 elements (one aligned block; only position 0 is data)
+    alloc(Y)     = 128 elements
+    """
+    ROWS, COLS = 16, 1
+    bias = np.array([0.25], dtype=np.float32)
+
+    X = _float32("X", [ROWS, COLS])
+    Y = _float32("Y", [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Add", ["X", "bias"], ["Y"])],
+        name="chunk_one",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "chunk_one.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 22: 3-D input shape                                          #
+#   X[2,3,4] + bias[4] -> Y[2,3,4]                                  #
+# ------------------------------------------------------------------ #
+
+def make_broadcast_3d(out_dir: str) -> None:
+    """
+    Bias [4] broadcasts over the first two dimensions of X [2, 3, 4].
+    Right-aligns to [1, 1, 4] → dims 0 and 1 are broadcast dims (contiguous
+    leading block), dim 2 matches.
+
+    outer_count   = 2 * 3 = 6
+    chunk_size    = 4
+    aligned_chunk = 8  (4 → next multiple of _ALIGN_ELEMS)
+    alloc(X)      = 6 * 8 = 48
+    alloc(bias)   = 8 (one aligned block)
+    alloc(Y)      = 48
+    """
+    bias = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+
+    X = _float32("X", [2, 3, 4])
+    Y = _float32("Y", [2, 3, 4])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Add", ["X", "bias"], ["Y"])],
+        name="broadcast_3d",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_3d.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 23: broadcast output tapped as a graph output                #
+#   X[4,6] + bias[6] -> add_Y[4,6] [output 1] -> Relu -> Y[out 2]  #
+# ------------------------------------------------------------------ #
+
+def make_broadcast_tapped(out_dir: str) -> None:
+    """
+    The broadcast Add node's output (add_Y) is exposed as a graph output
+    so the caller can read the pre-activation values.  Relu then produces
+    the second graph output Y.
+
+    Unlike broadcast_mixed (where add_Y is an internal intermediate buffer),
+    here add_Y is caller-supplied.  Unique properties:
+      - add_Y is an output_tensor, NOT an intermediate_tensor
+      - inference_run signature includes add_Y and Y (two output parameters)
+      - INFERENCE_ADD_Y_SIZE and INFERENCE_Y_SIZE both use strided SIZE macros
+      - test_inference.c prints BOTH add_Y and Y with chunk loops
+
+    Node 0 (Add):   broadcast, outer_count=4, chunk=6, aligned_chunk=8
+    Node 1 (Relu):  non-broadcast (run_op with padded size 32u)
+    """
+    ROWS, COLS = 4, 6
+    bias = np.ones(COLS, dtype=np.float32) * 0.25
+
+    X     = _float32("X",     [ROWS, COLS])
+    add_Y = _float32("add_Y", [ROWS, COLS])
+    Y     = _float32("Y",     [ROWS, COLS])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add",  ["X", "bias"], ["add_Y"]),
+            oh.make_node("Relu", ["add_Y"],      ["Y"]),
+        ],
+        name="broadcast_tapped",
+        inputs=[X],
+        outputs=[add_Y, Y],      # add_Y exposed — no intermediate buffer
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "broadcast_tapped.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 24: Clip(0, 6) with opset-10 attribute-style bounds          #
+#   X[1,64] -> Clip(min=0, max=6) -> Y[1,64]                        #
+# ------------------------------------------------------------------ #
+
+def make_clip_opset10(out_dir: str) -> None:
+    """
+    Clip node with min/max stored as node *attributes* (opset 10 style),
+    not as input tensors (opset >= 11 style).
+
+    This exercises the attribute-reading branch in _get_clip_bounds():
+        attrs = {a.name: a for a in node.attribute}
+        if "min" in attrs or "max" in attrs:
+            return attrs["min"].f, attrs["max"].f   # ← this path
+
+    Expected: op_code = OP_RELU6, arity = 1, VECTOROP_RELU6 emitted.
+    """
+    N = 64
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    clip_node = oh.make_node(
+        "Clip",
+        inputs=["X"],
+        outputs=["Y"],
+        min=0.0,
+        max=6.0,
+    )
+    graph = oh.make_graph(
+        nodes=[clip_node],
+        name="clip_opset10",
+        inputs=[X],
+        outputs=[Y],
+    )
+    # opset 10: Clip uses float attributes for min/max
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 10)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "clip_opset10.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 25: unsupported op (Conv)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
@@ -680,6 +983,13 @@ def main():
     make_normalize(args.out_dir)
     make_broadcast_aligned(args.out_dir)
     make_broadcast_unaligned(args.out_dir)
+    make_broadcast_mixed(args.out_dir)
+    make_broadcast_chain(args.out_dir)
+    make_broadcast_chain_bias(args.out_dir)
+    make_chunk_one(args.out_dir)
+    make_broadcast_3d(args.out_dir)
+    make_broadcast_tapped(args.out_dir)
+    make_clip_opset10(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 

@@ -61,10 +61,14 @@ class _SourceMixin:
         if not weights:
             return ""
         external = {t.onnx_name for t in self.large_weight_tensors}
+        strided  = self._strided_weight_params()
         parts = [_banner("Constant weight arrays (ONNX initializers)")]
         for t in weights:
             if t.onnx_name in external:
                 parts.append(t.emit_large_weight_ptr_decl())
+            elif t.onnx_name in strided:
+                outer_count, aligned_chunk = strided[t.onnx_name]
+                parts.append(t.emit_weight_decl_strided(outer_count, aligned_chunk))
             else:
                 parts.append(t.emit_weight_decl())
             parts.append("")
@@ -351,7 +355,14 @@ class _SourceMixin:
         body_lines = []
         for sn in graph.nodes:
             body_lines.append(sn.emit_comment())
-            body_lines.append(sn.emit_call())
+            if sn.outer_count == 1:
+                # Pass the alloc_size so run_op() covers the full padded
+                # buffer when the output inherited stride from upstream.
+                body_lines.append(
+                    sn.emit_call(op_size=self._alloc_sizes[sn.output.onnx_name])
+                )
+            else:
+                body_lines.append(sn.emit_call())
             body_lines.append("")
         if body_lines and body_lines[-1] == "":
             body_lines.pop()

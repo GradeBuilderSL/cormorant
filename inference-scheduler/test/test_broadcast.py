@@ -365,5 +365,142 @@ class TestBroadcast(unittest.TestCase):
                 self.assertNotIn("_off", t)
 
 
+# ------------------------------------------------------------------ #
+# Mixed model: broadcast Add + non-broadcast Relu                    #
+# X[4,6] + bias[6] -> add_Y[4,6] -> Relu -> Y[4,6]                  #
+# ------------------------------------------------------------------ #
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestBroadcastMixed(unittest.TestCase):
+    """
+    Model with one broadcast node (Add) and one non-broadcast node (Relu).
+    Unique properties not covered by single-node broadcast models:
+      - both run_op() and run_op_at() must be defined in the source
+      - add_Y (intermediate) is allocated with the padded broadcast size
+      - Y (Relu output) uses plain numel — no padding
+      - test_inference.c uses chunk-loop fill for X but flat print for Y
+    """
+
+    def _gen(self):
+        g  = OnnxGraph(_model("broadcast_mixed.onnx"))
+        cg = CodeGenerator(g, model_path=_model("broadcast_mixed.onnx"))
+        return g, cg
+
+    # ---- graph structure ------------------------------------------- #
+
+    def test_two_nodes(self):
+        g, _ = self._gen()
+        self.assertEqual(len(g.nodes), 2)
+
+    def test_node0_is_broadcast(self):
+        g, _ = self._gen()
+        sn = g.nodes[0]
+        self.assertEqual(sn.onnx_node.op_type, "Add")
+        self.assertEqual(sn.outer_count, 4)
+        self.assertEqual(sn.chunk_size, 6)
+        self.assertEqual(sn.aligned_chunk_size, 8)
+
+    def test_node1_is_not_broadcast(self):
+        g, _ = self._gen()
+        sn = g.nodes[1]
+        self.assertEqual(sn.onnx_node.op_type, "Relu")
+        self.assertEqual(sn.outer_count, 1)
+
+    # ---- source: both helpers present ------------------------------ #
+
+    def test_both_run_op_helpers_defined(self):
+        """Both run_op() and run_op_at() must be defined when the model
+        has a mix of broadcast and non-broadcast nodes."""
+        _, cg = self._gen()
+        s = cg.generate_source()
+        self.assertIn("static void run_op(", s)
+        self.assertIn("static void run_op_at(", s)
+
+    def test_add_emits_run_op_at(self):
+        _, cg = self._gen()
+        s = cg.generate_source()
+        self.assertIn("for (unsigned _i = 0u; _i < 4u; _i++)", s)
+        self.assertIn("run_op_at(", s)
+
+    def test_relu_emits_plain_run_op(self):
+        _, cg = self._gen()
+        s = cg.generate_source()
+        # Relu output inherits the padded alloc (32); run_op must use 32u so
+        # it covers the full strided buffer (4 rows × 8-elem stride), not just
+        # the logical 24 elements which would miss row 3 and read gap elements.
+        self.assertIn("run_op(add_Y, NULL, Y, 32u,", s)
+
+    # ---- header: chunk macros for Add output only ------------------ #
+
+    def test_chunk_macros_named_after_add_y(self):
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertIn("INFERENCE_ADD_Y_CHUNK", h)
+        self.assertIn("INFERENCE_ADD_Y_CHUNK_STRIDE", h)
+
+    def test_x_size_uses_add_y_chunk_stride(self):
+        # X advances through the broadcast Add node
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertIn("4u * INFERENCE_ADD_Y_CHUNK_STRIDE", h)
+        self.assertIn("INFERENCE_X_SIZE", h)
+
+    def test_y_size_uses_add_y_stride(self):
+        # Y inherits add_Y's stride; its SIZE must reference the same
+        # CHUNK_STRIDE so the caller allocates the full padded buffer.
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertIn("4u * INFERENCE_ADD_Y_CHUNK_STRIDE", h)
+        self.assertIn("INFERENCE_Y_SIZE", h)
+
+    def test_no_y_chunk_macro(self):
+        # Y has no CHUNK macro of its own — it reuses ADD_Y's macros.
+        _, cg = self._gen()
+        h = cg.generate_header()
+        self.assertNotIn("INFERENCE_Y_CHUNK ", h)   # not a separate definition
+        self.assertNotIn("INFERENCE_Y_CHUNK_STRIDE", h)
+
+    # ---- alloc sizes ----------------------------------------------- #
+
+    def test_add_y_alloc_is_padded(self):
+        # add_Y intermediate buffer: 4 outer × 8 aligned = 32 elements
+        g, cg = self._gen()
+        add_y = g.nodes[0].output
+        self.assertEqual(cg._alloc_sizes[add_y.onnx_name], 32)
+
+    def test_x_alloc_is_padded(self):
+        # X advances → also 4 × 8 = 32
+        g, cg = self._gen()
+        x = g.input_tensors[0]
+        self.assertEqual(cg._alloc_sizes[x.onnx_name], 32)
+
+    def test_y_alloc_inherits_padding(self):
+        # Y is Relu output; its alloc inherits the padded size from add_Y
+        # so run_op() can process the full strided buffer (4 × 8 = 32).
+        g, cg = self._gen()
+        y = g.output_tensors[0]
+        self.assertEqual(cg._alloc_sizes[y.onnx_name], 32)
+
+    # ---- test_inference.c: mixed fill/print ------------------------ #
+
+    def test_input_fill_uses_chunk_loop(self):
+        """X (broadcast advancing input) must use chunk-by-chunk fill."""
+        _, cg = self._gen()
+        t = cg.generate_test()
+        self.assertIn("broadcast input, fill data chunks only", t)
+        self.assertIn("for (_chunk = 0u; _chunk < 4u; _chunk++)", t)
+        self.assertIn("INFERENCE_ADD_Y_CHUNK_STRIDE", t)
+
+    def test_output_print_uses_chunk_loop(self):
+        """Y inherits add_Y's stride so test printing must skip gap elements."""
+        _, cg = self._gen()
+        t = cg.generate_test()
+        # Y print uses the same chunk/stride macros as the broadcast Add node
+        self.assertIn("for (_chunk = 0u; _chunk < 4u && shown < lim; _chunk++)", t)
+        self.assertIn("INFERENCE_ADD_Y_CHUNK_STRIDE", t)
+        # flat loop must NOT be used for Y (would print gap elements)
+        self.assertNotIn("for (i = 0u; i < lim; i++)", t)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

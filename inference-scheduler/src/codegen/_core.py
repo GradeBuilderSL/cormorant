@@ -104,7 +104,70 @@ class _CoreMixin:
                     sizes.get(sn.inputs[1].onnx_name, 0), b_size
                 )
 
+        # Propagate padded sizes through non-broadcast nodes.
+        # When a node's input was padded by an upstream broadcast op, its
+        # output buffer must be at least as large so run_op() can process
+        # the full padded range (including alignment gap elements) in one
+        # call.  Additionally, any co-input (e.g. a weight) whose numel is
+        # smaller than the padded size is raised to that size so run_op()'s
+        # uniform size argument is valid for every buffer in the operation.
+        # Nodes are in topological order, so one forward pass is sufficient.
+        for sn in self._graph.nodes:
+            if sn.outer_count > 1:
+                continue
+            max_input = max(sizes.get(inp.onnx_name, inp.numel)
+                            for inp in sn.inputs)
+            out = sn.output.onnx_name
+            if max_input > sizes[out]:
+                sizes[out] = max_input
+            # Raise every co-input to the same padded alloc so the kernel
+            # never reads past the end of any buffer.
+            padded = sizes[out]
+            for inp in sn.inputs:
+                if sizes.get(inp.onnx_name, inp.numel) < padded:
+                    sizes[inp.onnx_name] = padded
+
         return sizes
+
+    def _strided_weight_params(self) -> dict:
+        """
+        Return {onnx_name: (outer_count, aligned_chunk_size)} for weight
+        tensors whose alloc_size was raised above numel by backward
+        propagation in _compute_alloc_sizes().
+
+        These weights are used as co-inputs to non-broadcast nodes alongside
+        strided (padded) intermediate buffers.  Their ROM arrays must be
+        emitted in strided layout — data elements interleaved with zero-
+        padding in the gap slots — so that a single run_op() call with
+        size=alloc_size is valid for every buffer in the operation.
+
+        outer_count and aligned_chunk_size are derived from the strided
+        co-input's entry in _broadcast_io_map().
+        """
+        io_map = self._broadcast_io_map()
+        result: dict = {}
+
+        for sn in self._graph.nodes:
+            if sn.outer_count > 1:
+                continue
+            # Find outer_count from any strided non-weight co-input.
+            outer_count = None
+            for inp in sn.inputs:
+                if inp.onnx_name in io_map:
+                    outer_count = io_map[inp.onnx_name][0]
+                    break
+            if outer_count is None:
+                continue
+            # Record stride params for each weight input that was padded.
+            for inp in sn.inputs:
+                if not inp.is_weight:
+                    continue
+                alloc = self._alloc_sizes.get(inp.onnx_name, inp.numel)
+                if alloc <= inp.numel:
+                    continue
+                result[inp.onnx_name] = (outer_count, alloc // outer_count)
+
+        return result
 
     def _compute_pool_bytes(self) -> int:
         """
@@ -146,11 +209,23 @@ class _CoreMixin:
     def _broadcast_io_map(self) -> dict:
         """
         Returns {onnx_name → (outer_count, chunk_macro, stride_macro)} for
-        every I/O tensor (input or output) that advances through a broadcast
-        node.  Repeating tensors (e.g. a bias that stays at offset 0 each
-        iteration) are not included — they don't need strided fill/print logic.
+        every tensor whose DMA buffer has alignment-gap padding and therefore
+        needs strided fill/print logic.
+
+        Two categories:
+          1. Direct participants of a broadcast node: the advancing inputs and
+             the output of any node with outer_count > 1.
+          2. Outputs of non-broadcast nodes whose inputs are strided (stride
+             propagation).  E.g. a Relu applied to a broadcast intermediate
+             buffer produces a strided output that must be iterated chunk-by-
+             chunk even though Relu itself is not a broadcast op.
+
+        Repeating tensors (bias at offset 0 every iteration) are not included.
+        Nodes are processed in topological order so one forward pass suffices.
         """
         result = {}
+
+        # Pass 1 — broadcast nodes: collect advancing inputs and outputs.
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
@@ -163,4 +238,16 @@ class _CoreMixin:
                 result[sn.inputs[0].onnx_name] = (n, chunk_macro, stride_macro)
             if sn.arity == 2 and sn.b_advances:
                 result[sn.inputs[1].onnx_name] = (n, chunk_macro, stride_macro)
+
+        # Pass 2 — non-broadcast nodes: propagate stride to their outputs.
+        for sn in self._graph.nodes:
+            if sn.outer_count > 1:
+                continue
+            if sn.output.onnx_name in result:
+                continue  # already classified in pass 1
+            for inp in sn.inputs:
+                if inp.onnx_name in result:
+                    result[sn.output.onnx_name] = result[inp.onnx_name]
+                    break
+
         return result

@@ -125,6 +125,58 @@ class TensorInfo:
             f"static inference_buf_t *{self.c_name} = NULL;"
         )
 
+    def emit_weight_decl_strided(self,
+                                 outer_count: int,
+                                 aligned_chunk_size: int) -> str:
+        """
+        Emit a ROM array in strided layout for a weight that is used alongside
+        a strided buffer in a non-broadcast run_op() call.
+
+        The data is split into outer_count blocks; each block occupies
+        aligned_chunk_size slots in the array.  The first (numel // outer_count)
+        slots contain the encoded weight values; the remaining
+        (aligned_chunk_size - numel // outer_count) slots are zero-padded so
+        every block starts at an INFERENCE_ALIGN_BYTES-aligned offset.
+
+        Example for bias shape=[4,6], outer_count=4, aligned_chunk_size=8:
+          [row0_e0..e5, 0x0000, 0x0000,   <- block 0: 6 data + 2 gap
+           row1_e0..e5, 0x0000, 0x0000,   <- block 1
+           row2_e0..e5, 0x0000, 0x0000,   <- block 2
+           row3_e0..e5, 0x0000, 0x0000]   <- block 3
+        """
+        if not self.is_weight:
+            raise ValueError(f"Tensor '{self.onnx_name}' has no data")
+
+        chunk_size = self.numel // outer_count
+        gap        = aligned_chunk_size - chunk_size
+        total      = outer_count * aligned_chunk_size
+
+        hexvals = _float_to_apfixed_hex(self.data)
+
+        padded: list = []
+        for i in range(outer_count):
+            padded.extend(hexvals[i * chunk_size : (i + 1) * chunk_size])
+            padded.extend(["0x0000"] * gap)
+
+        rows = []
+        for i in range(0, len(padded), 8):
+            rows.append("    " + ", ".join(padded[i:i+8]))
+        inner = ",\n".join(rows)
+
+        return (
+            f"/* ROM data for weight '{self.onnx_name}'"
+            f"  shape={self.shape}  dtype={self.dtype}\n"
+            f" * Strided layout: {outer_count} blocks × {aligned_chunk_size} elements"
+            f" ({chunk_size} data + {gap} zero-pad per block).\n"
+            f" * Co-input to a non-broadcast run_op() that processes a strided buffer;\n"
+            f" * gap zeros ensure both operands are aligned at every block boundary. */\n"
+            f"static const uint16_t _rom_{self.c_name}[{total}] = {{\n"
+            f"{inner}\n"
+            f"}};\n"
+            f"/* DMA buffer pointer for '{self.onnx_name}' */\n"
+            f"static inference_buf_t *{self.c_name} = NULL;"
+        )
+
     def emit_large_weight_ptr_decl(self) -> str:
         """
         For large weights: emit only the DMA buffer pointer (no ROM array).

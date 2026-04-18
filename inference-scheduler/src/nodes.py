@@ -370,7 +370,7 @@ class ScheduledNode:
             f"  shape={self.output.shape}{broadcast} */"
         )
 
-    def emit_call(self) -> str:
+    def emit_call(self, op_size: Optional[int] = None) -> str:
         a  = self.inputs[0].c_name
         b  = self.inputs[1].c_name if self.arity == 2 else "NULL"
         c  = self.output.c_name
@@ -378,7 +378,10 @@ class ScheduledNode:
 
         if self.outer_count == 1:
             # Non-broadcast: run_op() handles cache syncs internally.
-            return f"    run_op({a}, {b}, {c}, {self.chunk_size}u, {op});"
+            # op_size overrides self.chunk_size when the output buffer is
+            # larger than numel due to upstream broadcast alignment padding.
+            size = op_size if op_size is not None else self.chunk_size
+            return f"    run_op({a}, {b}, {c}, {size}u, {op});"
 
         # Broadcasting: sync whole buffers once, then loop with run_op_at().
         # The chunk stride uses the CHUNK_STRIDE macro (INFERENCE_ALIGN_UP of
