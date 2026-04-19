@@ -27,6 +27,14 @@ Models produced:
   broadcast_3d.onnx         X[2,3,4]+ bias[4]  -> Y[2,3,4] (3D input, outer_count=6)
   broadcast_tapped.onnx     X[4,6]  + bias[6]  -> add_Y[out1] -> Relu -> Y[out2] (broadcast output tapped)
   clip_opset10.onnx         Clip(min=0,max=6) via opset-10 attributes (not input tensors)
+  sat_add_pos.onnx          X[1,256] + 127.5  -> Y; elements [128..255] saturate to max (+127.996)
+  sat_add_neg.onnx          X[1,256] + (-63) + (-65.5) -> Y; elements [0..127] saturate to min (-128)
+  sat_mul_pos.onnx          (X+1)*90 -> Y; elements [109..255] saturate to max (+127.996)
+  sat_mul_neg.onnx          (X-2)*90 -> Y; elements [0..147] saturate to min (-128)
+  sat_sub_pos.onnx          X[1,256] - (-127.5) -> Y; elements [128..255] saturate to max (+127.996)
+  sat_sub_neg.onnx          X[1,256] - 63 - 65.5 -> Y; elements [0..128] saturate to min (-128)
+  sat_div_pos.onnx          X[1,256] / (1/256) -> Y=i; elements [128..255] saturate to max (+127.996)
+  sat_div_neg.onnx          X[1,256] / (-1/256) -> Y=-i; elements [128..255] saturate to min (-128)
   unsupported.onnx          Conv node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
@@ -920,7 +928,252 @@ def make_clip_opset10(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 25: unsupported op (Conv)                                    #
+# Saturation models                                                  #
+#                                                                    #
+# ap_fixed<16,8> range: [-128.0,  127.99609375]  (= [-32768, 32767] #
+#                        scaled by 1/256)                            #
+#                                                                    #
+# The ramp input fills buffer position p with (Data_t)(p & 0xFFFF), #
+# so element i of a [1,N] tensor has value i/256.                   #
+# All four models use N=256, giving input range [0/256 .. 255/256]. #
+# ------------------------------------------------------------------ #
+
+# Model 26: Add positive saturation
+# X[1,256] + 127.5  -> Y
+#   i=0..127:  i/256 + 127.5 in [127.5, 127.996]  — no saturation
+#   i=128..255: i/256 + 127.5 >= 128.0             — saturate to 127.996
+def make_sat_add_pos(out_dir: str) -> None:
+    """Single Add with a large positive bias; upper half saturates."""
+    N    = 256
+    bias = np.full((1, N), 127.5, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Add", ["X", "bias"], ["Y"])],
+        name="sat_add_pos",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_add_pos.onnx"))
+
+
+# Model 27: Add negative saturation (two-stage chain)
+# X[1,256] + (-63) -> Z,  Z + (-65.5) -> Y
+#   Effective: Y[i] = i/256 - 128.5
+#   i=0..127:   Y[i] in [-128.5, -128.004]  — saturate to -128.0
+#   i=128..255: Y[i] in [-128.0, -127.504]  — no saturation
+def make_sat_add_neg(out_dir: str) -> None:
+    """Two-stage Add chain with large negative biases; lower half saturates."""
+    N     = 256
+    bias1 = np.full((1, N), -63.0, dtype=np.float32)
+    bias2 = np.full((1, N), -65.5, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Z = _float32("Z", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add", ["X",  "bias1"], ["Z"]),
+            oh.make_node("Add", ["Z",  "bias2"], ["Y"]),
+        ],
+        name="sat_add_neg",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("bias1", bias1),
+            _initializer("bias2", bias2),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_add_neg.onnx"))
+
+
+# Model 28: Mul positive saturation
+# X[1,256] + 1.0 -> Z,  Z * 90 -> Y
+#   Z[i] = i/256 + 1,  range [1.0, 1.996]
+#   i=0..108:   Z[i] * 90 <= 127.969  — no saturation
+#   i=109..255: Z[i] * 90 >= 128.320  — saturate to 127.996
+def make_sat_mul_pos(out_dir: str) -> None:
+    """Add offset then Mul by large scale; upper portion saturates."""
+    N      = 256
+    offset = np.full((1, N), 1.0,  dtype=np.float32)
+    scale  = np.full((1, N), 90.0, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Z = _float32("Z", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Add", ["X", "offset"], ["Z"]),
+            oh.make_node("Mul", ["Z", "scale"],  ["Y"]),
+        ],
+        name="sat_mul_pos",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("offset", offset),
+            _initializer("scale",  scale),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_mul_pos.onnx"))
+
+
+# Model 29: Mul negative saturation
+# X[1,256] - 2.0 -> Z,  Z * 90 -> Y
+#   Z[i] = i/256 - 2,  range [-2.0, -1.004]
+#   i=0..147:   Z[i] * 90 <= -128.320  — saturate to -128.0
+#   i=148..255: Z[i] * 90 >= -127.969  — no saturation
+def make_sat_mul_neg(out_dir: str) -> None:
+    """Sub mean then Mul by large scale; lower portion saturates."""
+    N     = 256
+    mean  = np.full((1, N), 2.0,  dtype=np.float32)
+    scale = np.full((1, N), 90.0, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Z = _float32("Z", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Sub", ["X", "mean"],  ["Z"]),
+            oh.make_node("Mul", ["Z", "scale"], ["Y"]),
+        ],
+        name="sat_mul_neg",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("mean",  mean),
+            _initializer("scale", scale),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_mul_neg.onnx"))
+
+
+# Model 30: Sub positive saturation
+# X[1,256] - (-127.5) -> Y    (equivalent to X + 127.5)
+#   Y[i] = i/256 + 127.5
+#   i=0..126:   Y[i] in [127.5, 127.992]  — no saturation
+#   i=127:      Y[127] = 127.996 = AP_MAX  — exact, no overflow
+#   i=128..255: Y[i] >= 128.0             — saturate to AP_MAX
+def make_sat_sub_pos(out_dir: str) -> None:
+    """Single Sub with a large negative bias; upper portion saturates to max."""
+    N    = 256
+    bias = np.full((1, N), -127.5, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Sub", ["X", "bias"], ["Y"])],
+        name="sat_sub_pos",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("bias", bias)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_sub_pos.onnx"))
+
+
+# Model 31: Sub negative saturation (two-stage chain)
+# X[1,256] - 63.0 -> Z,  Z - 65.5 -> Y
+#   Effective: Y[i] = i/256 - 128.5
+#   i=0..127:   Y[i] in [-128.5, -128.004]  — saturate to AP_MIN
+#   i=128:      Y[128] = -128.0 = AP_MIN     — exact, representable
+#   i=129..255: Y[i] in [-127.996, -127.504] — no saturation
+def make_sat_sub_neg(out_dir: str) -> None:
+    """Two-stage Sub chain with large positive biases; lower portion saturates to min."""
+    N     = 256
+    bias1 = np.full((1, N), 63.0, dtype=np.float32)
+    bias2 = np.full((1, N), 65.5, dtype=np.float32)
+
+    X = _float32("X", [1, N])
+    Z = _float32("Z", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[
+            oh.make_node("Sub", ["X", "bias1"], ["Z"]),
+            oh.make_node("Sub", ["Z", "bias2"], ["Y"]),
+        ],
+        name="sat_sub_neg",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[
+            _initializer("bias1", bias1),
+            _initializer("bias2", bias2),
+        ],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_sub_neg.onnx"))
+
+
+# Model 32: Div positive saturation
+# X[1,256] / (1/256) -> Y
+#   Y[i] = i/256 / (1/256) = float(i)
+#   i=0..127:   Y[i] in [0, 127]  — no saturation (127 < AP_MAX=127.996)
+#   i=128..255: Y[i] >= 128       — saturate to AP_MAX
+def make_sat_div_pos(out_dir: str) -> None:
+    """Single Div by smallest positive unit; upper half saturates to max."""
+    N       = 256
+    divisor = np.full((1, N), 1.0 / 256, dtype=np.float32)   # 1 LSB = 0.00390625
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Div", ["X", "divisor"], ["Y"])],
+        name="sat_div_pos",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("divisor", divisor)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_div_pos.onnx"))
+
+
+# Model 33: Div negative saturation
+# X[1,256] / (-1/256) -> Y
+#   Y[i] = i/256 / (-1/256) = float(-i)
+#   i=0..127:   Y[i] in [0, -127]    — no saturation (-127 > AP_MIN=-128)
+#   i=128:      Y[128] = -128 = AP_MIN — exact, representable
+#   i=129..255: Y[i] <= -129          — saturate to AP_MIN
+def make_sat_div_neg(out_dir: str) -> None:
+    """Single Div by smallest negative unit; lower half saturates to min."""
+    N       = 256
+    divisor = np.full((1, N), -1.0 / 256, dtype=np.float32)  # -1 LSB = -0.00390625
+
+    X = _float32("X", [1, N])
+    Y = _float32("Y", [1, N])
+
+    graph = oh.make_graph(
+        nodes=[oh.make_node("Div", ["X", "divisor"], ["Y"])],
+        name="sat_div_neg",
+        inputs=[X],
+        outputs=[Y],
+        initializer=[_initializer("divisor", divisor)],
+    )
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "sat_div_neg.onnx"))
+
+
+# ------------------------------------------------------------------ #
+# Model 34: unsupported op (Conv)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
@@ -990,6 +1243,14 @@ def main():
     make_broadcast_3d(args.out_dir)
     make_broadcast_tapped(args.out_dir)
     make_clip_opset10(args.out_dir)
+    make_sat_add_pos(args.out_dir)
+    make_sat_add_neg(args.out_dir)
+    make_sat_mul_pos(args.out_dir)
+    make_sat_mul_neg(args.out_dir)
+    make_sat_sub_pos(args.out_dir)
+    make_sat_sub_neg(args.out_dir)
+    make_sat_div_pos(args.out_dir)
+    make_sat_div_neg(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 

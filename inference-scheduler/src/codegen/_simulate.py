@@ -1,9 +1,25 @@
 """
 Mixin that forward-simulates the ONNX graph with fixed-point arithmetic.
 
-Every operation is computed in float64 and then rounded/clipped to the
+Every operation is computed in float64 and then truncated/clipped to the
 representable grid of ``self._dtype`` after each node — identical to what
 the hardware kernel does after each element-wise op.
+
+Quantization model
+------------------
+Two distinct rounding behaviours are used:
+
+* **dtype.quantize()** — round-to-nearest (used when seeding weight values).
+  Weights are written to the .dat / C-array via float_to_storage(), which
+  also rounds to nearest; quantize() must match so the simulation uses the
+  same value the hardware reads from the DMA buffer.
+
+* **dtype.truncate()** — floor toward −∞ (used after each arithmetic node).
+  HLS ap_fixed defaults to AP_TRN (truncation toward −∞) when narrowing an
+  arithmetic result back to the element type.  For ADD/SUB/RELU/RELU6 this
+  is a no-op because the inputs are already on the representable grid and
+  the result inherits the same precision.  For MUL/DIV the intermediate
+  result has more fractional bits and truncation matters.
 
 The ramp input used by ``_simulate()`` mirrors the pattern written by the
 generated test harness, so the expected output can be embedded verbatim in
@@ -146,6 +162,13 @@ class _SimulateMixin:
                 result = a * arrays[sn.inputs[1].onnx_name]
             elif sn.op_code == OP_DIV:
                 result = a / arrays[sn.inputs[1].onnx_name]
+                # DIV: HLS computes a_int / b_int (C integer division =
+                # truncation toward zero), so use truncate_div instead of
+                # the default truncate (floor toward −∞).
+                arrays[sn.output.onnx_name] = dtype.truncate_div(result).reshape(
+                    sn.output.shape
+                )
+                continue
             elif sn.op_code == OP_RELU:
                 result = np.maximum(a, 0.0)
             elif sn.op_code == OP_RELU6:
@@ -156,7 +179,7 @@ class _SimulateMixin:
                     f"in node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
                 )
 
-            arrays[sn.output.onnx_name] = dtype.quantize(result).reshape(
+            arrays[sn.output.onnx_name] = dtype.truncate(result).reshape(
                 sn.output.shape
             )
 

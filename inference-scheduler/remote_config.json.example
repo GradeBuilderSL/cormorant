@@ -1,0 +1,56 @@
+{
+  "_comment": "Copy this file to remote_config.json and fill in your KV260 details.",
+
+  "ssh": {
+    "host": "kv260.local",
+    "user": "root",
+    "port": 22,
+
+    "key_file": "~/.ssh/id_rsa",
+    "_key_file_note": "Path to SSH private key. Set to null to use password auth instead.",
+
+    "password": null,
+    "_password_note": "SSH password. Leave null when using key-based auth.",
+
+    "connect_timeout": 15
+  },
+
+  "remote": {
+    "work_dir": "/tmp/inference_hw_tests",
+    "_work_dir_note": "Base directory on the remote machine. Created automatically. Cleaned up after each run unless --no-cleanup is set.",
+
+    "uio_device": "fabric",
+    "_uio_device_note": "UIO sysfs name for VectorOPKernel — the string in /sys/class/uio/uio*/name, NOT a /dev/uioN path. Verify with: cat /sys/class/uio/uio*/name",
+
+    "driver_dir": null,
+    "_driver_dir_note": "Path on the REMOTE machine to copy XVectoropkernel driver sources from. Takes precedence over local.driver_dir when set.",
+
+    "cmake_args": []
+  },
+
+  "local": {
+    "driver_dir": null,
+    "_driver_dir_note": "Path on the LOCAL machine to bundle driver sources into each project before upload. Example: '../build/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src'"
+  },
+
+  "build": {
+    "jobs": 4,
+    "_jobs_note": "Parallel make jobs on the remote machine.",
+    "timeout": 180
+  },
+
+  "run": {
+    "timeout": 120,
+    "use_sudo": true,
+    "_use_sudo_note": "Run test_inference with 'sudo -n'. Requires passwordless sudo configured on the target (visudo: 'root ALL=(ALL) NOPASSWD: ALL' or equivalent)."
+  },
+
+  "cleanup": true,
+  "_cleanup_note": "Remove remote work_dir after all tests finish. Set false (or use --no-cleanup) to inspect build artifacts.",
+
+  "models": [
+    "test/models/single_add.onnx",
+    "test/models/mixed_ops.onnx"
+  ],
+  "_models_note": "Model paths relative to the inference-scheduler directory. Overridden by --models on the command line."
+}

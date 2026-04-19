@@ -80,12 +80,48 @@ class DataType(ABC):
     def quantize(self, x: np.ndarray) -> np.ndarray:
         """
         Round float64 array x to the nearest value representable in this
-        type (saturation + rounding).  Returns float64.
+        type (saturation + round-to-nearest).  Returns float64.
 
-        For fixed-point types this clips to [min, max] and rounds to the
-        fractional grid.  For floating-point types this is typically a
-        no-op (or a float32 round-trip to match hardware precision).
+        Used for encoding weights and inputs: the result matches what
+        float_to_storage() + decode produces, i.e. the value the hardware
+        actually reads from the DMA buffer.
+
+        For fixed-point types: clip to [min, max] and round to nearest
+        fractional grid point.  For floating-point types: float32 round-trip.
         """
+
+    def truncate(self, x: np.ndarray) -> np.ndarray:
+        """
+        Truncate float64 array x toward −∞ to the nearest representable
+        value (saturation + floor).  Returns float64.
+
+        Used to simulate AP_TRN quantization of MUL results.  For
+        ap_fixed<16,8> × ap_fixed<16,8> HLS produces ap_fixed<32,16>; the
+        AP_TRN cast back to ap_fixed<16,8> discards the lower 8 fractional
+        bits with an arithmetic right-shift (= floor toward −∞).
+
+        The default implementation delegates to quantize() (round-to-nearest),
+        which is correct for types where arithmetic results carry no
+        sub-representable-precision remainder (e.g. float32).  Fixed-point
+        subclasses override this with floor.
+        """
+        return self.quantize(x)
+
+    def truncate_div(self, x: np.ndarray) -> np.ndarray:
+        """
+        Truncate float64 array x toward zero to the nearest representable
+        value (saturation + trunc).  Returns float64.
+
+        Used to simulate DIV results.  HLS implements ap_fixed division as
+        integer division of the raw representations (a_int / b_int), which
+        in C truncates toward zero.  For positive quotients this equals
+        floor; for negative quotients it equals ceiling (less negative).
+
+        The default delegates to truncate() (floor), which is correct for
+        float32 and for types where all div results are non-negative.
+        Fixed-point subclasses override with np.trunc.
+        """
+        return self.truncate(x)
 
     @abstractmethod
     def ramp_to_float(self, positions: np.ndarray) -> np.ndarray:
@@ -230,6 +266,20 @@ class ApFixed(DataType):
     def quantize(self, x: np.ndarray) -> np.ndarray:
         clipped = np.clip(x.astype(np.float64), self._min_val, self._max_val)
         return np.round(clipped * self._scale) / self._scale
+
+    def truncate(self, x: np.ndarray) -> np.ndarray:
+        # AP_TRN: floor toward −∞.  Only differs from quantize when the
+        # arithmetic result lands between two representable values
+        # (e.g. after a multiply that produces 16 fractional bits narrowed
+        # to 8).  ADD/SUB inputs are always on-grid so floor is a no-op.
+        clipped = np.clip(x.astype(np.float64), self._min_val, self._max_val)
+        return np.floor(clipped * self._scale) / self._scale
+
+    def truncate_div(self, x: np.ndarray) -> np.ndarray:
+        # HLS division is a_int / b_int (C integer division = truncation
+        # toward zero).  Differs from floor only for negative non-grid values.
+        clipped = np.clip(x.astype(np.float64), self._min_val, self._max_val)
+        return np.trunc(clipped * self._scale) / self._scale
 
     def ramp_to_float(self, positions: np.ndarray) -> np.ndarray:
         # p[pos] = (Data_t)(pos & mask)  →  interpret bit pattern as signed int

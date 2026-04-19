@@ -57,9 +57,12 @@ class TestTestGen(unittest.TestCase):
         t = self._test_src("single_add.onnx")
         self.assertIn("printf(", t)
 
-    def test_linux_default_uio(self):
+    def test_linux_default_instance(self):
+        # The Linux default is the UIO sysfs name, not a /dev/uioN path.
+        # XVectoropkernel_Initialize() scans /sys/class/uio/*/name for the match.
         t = self._test_src("single_add.onnx")
-        self.assertIn("/dev/uio0", t)
+        self.assertIn('"fabric"', t)
+        self.assertNotIn("/dev/uio0", t)
 
     def test_baremetal_default_instance(self):
         t = self._test_src("single_add.onnx")
