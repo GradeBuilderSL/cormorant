@@ -115,12 +115,17 @@ class _SourceMixin:
         if need_run_op:
             parts.append(
                 "/*\n"
-                " * run_op() — program AXI-Lite registers with physical addresses,\n"
-                " *             maintain cache coherence, start the kernel, and poll.\n"
+                " * run_op() — program AXI-Lite registers, start the kernel, and poll.\n"
                 " *\n"
                 " * The kernel's AXI master reads/writes DDR using PHYSICAL addresses;\n"
                 " * inference_buf_phys() provides the address to program into the registers.\n"
-                " * inference_buf_ptr() provides the virtual address for CPU cache ops.\n"
+                " *\n"
+                " * Cache sync is entirely the CALLER'S responsibility:\n"
+                " *   - sync_to_device for inputs: done once per inference_run() call\n"
+                " *     for user inputs; done once in inference_init() for weights.\n"
+                " *   - sync_from_device for outputs: done once at the end of\n"
+                " *     inference_run() for graph outputs only.  Internal buffers that\n"
+                " *     flow kernel-to-kernel never touch the CPU, so they need no sync.\n"
                 " *\n"
                 " *   a     input buffer A  (always required)\n"
                 " *   b     input buffer B  (NULL for unary ops: RELU, RELU6)\n"
@@ -140,17 +145,8 @@ class _SourceMixin:
                 "    XVectoropkernel_Set_c(&s_kernel, inference_buf_phys(c));\n"
                 "    XVectoropkernel_Set_size(&s_kernel, size);\n"
                 "    XVectoropkernel_Set_op(&s_kernel, op);\n"
-                "\n"
-                "    /* Sync inputs: flush CPU cache / XRT BO to device before AXI master reads */\n"
-                "    inference_buf_sync_to_device(a);\n"
-                "    if (b != NULL)\n"
-                "        inference_buf_sync_to_device(b);\n"
-                "\n"
                 "    XVectoropkernel_Start(&s_kernel);\n"
                 "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
-                "\n"
-                "    /* Sync output: invalidate CPU cache / XRT BO from device after AXI master writes */\n"
-                "    inference_buf_sync_from_device(c);\n"
                 "}\n"
             )
 
@@ -279,6 +275,12 @@ class _SourceMixin:
                         f"    memcpy(inference_buf_ptr({t.c_name}),"
                         f" _rom_{t.c_name}, sizeof(_rom_{t.c_name}));"
                     )
+                # Sync once after loading — weight data never changes, so the
+                # AXI master can read it on every inference_run() without a
+                # repeated flush.
+                alloc_lines.append(
+                    f"    inference_buf_sync_to_device({t.c_name});"
+                )
             alloc_lines.append("")
 
         if intermediates:
@@ -352,6 +354,31 @@ class _SourceMixin:
             params.append(f"    inference_buf_t *{t.c_name}")
         param_str = ",\n".join(params)
 
+        # ---- Cache sync strategy ------------------------------------------ #
+        # The FPGA kernel accesses DDR directly; CPU cache coherency is only
+        # needed at the user-visible boundary:
+        #   1. Flush user inputs (graph inputs, CPU-written) to DDR once before
+        #      the first kernel invocation.  Weights are already flushed in
+        #      inference_init() and never change.  Internal buffers are never
+        #      written by the CPU so they need no flush.
+        #   2. Invalidate graph outputs from DDR once after all ops complete,
+        #      so the caller can read the results via the CPU virtual address.
+        #      Internal (kernel-to-kernel) buffers are skipped entirely.
+        # -------------------------------------------------------------------
+        sync_in_lines = [
+            "    /* Flush user inputs to DDR (CPU → FPGA) */",
+        ] + [
+            f"    inference_buf_sync_to_device({t.c_name});"
+            for t in inputs
+        ]
+
+        sync_out_lines = [
+            "    /* Invalidate graph outputs in CPU cache (FPGA → CPU) */",
+        ] + [
+            f"    inference_buf_sync_from_device({t.c_name});"
+            for t in outputs
+        ]
+
         body_lines = []
         for sn in graph.nodes:
             body_lines.append(sn.emit_comment())
@@ -366,7 +393,15 @@ class _SourceMixin:
             body_lines.append("")
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
-        body = "\n".join(body_lines) if body_lines else "    /* (empty graph) */"
+
+        sections = []
+        if inputs:
+            sections.append("\n".join(sync_in_lines))
+        if body_lines:
+            sections.append("\n".join(body_lines))
+        if outputs:
+            sections.append("\n".join(sync_out_lines))
+        body = "\n\n".join(sections) if sections else "    /* (empty graph) */"
 
         return (
             _banner("inference_run()") +

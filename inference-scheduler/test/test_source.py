@@ -55,9 +55,14 @@ class TestSourceGen(unittest.TestCase):
 
     def test_run_op_uses_sync_functions(self):
         s = self._source("single_add.onnx")
-        # run_op() calls sync instead of raw cache macros
-        self.assertIn("inference_buf_sync_to_device(a)", s)
-        self.assertIn("inference_buf_sync_from_device(c)", s)
+        # run_op() must NOT sync anything — all sync is the caller's responsibility
+        self.assertNotIn("inference_buf_sync_to_device(a)", s)
+        self.assertNotIn("inference_buf_sync_from_device(c)", s)
+        # inference_run() flushes graph inputs and invalidates graph outputs
+        self.assertIn("inference_buf_sync_to_device(X)", s)
+        self.assertIn("inference_buf_sync_from_device(Y)", s)
+        # inference_init() syncs weights once after loading
+        self.assertIn("inference_buf_sync_to_device(bias)", s)
 
     def test_run_op_call_add(self):
         s = self._source("single_add.onnx")

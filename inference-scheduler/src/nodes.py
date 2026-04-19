@@ -376,43 +376,45 @@ class ScheduledNode:
         )
 
     def emit_call(self, op_size: Optional[int] = None) -> str:
+        """
+        Emit the C kernel call(s) for this node.
+
+        Cache sync is handled entirely by the caller (inference_run):
+          - sync_to_device for graph inputs at the top of inference_run()
+          - sync_from_device for graph outputs at the bottom of inference_run()
+          - weights were flushed once in inference_init()
+          - internal (kernel-to-kernel) buffers need no sync
+
+        op_size overrides chunk_size for the non-broadcast case when the
+        output buffer is larger than numel due to upstream alignment padding.
+        """
         a  = self.inputs[0].c_name
         b  = self.inputs[1].c_name if self.arity == 2 else "NULL"
         c  = self.output.c_name
         op = OP_NAMES[self.op_code]
 
         if self.outer_count == 1:
-            # Non-broadcast: run_op() handles cache syncs internally.
-            # op_size overrides self.chunk_size when the output buffer is
-            # larger than numel due to upstream broadcast alignment padding.
             size = op_size if op_size is not None else self.chunk_size
             return f"    run_op({a}, {b}, {c}, {size}u, {op});"
 
-        # Broadcasting: sync whole buffers once, then loop with run_op_at().
+        # Broadcasting: loop over outer_count chunks with run_op_at().
         # The chunk stride uses the CHUNK_STRIDE macro (INFERENCE_ALIGN_UP of
         # CHUNK) so every iteration starts at an INFERENCE_ALIGN_BYTES-aligned
         # physical address.  Gap elements between data blocks are never touched
         # by VectorOPKernel (it receives the exact chunk_size as 'size').
         chunk_macro  = f"INFERENCE_{c.upper()}_CHUNK"
         stride_macro = f"INFERENCE_{c.upper()}_CHUNK_STRIDE"
-        n    = self.outer_count
+        n     = self.outer_count
         a_off = f"_i * {stride_macro}" if self.a_advances else "0u"
         b_off = (f"_i * {stride_macro}" if self.b_advances else "0u") \
                 if self.arity == 2 else "0u"
         c_off = f"_i * {stride_macro}"
 
-        lines = [f"    inference_buf_sync_to_device({a});"]
-        if self.arity == 2:
-            lines.append(f"    inference_buf_sync_to_device({b});")
-        lines.append(
-            f"    for (unsigned _i = 0u; _i < {n}u; _i++) {{"
-        )
-        lines.append(
+        return "\n".join([
+            f"    for (unsigned _i = 0u; _i < {n}u; _i++) {{",
             f"        run_op_at({a}, {a_off},"
             f" {b}, {b_off},"
             f" {c}, {c_off},"
-            f" {chunk_macro}, {op});"
-        )
-        lines.append("    }")
-        lines.append(f"    inference_buf_sync_from_device({c});")
-        return "\n".join(lines)
+            f" {chunk_macro}, {op});",
+            "    }",
+        ])
