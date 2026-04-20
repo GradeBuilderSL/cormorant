@@ -36,7 +36,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from ..nodes  import OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6
+from ..nodes  import OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6, MatmulNode
 from ..tensor import TensorInfo
 
 # Expected GT arrays larger than this threshold are written to external
@@ -152,6 +152,15 @@ class _SimulateMixin:
 
         # Node-by-node forward pass
         for sn in self._graph.nodes:
+            if isinstance(sn, MatmulNode):
+                a = arrays[sn.inputs[0].onnx_name]
+                b = arrays[sn.inputs[1].onnx_name]
+                result = np.matmul(a, b)
+                arrays[sn.output.onnx_name] = dtype.truncate(result).reshape(
+                    sn.output.shape
+                )
+                continue
+
             a = arrays[sn.inputs[0].onnx_name]
 
             if sn.op_code == OP_ADD:

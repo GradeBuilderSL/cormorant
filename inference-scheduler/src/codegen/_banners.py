@@ -5,7 +5,7 @@ import os
 import datetime
 
 from ..graph import OnnxGraph
-from ..nodes import OP_NAMES
+from ..nodes import OP_NAMES, MatmulNode
 
 
 def _banner(title: str) -> str:
@@ -17,8 +17,23 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
     ts         = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     model_name = os.path.basename(model_path)
     n_nodes    = len(graph.nodes)
-    ops_used   = sorted({OP_NAMES[sn.op_code] for sn in graph.nodes})
-    ops_str    = ", ".join(ops_used) if ops_used else "(none)"
+
+    # Collect op names: VectorOP codes for ScheduledNode, "MatMul" for MatmulNode
+    ops_used = sorted({
+        "MatMul" if isinstance(sn, MatmulNode) else OP_NAMES[sn.op_code]
+        for sn in graph.nodes
+    })
+    ops_str = ", ".join(ops_used) if ops_used else "(none)"
+
+    # Identify which kernel(s) are used
+    has_matmul   = any(isinstance(sn, MatmulNode) for sn in graph.nodes)
+    has_vectorop = any(not isinstance(sn, MatmulNode) for sn in graph.nodes)
+    if has_matmul and has_vectorop:
+        kernel_line = "MatmulKernel (matrix multiply) + VectorOPKernel (element-wise)"
+    elif has_matmul:
+        kernel_line = "MatmulKernel (matrix multiply, tiled)"
+    else:
+        kernel_line = "VectorOPKernel (element-wise, 1-D, II=1)"
 
     lines = [
         "/*",
@@ -37,7 +52,7 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
     lines += [
         " *",
         " * Target: Xilinx KV260 bare-metal, ap_fixed<16,8> data type",
-        " * Kernel: VectorOPKernel (element-wise, 1-D, II=1)",
+        f" * Kernel: {kernel_line}",
         " */",
     ]
     return "\n".join(lines)

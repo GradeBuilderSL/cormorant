@@ -42,6 +42,7 @@ import os
 from typing import List, Optional
 
 from ..graph  import OnnxGraph
+from ..nodes  import ScheduledNode, MatmulNode
 from ..tensor import TensorInfo, LARGE_WEIGHT_THRESHOLD
 from ..dtype  import DataType, AP_FIXED_16_8
 from ._banners import _file_banner
@@ -89,9 +90,14 @@ class _CoreMixin:
         for t in all_tensors:
             sizes[t.onnx_name] = t.numel
 
-        # Override for nodes that use broadcasting
+        # Override for VectorOP nodes that use chunk-based broadcasting.
+        # MatmulNode is excluded even when outer_count > 1: its outer loop
+        # uses physical-address offsets rather than alignment-padded chunks,
+        # so buffer sizes are just numel (set above) with no padding needed.
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
+                continue
+            if isinstance(sn, MatmulNode):
                 continue
             total = sn.outer_count * sn.aligned_chunk_size
 
@@ -111,7 +117,7 @@ class _CoreMixin:
                     sizes.get(sn.inputs[1].onnx_name, 0), b_size
                 )
 
-        # Propagate padded sizes through non-broadcast nodes.
+        # Propagate padded sizes through non-broadcast VectorOP nodes.
         # When a node's input was padded by an upstream broadcast op, its
         # output buffer must be at least as large so run_op() can process
         # the full padded range (including alignment gap elements) in one
@@ -119,8 +125,14 @@ class _CoreMixin:
         # smaller than the padded size is raised to that size so run_op()'s
         # uniform size argument is valid for every buffer in the operation.
         # Nodes are in topological order, so one forward pass is sufficient.
+        #
+        # MatmulNode is explicitly excluded: its inputs (A[N,K], B[K,M]) and
+        # output (Y[N,M]) have inherently different element counts, so the
+        # "uniform size" invariant does not apply.
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
+                continue
+            if isinstance(sn, MatmulNode):
                 continue
             max_input = max(sizes.get(inp.onnx_name, inp.numel)
                             for inp in sn.inputs)
@@ -199,6 +211,21 @@ class _CoreMixin:
         return (total + page - 1) & ~(page - 1)
 
     @property
+    def _has_matmul_nodes(self) -> bool:
+        """True when the graph contains at least one MatmulNode."""
+        return any(isinstance(sn, MatmulNode) for sn in self._graph.nodes)
+
+    @property
+    def _has_vectorop_nodes(self) -> bool:
+        """True when the graph contains at least one VectorOP ScheduledNode."""
+        return any(isinstance(sn, ScheduledNode) for sn in self._graph.nodes)
+
+    @property
+    def _driver_prefix(self) -> str:
+        """Lowercase driver filename prefix — 'xmatmulkernel' or 'xvectoropkernel'."""
+        return "xmatmulkernel" if self._has_matmul_nodes else "xvectoropkernel"
+
+    @property
     def large_weight_tensors(self) -> List[TensorInfo]:
         """Weight tensors stored as external .dat files.
         Empty when embed_large_weights=True (all weights inlined)."""
@@ -233,9 +260,13 @@ class _CoreMixin:
         """
         result = {}
 
-        # Pass 1 — broadcast nodes: collect advancing inputs and outputs.
+        # Pass 1 — VectorOP broadcast nodes: collect advancing inputs and outputs.
+        # MatmulNode is excluded: its outer_count > 1 means a run_matmul_at()
+        # loop with physical offsets, not chunk-stride alignment macros.
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
+                continue
+            if isinstance(sn, MatmulNode):
                 continue
             c_up         = sn.output.c_name.upper()
             chunk_macro  = f"INFERENCE_{c_up}_CHUNK"

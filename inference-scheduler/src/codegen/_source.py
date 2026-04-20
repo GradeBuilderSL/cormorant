@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes  import OP_NAMES, _ALIGN_BYTES
+from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode
 from ..tensor import LARGE_WEIGHT_THRESHOLD
 from ._banners import _banner, _file_banner
 
@@ -16,7 +16,11 @@ class _SourceMixin:
         parts = [
             _file_banner("inference.c", self._graph, self._model_path),
             self._source_includes(),
-            self._source_op_defines(),
+        ]
+        op_defines = self._source_op_defines()
+        if op_defines:
+            parts.append(op_defines)
+        parts += [
             self._weight_arrays(),
             self._buffer_declarations(),
             self._kernel_instance(),
@@ -29,10 +33,11 @@ class _SourceMixin:
     def _source_includes(self) -> str:
         stdio = '#include <stdio.h>    /* fopen, fread, snprintf */\n' \
                 if self.large_weight_tensors else ''
+        kernel_header = f'#include "{self._driver_prefix}.h"\n'
         return (
             _banner("Includes") +
             '#include "inference.h"\n'
-            '#include "xvectoropkernel.h"\n'
+            f'{kernel_header}'
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
             '\n'
@@ -51,6 +56,9 @@ class _SourceMixin:
         )
 
     def _source_op_defines(self) -> str:
+        """Emit VectorOPKernel op-code #defines.  Empty for MatMul-only models."""
+        if not self._has_vectorop_nodes:
+            return ""
         lines = [_banner("VectorOPKernel operation codes (must match VectorOP.h)")]
         for code, name in sorted(OP_NAMES.items()):
             lines.append(f"#define {name:<20} {code}u")
@@ -93,22 +101,46 @@ class _SourceMixin:
         return "\n".join(lines)
 
     def _kernel_instance(self) -> str:
+        if self._has_matmul_nodes:
+            type_name = "XMatmulkernel"
+        else:
+            type_name = "XVectoropkernel"
         return (
             _banner("Kernel driver instance") +
-            "static XVectoropkernel s_kernel;\n"
+            f"static {type_name} s_kernel;\n"
         )
 
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
-        need_run_op    = any(sn.outer_count == 1 for sn in nodes)
-        need_run_op_at = any(sn.outer_count >  1 for sn in nodes)
+        # Only VectorOP ScheduledNodes use run_op() / run_op_at()
+        need_run_op    = any(
+            isinstance(sn, ScheduledNode) and sn.outer_count == 1
+            for sn in nodes
+        )
+        need_run_op_at = any(
+            isinstance(sn, ScheduledNode) and sn.outer_count > 1
+            for sn in nodes
+        )
+        need_run_matmul = self._has_matmul_nodes
+        need_run_matmul_at = any(
+            isinstance(sn, MatmulNode) and sn.outer_count > 1
+            for sn in nodes
+        )
 
+        titles = []
         if need_run_op and need_run_op_at:
-            title = "run_op() / run_op_at() — VectorOPKernel dispatch helpers"
+            titles.append("run_op() / run_op_at() — VectorOPKernel dispatch helpers")
         elif need_run_op_at:
-            title = "run_op_at() — VectorOPKernel dispatch helper"
-        else:
-            title = "run_op() — VectorOPKernel dispatch helper"
+            titles.append("run_op_at() — VectorOPKernel dispatch helper")
+        elif need_run_op:
+            titles.append("run_op() — VectorOPKernel dispatch helper")
+        if need_run_matmul and need_run_matmul_at:
+            titles.append("run_matmul() / run_matmul_at() — MatmulKernel dispatch helpers")
+        elif need_run_matmul_at:
+            titles.append("run_matmul_at() — MatmulKernel dispatch helper")
+        elif need_run_matmul:
+            titles.append("run_matmul() — MatmulKernel dispatch helper")
+        title = " / ".join(titles) if titles else "Kernel dispatch helpers"
 
         parts = [_banner(title)]
 
@@ -189,6 +221,88 @@ class _SourceMixin:
                 "    XVectoropkernel_Set_op(&s_kernel, op);\n"
                 "    XVectoropkernel_Start(&s_kernel);\n"
                 "    while (!XVectoropkernel_IsDone(&s_kernel)) {}\n"
+                "}\n"
+            )
+
+        if need_run_matmul:
+            parts.append(
+                "/*\n"
+                " * run_matmul() — program XMatmulkernel AXI-Lite registers,\n"
+                " * start the kernel, and poll until done.\n"
+                " *\n"
+                " *   a / b / c   DMA buffer pointers (physical addresses via\n"
+                " *                inference_buf_phys())\n"
+                " *   n           output rows  (A.rows)\n"
+                " *   k           inner dim    (A.cols == B.rows)\n"
+                " *   m           output cols  (B.cols)\n"
+                " *   batch       number of independent matrix multiplications\n"
+                " *   a_stride    elements between consecutive A batch slices\n"
+                " *                (0 when batch == 1)\n"
+                " *   b_stride    elements between consecutive B batch slices\n"
+                " *                (0 when B broadcasts across batch)\n"
+                " *   c_stride    elements between consecutive Y batch slices\n"
+                " *                (0 when batch == 1)\n"
+                " */\n"
+                "static void run_matmul(\n"
+                "    inference_buf_t *a,\n"
+                "    inference_buf_t *b,\n"
+                "    inference_buf_t *c,\n"
+                "    uint32_t n, uint32_t k, uint32_t m, uint32_t batch,\n"
+                "    uint32_t a_stride, uint32_t b_stride, uint32_t c_stride)\n"
+                "{\n"
+                "    XMatmulkernel_Set_a(&s_kernel, inference_buf_phys(a));\n"
+                "    XMatmulkernel_Set_b(&s_kernel, inference_buf_phys(b));\n"
+                "    XMatmulkernel_Set_c(&s_kernel, inference_buf_phys(c));\n"
+                "    XMatmulkernel_Set_n(&s_kernel, n);\n"
+                "    XMatmulkernel_Set_k(&s_kernel, k);\n"
+                "    XMatmulkernel_Set_m(&s_kernel, m);\n"
+                "    XMatmulkernel_Set_batch(&s_kernel, batch);\n"
+                "    XMatmulkernel_Set_a_batch_stride(&s_kernel, a_stride);\n"
+                "    XMatmulkernel_Set_b_batch_stride(&s_kernel, b_stride);\n"
+                "    XMatmulkernel_Set_c_batch_stride(&s_kernel, c_stride);\n"
+                "    XMatmulkernel_Start(&s_kernel);\n"
+                "    while (!XMatmulkernel_IsDone(&s_kernel)) {}\n"
+                "}\n"
+            )
+
+        if need_run_matmul_at:
+            parts.append(
+                "/*\n"
+                " * run_matmul_at() — offset-based dispatch for outer-loop broadcasting.\n"
+                " *\n"
+                " * Used when one input has a leading batch dimension absent from the\n"
+                " * other.  The outer loop advances the larger-rank operand by one\n"
+                " * batch-block per step while the smaller-rank operand repeats at\n"
+                " * offset 0.  Element offsets are converted to byte offsets using\n"
+                " * INFERENCE_BYTES_PER_ELEM.\n"
+                " *\n"
+                " *   a_off / b_off / c_off   element offset into each buffer\n"
+                " */\n"
+                "static void run_matmul_at(\n"
+                "    inference_buf_t *a, unsigned a_off,\n"
+                "    inference_buf_t *b, unsigned b_off,\n"
+                "    inference_buf_t *c, unsigned c_off,\n"
+                "    uint32_t n, uint32_t k, uint32_t m, uint32_t batch,\n"
+                "    uint32_t a_stride, uint32_t b_stride, uint32_t c_stride)\n"
+                "{\n"
+                "    XMatmulkernel_Set_a(&s_kernel,\n"
+                "        inference_buf_phys(a)"
+                " + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM);\n"
+                "    XMatmulkernel_Set_b(&s_kernel,\n"
+                "        inference_buf_phys(b)"
+                " + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM);\n"
+                "    XMatmulkernel_Set_c(&s_kernel,\n"
+                "        inference_buf_phys(c)"
+                " + (uint64_t)c_off * INFERENCE_BYTES_PER_ELEM);\n"
+                "    XMatmulkernel_Set_n(&s_kernel, n);\n"
+                "    XMatmulkernel_Set_k(&s_kernel, k);\n"
+                "    XMatmulkernel_Set_m(&s_kernel, m);\n"
+                "    XMatmulkernel_Set_batch(&s_kernel, batch);\n"
+                "    XMatmulkernel_Set_a_batch_stride(&s_kernel, a_stride);\n"
+                "    XMatmulkernel_Set_b_batch_stride(&s_kernel, b_stride);\n"
+                "    XMatmulkernel_Set_c_batch_stride(&s_kernel, c_stride);\n"
+                "    XMatmulkernel_Start(&s_kernel);\n"
+                "    while (!XMatmulkernel_IsDone(&s_kernel)) {}\n"
                 "}\n"
             )
 
@@ -326,7 +440,7 @@ class _SourceMixin:
             "\n"
             f"{alloc_str}"
             "    /* Initialise kernel driver */\n"
-            "    rc = XVectoropkernel_Initialize(&s_kernel, instance_name);\n"
+            f"    rc = X{self._driver_prefix[1:].capitalize()}_Initialize(&s_kernel, instance_name);\n"
             "    if (rc != 0) goto fail;\n"
             "    return 0;\n"
             "\n"

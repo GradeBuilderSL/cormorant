@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..nodes  import _ALIGN_BYTES
+from ..nodes  import _ALIGN_BYTES, MatmulNode
 from ._banners import _banner
 
 
@@ -61,10 +61,14 @@ class _HeaderMixin:
         lines.append("")
 
         # ---- collect broadcast info for the SIZE-macro section ----
-        # Repeating tensors (weights / internal buffers) do not appear in
-        # the public header SIZE macros.
+        # Only VectorOP ScheduledNodes produce CHUNK/STRIDE alignment macros.
+        # MatmulNode with outer_count > 1 uses physical-address offsets instead,
+        # so it is excluded from broadcast_nodes and from bcast_map.
         bcast_map       = self._broadcast_io_map()   # onnx_name → (n, chunk_macro, stride_macro)
-        broadcast_nodes = [sn for sn in graph.nodes if sn.outer_count > 1]
+        broadcast_nodes = [
+            sn for sn in graph.nodes
+            if sn.outer_count > 1 and not isinstance(sn, MatmulNode)
+        ]
 
         # ---- Array-size macros ----
         # Emit CHUNK / CHUNK_STRIDE macros first (referenced by SIZE macros below).
