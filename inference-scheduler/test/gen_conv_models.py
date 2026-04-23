@@ -300,6 +300,52 @@ def gen_conv_auto_pad_valid() -> None:
     _save(model, "conv_auto_pad_valid.onnx")
 
 
+# ---------------------------------------------------------------------------
+# conv_two_layer_vgg: VGG-style two-layer conv block, 224×224 input.
+#
+# Mirrors the first two convolutional layers of VGG-16:
+#   Layer 1: X[1,3,224,224]   * W1[64,3,3,3]   → Z[1,64,222,222]  (no pad, stride=1)
+#   Layer 2: Z[1,64,222,222]  * W2[64,64,3,3]  → Y[1,64,220,220]  (no pad, stride=1)
+#
+# The 64×64×3×3 second-layer weight shape is what motivates the first layer:
+# the input has in_ch=3, so a 64→64 conv requires a preceding 3→64 lift.
+#
+# Weight sizes:
+#   W1: 64×3×3×3   = 1 728 elements  (<  4096 threshold → embedded as C array)
+#   W2: 64×64×3×3  = 36 864 elements (>  4096 threshold → external weights/W2.dat)
+# ---------------------------------------------------------------------------
+def gen_conv_two_layer_vgg() -> None:
+    w1_data = (np.random.randn(64, 3,  3, 3) * 0.1).astype(np.float32)
+    w2_data = (np.random.randn(64, 64, 3, 3) * 0.1).astype(np.float32)
+    w1_init = numpy_helper.from_array(w1_data, name="W1")
+    w2_init = numpy_helper.from_array(w2_data, name="W2")
+
+    conv1 = helper.make_node(
+        "Conv",
+        inputs=["X", "W1"],
+        outputs=["Z"],
+        kernel_shape=[3, 3],
+        strides=[1, 1],
+        pads=[0, 0, 0, 0],
+    )
+    conv2 = helper.make_node(
+        "Conv",
+        inputs=["Z", "W2"],
+        outputs=["Y"],
+        kernel_shape=[3, 3],
+        strides=[1, 1],
+        pads=[0, 0, 0, 0],
+    )
+    graph = helper.make_graph(
+        [conv1, conv2], "conv_two_layer_vgg",
+        inputs=[_vi("X", [1, 3, 224, 224])],
+        outputs=[_vi("Y", [1, 64, 220, 220])],
+        initializer=[w1_init, w2_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_two_layer_vgg.onnx")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -320,4 +366,5 @@ if __name__ == "__main__":
     gen_conv_depthwise()
     gen_conv_dilation()
     gen_conv_auto_pad_valid()
+    gen_conv_two_layer_vgg()
     print("Done.")

@@ -904,6 +904,173 @@ class TestResidual(unittest.TestCase):
         self.assertNotIn("INFERENCE_Y_CHUNK", hdr)
 
 
+@unittest.skipUnless(_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestSkipConnection(unittest.TestCase):
+    """mixed_skip_connection: X[4,8] → Z=MatMul(X,W[8,8]) → R=Relu(Z) → Y=Add(X,R).
+
+    True skip/residual connection: Y = X + Relu(X @ W).
+    X participates in both the MatMul path (as operand A) and the Add (as skip input).
+    All tensors flat (n_chunks=1); Add is non-broadcast (same-shape inputs).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path  = _mixed_model("mixed_skip_connection.onnx")
+        cls.graph = OnnxGraph(cls.path)
+        cls.gen   = CodeGenerator(cls.graph, model_path=cls.path)
+
+    # ---- Graph structure ----
+
+    def test_three_nodes(self):
+        from src.nodes import MatmulNode, ScheduledNode
+        nodes = self.graph.nodes
+        self.assertEqual(len(nodes), 3)
+        self.assertIsInstance(nodes[0], MatmulNode)   # MatMul
+        self.assertIsInstance(nodes[1], ScheduledNode) # Relu
+        self.assertIsInstance(nodes[2], ScheduledNode) # Add
+
+    def test_single_input_output(self):
+        self.assertEqual(len(self.graph.input_tensors),  1)
+        self.assertEqual(len(self.graph.output_tensors), 1)
+        self.assertEqual(self.graph.input_tensors[0].shape,  [4, 8])
+        self.assertEqual(self.graph.output_tensors[0].shape, [4, 8])
+
+    def test_x_is_both_matmul_input_and_add_input(self):
+        """X participates in MatMul (operand A) and in Add (skip path)."""
+        from src.nodes import MatmulNode, ScheduledNode
+        mm  = self.graph.nodes[0]
+        add = self.graph.nodes[2]
+        self.assertEqual(mm.inputs[0].onnx_name, "X")
+        input_names = {t.onnx_name for t in add.inputs}
+        self.assertIn("X", input_names)
+
+    # ---- MatmulNode geometry ----
+
+    def test_matmul_dims(self):
+        from src.nodes import MatmulNode
+        mm = self.graph.nodes[0]
+        self.assertEqual(mm.n, 4)
+        self.assertEqual(mm.k, 8)
+        self.assertEqual(mm.m, 8)   # W is square [8,8]
+
+    def test_matmul_plain_2d(self):
+        """W is 2-D: batch=1, all strides zero (no batch loop)."""
+        mm = self.graph.nodes[0]
+        self.assertEqual(mm.batch, 1)
+        self.assertEqual(mm.a_batch_stride, 0)
+        self.assertEqual(mm.b_batch_stride, 0)
+        self.assertEqual(mm.c_batch_stride, 0)
+        self.assertEqual(mm.outer_count,    1)
+
+    # ---- TensorLayouts ----
+
+    def test_all_tensors_flat(self):
+        for name in ("Z", "R", "Y"):
+            lay = self.gen._layouts[name]
+            self.assertEqual(lay.n_chunks, 1, f"{name} should be flat")
+            self.assertEqual(lay.gap,      0, f"{name} should have no gap")
+
+    def test_x_layout_flat(self):
+        lay = self.gen._layouts["X"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.numel, 32)
+        self.assertEqual(lay.alloc, 32)
+
+    def test_z_numel(self):
+        self.assertEqual(self.gen._layouts["Z"].numel, 32)  # 4*8
+
+    def test_no_broadcast_in_io_map(self):
+        self.assertEqual(self.gen._broadcast_io_map(), {})
+
+    # ---- Generated source ----
+
+    def _src(self):
+        return self.gen.generate_source()
+
+    def test_matmul_call_plain(self):
+        """run_matmul(X, W, Z, 4u, 8u, 8u, 1u, 0u, 0u, 0u)."""
+        s = self._src()
+        self.assertIn("4u, 8u, 8u, 1u,", s)
+        self.assertIn("0u, 0u, 0u", s)
+
+    def test_relu_call(self):
+        """run_op(Z, NULL, R, 32u, VECTOROP_RELU)."""
+        s = self._src()
+        self.assertIn("32u, VECTOROP_RELU", s)
+
+    def test_add_call_with_x_as_skip(self):
+        """Add uses X (skip path) and R (transformed path) → Y."""
+        s = self._src()
+        # run_op(X, R, Y, 32u, VECTOROP_ADD) — X is the skip input
+        self.assertIn("32u, VECTOROP_ADD", s)
+        self.assertIn("run_op(X, R, Y", s)
+
+    def test_three_kernel_calls_in_order(self):
+        s = self._src()
+        # Search within the inference_run body to avoid matching the file banner
+        body_start = s.find("void inference_run(")
+        body = s[body_start:]
+        mm_pos   = body.find("run_matmul(")
+        relu_pos = body.find("VECTOROP_RELU")
+        add_pos  = body.find("VECTOROP_ADD")
+        self.assertLess(mm_pos,   relu_pos)
+        self.assertLess(relu_pos, add_pos)
+
+    def test_no_run_op_at(self):
+        """No broadcast loops — run_op_at must not appear."""
+        self.assertNotIn("run_op_at(", self._src())
+
+    def test_both_kernels_active(self):
+        names = [kd.name for kd in self.gen._active_kernels]
+        self.assertIn("VectorOPKernel", names)
+        self.assertIn("MatmulKernel",   names)
+
+    def test_no_chunk_macros_in_header(self):
+        hdr = self.gen.generate_header()
+        for tensor in ("X", "Z", "R", "Y"):
+            self.assertNotIn(f"INFERENCE_{tensor}_CHUNK", hdr)
+
+    # ---- Simulation ----
+
+    def test_simulate_output_shape(self):
+        arrays = self.gen._simulate()
+        self.assertEqual(list(arrays["Y"].shape), [4, 8])
+
+    def test_simulate_residual_identity(self):
+        """When W=0, Relu(X@0)=0 and Y=X+0=X: output equals input."""
+        from src.graph   import OnnxGraph
+        from src.codegen import CodeGenerator
+        import onnx, numpy as np
+        from onnx import helper, TensorProto, numpy_helper
+
+        w_zero = numpy_helper.from_array(
+            np.zeros((8, 8), dtype=np.float32), name="W"
+        )
+        mm   = helper.make_node("MatMul", inputs=["X", "W"], outputs=["Z"])
+        relu = helper.make_node("Relu",   inputs=["Z"],      outputs=["R"])
+        add  = helper.make_node("Add",    inputs=["X", "R"], outputs=["Y"])
+        graph = helper.make_graph(
+            [mm, relu, add], "skip_zero",
+            inputs=[helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 8])],
+            outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 8])],
+            initializer=[w_zero],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
+            onnx.save(model, f.name)
+            tmp = f.name
+        try:
+            gen = CodeGenerator(OnnxGraph(tmp), model_path=tmp)
+            x_in = np.ones((4, 8), dtype=np.float64) * 0.5
+            result = gen.simulate({"X": x_in})
+            np.testing.assert_array_equal(result["Y"], x_in)
+        finally:
+            os.unlink(tmp)
+
+
 @unittest.skipUnless(_new_mixed_models_exist(),
                      "Run test/gen_mixed_kernel_models.py first")
 class TestBatchMatmulRelu(unittest.TestCase):
@@ -1319,6 +1486,129 @@ class TestTwoInputTwoOutput(unittest.TestCase):
         hdr = self.gen.generate_header()
         self.assertIn("inference_buf_t *Yadd", hdr)
         self.assertIn("inference_buf_t *Yrelu", hdr)
+
+
+@unittest.skipUnless(_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestSpatialMatmulRelu(unittest.TestCase):
+    """X[1,3,224,224] @ W[224,10] → Z[1,3,224,10] → Relu → Y[1,3,224,10].
+
+    4-D × 2-D batched MatMul: W broadcasts across all leading dims of X.
+    The last two dims of X are the matrix dims [n=224, k=224]; the leading
+    dims [1, 3] are the batch → batch = 1*3 = 3.
+    MatmulKernel: n=224, k=224, m=10, batch=3,
+                  a_batch_stride=50176, b_batch_stride=0, c_batch_stride=2240.
+    VectorOPKernel: Relu on Z (6720 elements), flat layout.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _mixed_model("mixed_spatial_matmul_relu.onnx")
+        cls.graph = OnnxGraph(cls.path)
+        cls.gen   = CodeGenerator(cls.graph, model_path=cls.path)
+
+    # ---- Graph structure ----
+
+    def test_two_nodes(self):
+        from src.nodes import MatmulNode, ScheduledNode
+        self.assertEqual(len(self.graph.nodes), 2)
+        self.assertIsInstance(self.graph.nodes[0], MatmulNode)
+        self.assertIsInstance(self.graph.nodes[1], ScheduledNode)
+
+    def test_input_shape(self):
+        inputs = self.graph.input_tensors
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(inputs[0].shape, [1, 3, 224, 224])
+
+    def test_output_shape(self):
+        outputs = self.graph.output_tensors
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].shape, [1, 3, 224, 10])
+
+    # ---- MatmulNode geometry ----
+
+    def test_matmul_dims(self):
+        from src.nodes import MatmulNode
+        mm = self.graph.nodes[0]
+        self.assertIsInstance(mm, MatmulNode)
+        self.assertEqual(mm.n, 224)
+        self.assertEqual(mm.k, 224)
+        self.assertEqual(mm.m,  10)
+
+    def test_matmul_batch(self):
+        mm = self.graph.nodes[0]
+        # a_batch = A.shape[:-2] = [1, 3]; batch = 1 * 3 = 3
+        # The last two dims [224, 224] are the n×k matrix dims, not batch.
+        self.assertEqual(mm.batch, 3)
+
+    def test_matmul_strides(self):
+        mm = self.graph.nodes[0]
+        self.assertEqual(mm.a_batch_stride, 224 * 224)   # 50176
+        self.assertEqual(mm.b_batch_stride, 0)            # W broadcasts
+        self.assertEqual(mm.c_batch_stride, 224 * 10)    # 2240
+
+    def test_no_outer_loop(self):
+        mm = self.graph.nodes[0]
+        self.assertEqual(mm.outer_count, 1)
+
+    # ---- TensorLayouts ----
+
+    def test_z_flat(self):
+        z_lay = self.gen._layouts["Z"]
+        self.assertEqual(z_lay.n_chunks, 1)
+        self.assertEqual(z_lay.numel,   1 * 3 * 224 * 10)  # 6720
+        self.assertEqual(z_lay.alloc,   6720)
+
+    def test_y_flat(self):
+        y_lay = self.gen._layouts["Y"]
+        self.assertEqual(y_lay.n_chunks, 1)
+        self.assertEqual(y_lay.numel,   6720)
+        self.assertEqual(y_lay.alloc,   6720)
+
+    def test_w_flat(self):
+        w_lay = self.gen._layouts["W"]
+        self.assertEqual(w_lay.n_chunks, 1)
+        self.assertEqual(w_lay.numel,   224 * 10)  # 2240
+        self.assertEqual(w_lay.alloc,   2240)
+
+    # ---- Generated source ----
+
+    def _src(self):
+        return self.gen.generate_source()
+
+    def test_run_matmul_call_correct_dims(self):
+        s = self._src()
+        # n=224, k=224, m=10, batch=3 (leading dims [1,3] of A)
+        self.assertIn("224u, 224u, 10u, 3u,", s)
+
+    def test_run_matmul_strides(self):
+        s = self._src()
+        # a_batch_stride=50176, b_batch_stride=0, c_batch_stride=2240
+        self.assertIn("50176u, 0u, 2240u", s)
+
+    def test_relu_call_correct_size(self):
+        s = self._src()
+        # run_op(Z, NULL, Y, 6720u, VECTOROP_RELU)
+        self.assertIn("6720u, VECTOROP_RELU", s)
+
+    def test_both_kernels_active(self):
+        names = [kd.name for kd in self.gen._active_kernels]
+        self.assertIn("VectorOPKernel", names)
+        self.assertIn("MatmulKernel",   names)
+
+    # ---- Simulation ----
+
+    def test_simulate_output_shape(self):
+        arrays = self.gen._simulate()
+        self.assertEqual(list(arrays["Y"].shape), [1, 3, 224, 10])
+
+    def test_simulate_output_nonneg(self):
+        arrays = self.gen._simulate()
+        self.assertTrue((arrays["Y"] >= 0).all(), "Relu output must be non-negative")
+
+    def test_intermediate_z_shape(self):
+        arrays = self.gen._simulate()
+        self.assertEqual(list(arrays["Z"].shape), [1, 3, 224, 10])
 
 
 if __name__ == "__main__":

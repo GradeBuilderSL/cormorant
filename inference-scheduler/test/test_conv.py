@@ -462,5 +462,142 @@ class TestConvEmit(unittest.TestCase):
         self.assertIn(bias_name, call)
 
 
+# ---------------------------------------------------------------------------
+# Two-layer VGG-style conv block: X[1,3,224,224] → [1,64,222,222] → [1,64,220,220]
+# ---------------------------------------------------------------------------
+
+def _vgg_model_exists() -> bool:
+    return os.path.isfile(_conv_model("conv_two_layer_vgg.onnx"))
+
+
+@unittest.skipUnless(_vgg_model_exists(),
+                     "Run test/gen_conv_models.py first")
+class TestConvTwoLayerVGG(unittest.TestCase):
+    """Scheduler correctness for the 224×224 two-layer VGG-style conv block."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gen = _gen("conv_two_layer_vgg.onnx")
+        cls.graph = cls.gen._graph
+
+    def _src(self) -> str:
+        return self.gen.generate_source()
+
+    # ---- Graph structure ------------------------------------------------
+
+    def test_two_conv_nodes(self):
+        self.assertEqual(len(self.graph.nodes), 2)
+        for sn in self.graph.nodes:
+            self.assertIsInstance(sn, ConvNode)
+
+    def test_single_input_output(self):
+        self.assertEqual(len(self.graph.input_tensors),  1)
+        self.assertEqual(len(self.graph.output_tensors), 1)
+
+    # ---- First layer geometry -------------------------------------------
+
+    def test_layer1_in_shape(self):
+        sn = self.graph.nodes[0]
+        self.assertEqual(sn.batch,  1)
+        self.assertEqual(sn.in_ch,  3)
+        self.assertEqual(sn.in_h,   224)
+        self.assertEqual(sn.in_w,   224)
+
+    def test_layer1_out_shape(self):
+        sn = self.graph.nodes[0]
+        self.assertEqual(sn.out_ch, 64)
+        self.assertEqual(sn.out_h,  222)   # (224 - 3) / 1 + 1
+        self.assertEqual(sn.out_w,  222)
+
+    def test_layer1_kernel(self):
+        sn = self.graph.nodes[0]
+        self.assertEqual(sn.kh, 3)
+        self.assertEqual(sn.kw, 3)
+        self.assertEqual(sn.stride_h, 1)
+        self.assertEqual(sn.stride_w, 1)
+        self.assertFalse(sn.has_bias)
+
+    # ---- Second layer geometry ------------------------------------------
+
+    def test_layer2_in_shape(self):
+        sn = self.graph.nodes[1]
+        self.assertEqual(sn.in_ch, 64)
+        self.assertEqual(sn.in_h,  222)
+        self.assertEqual(sn.in_w,  222)
+
+    def test_layer2_out_shape(self):
+        sn = self.graph.nodes[1]
+        self.assertEqual(sn.out_ch, 64)
+        self.assertEqual(sn.out_h,  220)   # (222 - 3) / 1 + 1
+        self.assertEqual(sn.out_w,  220)
+
+    def test_layer2_kernel(self):
+        sn = self.graph.nodes[1]
+        self.assertEqual(sn.kh, 3)
+        self.assertEqual(sn.kw, 3)
+        self.assertFalse(sn.has_bias)
+
+    # ---- Tensor layouts -------------------------------------------------
+
+    def test_intermediate_z_flat(self):
+        # Z is the output of layer 1 and input of layer 2; must be flat
+        z_lay = self.gen._layouts["Z"]
+        self.assertEqual(z_lay.n_chunks, 1)
+        self.assertEqual(z_lay.numel, 1 * 64 * 222 * 222)
+        self.assertEqual(z_lay.alloc,   z_lay.numel)
+
+    def test_output_y_flat(self):
+        y_lay = self.gen._layouts["Y"]
+        self.assertEqual(y_lay.n_chunks, 1)
+        self.assertEqual(y_lay.numel, 1 * 64 * 220 * 220)
+
+    # ---- Large weight goes to external .dat file ------------------------
+
+    def test_w2_is_large_weight(self):
+        # W2[64,64,3,3] = 36 864 elements > LARGE_WEIGHT_THRESHOLD (4096)
+        large = self.gen.large_weight_tensors
+        names = [t.onnx_name for t in large]
+        self.assertIn("W2", names)
+
+    def test_w1_is_embedded(self):
+        # W1[64,3,3,3] = 1 728 elements < threshold → not in large list
+        large = self.gen.large_weight_tensors
+        names = [t.onnx_name for t in large]
+        self.assertNotIn("W1", names)
+
+    # ---- Generated source -----------------------------------------------
+
+    def test_no_run_op_pure_conv(self):
+        self.assertNotIn("run_op(", self._src())
+
+    def test_two_run_conv_calls(self):
+        s = self._src()
+        body = s[s.find("void inference_run("):]
+        self.assertEqual(body.count("run_conv("), 2)
+
+    def test_run_conv_calls_in_order(self):
+        s = self._src()
+        body = s[s.find("void inference_run("):]
+        first  = body.find("run_conv(")
+        second = body.find("run_conv(", first + 1)
+        self.assertGreater(second, first)
+
+    def test_conv_only_kernel_active(self):
+        names = [kd.name for kd in self.gen._active_kernels]
+        self.assertEqual(names, ["ConvKernel"])
+
+    def test_layer1_dims_in_source(self):
+        s = self._src()
+        # First call: batch=1 in_ch=3 in_h=224 in_w=224 out_ch=64 ...
+        self.assertIn("224u,", s)
+        self.assertIn("3u,",   s)
+
+    def test_layer2_in_ch_64_in_source(self):
+        s = self._src()
+        # Second call uses in_ch=64 and in_h/in_w=222
+        self.assertIn("222u,", s)
+        self.assertIn("64u,",  s)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

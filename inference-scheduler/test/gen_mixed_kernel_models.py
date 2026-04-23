@@ -364,6 +364,63 @@ def gen_two_input_two_output(n=4, k=8, m=4) -> None:
     _save(model, "mixed_two_input_two_output.onnx")
 
 
+def gen_spatial_matmul_relu() -> None:
+    """X[1,3,224,224] @ W[224,10] → Z[1,3,224,10] → Relu → Y[1,3,224,10].
+
+    4-D × 2-D batched MatMul: the last two dims of X are the matrix dims
+    [n=224, k=224]; leading dims [1,3] are the batch → batch = 1*3 = 3.
+    W (2-D) broadcasts across all leading dims of X.
+    MatmulKernel: n=224, k=224, m=10, batch=3,
+                  a_batch_stride=50176, b_batch_stride=0, c_batch_stride=2240.
+    Relu is a plain non-broadcast VectorOPKernel call on Z → Y (6720 elements).
+    """
+    w_data = (np.random.randn(224, 10) * 0.01).astype(np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+
+    mm   = helper.make_node("MatMul", inputs=["X", "W"], outputs=["Z"])
+    relu = helper.make_node("Relu",   inputs=["Z"],      outputs=["Y"])
+
+    graph = helper.make_graph(
+        [mm, relu],
+        "spatial_matmul_relu",
+        inputs=[helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 224, 224])],
+        outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3, 224, 10])],
+        initializer=[w_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "mixed_spatial_matmul_relu.onnx")
+
+
+def gen_skip_connection(n=4, k=8) -> None:
+    """X[4,8] → Z=MatMul(X, W[8,8]) → R=Relu(Z) → Y=Add(X, R): Y = X + Relu(X @ W).
+
+    True skip/residual connection: X flows through both the MatMul path and the
+    identity path, then the two paths are summed.  W is square so the MatMul
+    output has the same shape as X, making the Add non-broadcast.
+
+    MatmulKernel: n=4, k=8, m=8, batch=1, all strides=0 (plain 2-D).
+    VectorOPKernel (Relu): run_op(Z, NULL, R, 32u, VECTOROP_RELU).
+    VectorOPKernel (Add):  run_op(X, R, Y, 32u, VECTOROP_ADD).
+    All layouts flat (n_chunks=1, gap=0).
+    """
+    w_data = (np.random.randn(k, k) * 0.5).astype(np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+
+    mm   = helper.make_node("MatMul", inputs=["X", "W"], outputs=["Z"])
+    relu = helper.make_node("Relu",   inputs=["Z"],      outputs=["R"])
+    add  = helper.make_node("Add",    inputs=["X", "R"], outputs=["Y"])
+
+    graph = helper.make_graph(
+        [mm, relu, add],
+        "skip_connection",
+        inputs=[helper.make_tensor_value_info("X", TensorProto.FLOAT, [n, k])],
+        outputs=[helper.make_tensor_value_info("Y", TensorProto.FLOAT, [n, k])],
+        initializer=[w_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "mixed_skip_connection.onnx")
+
+
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     print("Generating mixed-kernel test models...")
@@ -381,4 +438,6 @@ if __name__ == "__main__":
     gen_two_input_matmul()
     gen_two_output()
     gen_two_input_two_output()
+    gen_spatial_matmul_relu()
+    gen_skip_connection()
     print("Done.")
