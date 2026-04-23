@@ -5,7 +5,7 @@ import os
 import datetime
 
 from ..graph import OnnxGraph
-from ..nodes import OP_NAMES, MatmulNode
+from ..nodes import OP_NAMES, MatmulNode, ConvNode
 
 
 def _banner(title: str) -> str:
@@ -18,22 +18,29 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
     model_name = os.path.basename(model_path)
     n_nodes    = len(graph.nodes)
 
-    # Collect op names: VectorOP codes for ScheduledNode, "MatMul" for MatmulNode
+    # Collect op names per node type
     ops_used = sorted({
-        "MatMul" if isinstance(sn, MatmulNode) else OP_NAMES[sn.op_code]
+        "MatMul" if isinstance(sn, MatmulNode)
+        else "Conv"  if isinstance(sn, ConvNode)
+        else OP_NAMES[sn.op_code]
         for sn in graph.nodes
     })
     ops_str = ", ".join(ops_used) if ops_used else "(none)"
 
     # Identify which kernel(s) are used
     has_matmul   = any(isinstance(sn, MatmulNode) for sn in graph.nodes)
-    has_vectorop = any(not isinstance(sn, MatmulNode) for sn in graph.nodes)
-    if has_matmul and has_vectorop:
-        kernel_line = "MatmulKernel (matrix multiply) + VectorOPKernel (element-wise)"
-    elif has_matmul:
-        kernel_line = "MatmulKernel (matrix multiply, tiled)"
-    else:
-        kernel_line = "VectorOPKernel (element-wise, 1-D, II=1)"
+    has_conv     = any(isinstance(sn, ConvNode)   for sn in graph.nodes)
+    has_vectorop = any(
+        not isinstance(sn, (MatmulNode, ConvNode)) for sn in graph.nodes
+    )
+    kernel_parts = []
+    if has_vectorop:
+        kernel_parts.append("VectorOPKernel (element-wise, 1-D, II=1)")
+    if has_matmul:
+        kernel_parts.append("MatmulKernel (matrix multiply, tiled)")
+    if has_conv:
+        kernel_parts.append("ConvKernel (2-D convolution, NCHW)")
+    kernel_line = " + ".join(kernel_parts) if kernel_parts else "unknown"
 
     lines = [
         "/*",

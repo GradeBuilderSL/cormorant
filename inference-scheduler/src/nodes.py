@@ -1,6 +1,6 @@
 """
 Supported ONNX operators and their mapping to VectorOPKernel op codes,
-plus MatmulNode for the separate MatmulKernel IP.
+plus MatmulNode for the separate MatmulKernel IP and ConvNode for ConvKernel.
 
 Each ScheduledNode wraps one onnx.NodeProto, holds resolved TensorInfo
 references for its inputs/outputs, and knows how to emit the corresponding
@@ -8,6 +8,9 @@ run_op() / run_op_at() call in the generated C file.
 
 MatmulNode wraps a MatMul ONNX op and emits run_matmul() calls for
 the XMatmulkernel driver API.
+
+ConvNode wraps a Conv ONNX op and emits run_conv() calls for
+the XConvkernel driver API.  Only 2-D convolution (4-D input) is supported.
 
 Supported ONNX ops (VectorOPKernel)
 ------------------------------------
@@ -21,6 +24,10 @@ Supported ONNX ops (VectorOPKernel)
 Supported ONNX ops (MatmulKernel)
 ----------------------------------
   MatMul              → run_matmul()  (2-D and batched 3-D)
+
+Supported ONNX ops (ConvKernel)
+--------------------------------
+  Conv (2-D, NCHW)    → run_conv()
 
 All other ops raise SchedulerError.
 
@@ -798,3 +805,278 @@ class MatmulNode:
             f" {self.c_batch_stride}u);",
             "    }",
         ])
+
+
+# ------------------------------------------------------------------ #
+# ConvNode                                                             #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class ConvNode:
+    """One ONNX Conv operator mapped to one XConvkernel invocation.
+
+    Supports 2-D convolution with NCHW layout:
+      x      [N, C, H, W]  — input feature map
+      weight [M, C, kH, kW] — filters (M output channels)
+      bias   [M]            — optional per-channel bias
+      y      [N, M, oH, oW] — output feature map
+
+    auto_pad modes supported: NOTSET, VALID, SAME_UPPER, SAME_LOWER.
+    Only dilations == [1,1] are strictly needed (ConvKernel supports arbitrary
+    dilation, so we pass whatever ONNX specifies).
+
+    The output is always NCHW-flat.  ConvNode is excluded from phases 2 and 3
+    of _compute_tensor_layouts() so that broadcast VectorOP nodes downstream
+    of a Conv never see advancing-strided buffers that ConvKernel didn't fill.
+    Any graph that requires broadcasting immediately after a Conv (other than
+    the Conv's own bias) must use the Conv's built-in bias input, not a
+    separate Add node.
+
+    Compatibility shims (init=False)
+    ---------------------------------
+    outer_count, chunk_size, aligned_chunk_size, a_advances, b_advances, arity
+    — set to neutral values so that _compute_tensor_layouts() phase 2/3 exclusion
+    guards (isinstance checks) are the only gating logic needed.
+    """
+
+    kernel_name: ClassVar[str] = "ConvKernel"
+
+    onnx_node:   onnx.NodeProto
+    inputs:      List[TensorInfo]   # [x, weight] or [x, weight, bias]
+    output:      TensorInfo
+    index:       int = 0
+    align_elems: int = 8
+
+    # Conv geometry (derived from ONNX attributes + shape inference)
+    batch:       int = 1
+    in_ch:       int = 0
+    in_h:        int = 0
+    in_w:        int = 0
+    out_ch:      int = 0
+    out_h:       int = 0
+    out_w:       int = 0
+    kh:          int = 1
+    kw:          int = 1
+    stride_h:    int = 1
+    stride_w:    int = 1
+    dilation_h:  int = 1
+    dilation_w:  int = 1
+    pad_top:     int = 0
+    pad_left:    int = 0
+    has_bias:    bool = False
+
+    # Compatibility shims — never set by callers.
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=2,    init=False)
+
+    # ------------------------------------------------------------------ #
+    # Factory                                                              #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def from_onnx_node(
+        cls,
+        node:        onnx.NodeProto,
+        tensors:     dict,
+        index:       int,
+        align_elems: int = 8,
+    ) -> "ConvNode":
+        if node.op_type != "Conv":
+            raise SchedulerError(
+                f"ConvNode.from_onnx_node() called with op_type='{node.op_type}'"
+            )
+
+        # ONNX Conv has 2 required inputs (x, W) and 1 optional input (B).
+        n_inputs = len([nm for nm in node.input if nm != ""])
+        if n_inputs not in (2, 3):
+            raise SchedulerError(
+                f"Conv node '{node.name}' must have 2 or 3 inputs, got {n_inputs}."
+            )
+
+        for tname in node.input[:n_inputs]:
+            if tname == "":
+                continue
+            if tname not in tensors:
+                raise SchedulerError(
+                    f"Tensor '{tname}' referenced by Conv node "
+                    f"'{node.name}' not found in graph."
+                )
+
+        x_info  = tensors[node.input[0]]
+        w_info  = tensors[node.input[1]]
+        has_b   = n_inputs == 3 and node.input[2] != ""
+        b_info  = tensors[node.input[2]] if has_b else None
+
+        if not node.output or node.output[0] == "":
+            raise SchedulerError(f"Conv node '{node.name}' has no output.")
+        out_name = node.output[0]
+        if out_name not in tensors:
+            raise SchedulerError(
+                f"Output tensor '{out_name}' of Conv node '{node.name}' "
+                f"not found in graph."
+            )
+        y_info = tensors[out_name]
+
+        # --- Validate input/weight shapes ---
+        if len(x_info.shape) != 4:
+            raise SchedulerError(
+                f"Conv node '{node.name}': input must be 4-D (NCHW), "
+                f"got shape {x_info.shape}."
+            )
+        if len(w_info.shape) != 4:
+            raise SchedulerError(
+                f"Conv node '{node.name}': weight must be 4-D (M,C,kH,kW), "
+                f"got shape {w_info.shape}."
+            )
+        if len(y_info.shape) != 4:
+            raise SchedulerError(
+                f"Conv node '{node.name}': output must be 4-D (NCHW), "
+                f"got shape {y_info.shape}."
+            )
+
+        # --- Parse ONNX attributes ---
+        attrs = {a.name: a for a in node.attribute}
+
+        def _int_list(name: str, default: List[int]) -> List[int]:
+            return (list(attrs[name].ints) if name in attrs else default)
+
+        # ConvKernel does not support grouped (depthwise) convolutions.
+        # Check this before channel validation to give a clearer error.
+        group = attrs["group"].i if "group" in attrs else 1
+        if group != 1:
+            raise SchedulerError(
+                f"Conv node '{node.name}': grouped convolution (group={group}) "
+                f"is not supported by ConvKernel. "
+                f"Only standard convolution (group=1) is supported."
+            )
+
+        n_val, c_in, h_in, w_in = x_info.shape
+        m_val, c_w, kh_val, kw_val = w_info.shape
+        _, _, h_out, w_out = y_info.shape
+
+        if c_w != c_in:
+            raise SchedulerError(
+                f"Conv node '{node.name}': weight in_channels={c_w} "
+                f"!= input in_channels={c_in}."
+            )
+        if m_val != y_info.shape[1]:
+            raise SchedulerError(
+                f"Conv node '{node.name}': weight out_channels={m_val} "
+                f"!= output channels={y_info.shape[1]}."
+            )
+
+        strides    = _int_list("strides",   [1, 1])
+        dilations  = _int_list("dilations", [1, 1])
+        pads_attr  = _int_list("pads",      [0, 0, 0, 0])  # [top,left,bottom,right]
+        auto_pad   = (attrs["auto_pad"].s.decode("utf-8")
+                      if "auto_pad" in attrs else "NOTSET")
+
+        if len(strides) != 2:
+            raise SchedulerError(
+                f"Conv node '{node.name}': only 2-D strides supported, got {strides}."
+            )
+        if len(dilations) != 2:
+            raise SchedulerError(
+                f"Conv node '{node.name}': only 2-D dilations supported, "
+                f"got {dilations}."
+            )
+
+        sh, sw = strides
+        dh, dw = dilations
+
+        # --- Derive padding ---
+        if auto_pad == "NOTSET":
+            pad_top_val  = pads_attr[0]
+            pad_left_val = pads_attr[1]
+        elif auto_pad == "VALID":
+            pad_top_val  = 0
+            pad_left_val = 0
+        elif auto_pad in ("SAME_UPPER", "SAME_LOWER"):
+            # Effective kernel size
+            eff_kh = dh * (kh_val - 1) + 1
+            eff_kw = dw * (kw_val - 1) + 1
+            pad_h = max(0, (h_out - 1) * sh + eff_kh - h_in)
+            pad_w = max(0, (w_out - 1) * sw + eff_kw - w_in)
+            if auto_pad == "SAME_UPPER":
+                pad_top_val  = pad_h // 2
+                pad_left_val = pad_w // 2
+            else:
+                pad_top_val  = (pad_h + 1) // 2
+                pad_left_val = (pad_w + 1) // 2
+        else:
+            raise SchedulerError(
+                f"Conv node '{node.name}': unsupported auto_pad='{auto_pad}'."
+            )
+
+        inputs_list: List[TensorInfo] = [x_info, w_info]
+        if has_b and b_info is not None:
+            inputs_list.append(b_info)
+
+        return cls(
+            onnx_node=node,
+            inputs=inputs_list,
+            output=y_info,
+            index=index,
+            align_elems=align_elems,
+            batch=n_val,
+            in_ch=c_in,
+            in_h=h_in,
+            in_w=w_in,
+            out_ch=m_val,
+            out_h=h_out,
+            out_w=w_out,
+            kh=kh_val,
+            kw=kw_val,
+            stride_h=sh,
+            stride_w=sw,
+            dilation_h=dh,
+            dilation_w=dw,
+            pad_top=pad_top_val,
+            pad_left=pad_left_val,
+            has_bias=has_b,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Code emission                                                        #
+    # ------------------------------------------------------------------ #
+
+    def emit_comment(self) -> str:
+        x_name = self.inputs[0].onnx_name
+        w_name = self.inputs[1].onnx_name
+        bias_str = (
+            f", bias={self.inputs[2].onnx_name}" if self.has_bias else ""
+        )
+        k_str = (
+            f"{self.kh}x{self.kw}"
+            if self.kh != self.kw else f"{self.kh}"
+        )
+        return (
+            f"    /* [{self.index}] Conv({x_name}, {w_name}{bias_str})"
+            f" -> {self.output.onnx_name}"
+            f"  [{self.batch},{self.in_ch},{self.in_h},{self.in_w}]"
+            f"→[{self.batch},{self.out_ch},{self.out_h},{self.out_w}]"
+            f"  k={k_str}"
+            f" s={self.stride_h}x{self.stride_w}"
+            f" p={self.pad_top},{self.pad_left} */"
+        )
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        x      = self.inputs[0].c_name
+        weight = self.inputs[1].c_name
+        bias   = self.inputs[2].c_name if self.has_bias else "NULL"
+        y      = self.output.c_name
+        hb     = "1u" if self.has_bias else "0u"
+        return (
+            f"    run_conv({x}, {weight}, {bias}, {y},\n"
+            f"             {self.batch}u, {self.in_ch}u,"
+            f" {self.in_h}u, {self.in_w}u,\n"
+            f"             {self.out_ch}u, {self.out_h}u, {self.out_w}u,\n"
+            f"             {self.kh}u, {self.kw}u,"
+            f" {self.stride_h}u, {self.stride_w}u,\n"
+            f"             {self.dilation_h}u, {self.dilation_w}u,"
+            f" {self.pad_top}u, {self.pad_left}u, {hb});"
+        )

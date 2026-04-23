@@ -36,10 +36,51 @@ from typing import Dict, List
 
 import numpy as np
 
-from ..nodes  import OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6, MatmulNode
+from ..nodes  import OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6, MatmulNode, ConvNode
 from ..tensor import TensorInfo
 
 # Expected GT arrays larger than this threshold are written to external
+
+
+def _conv2d_ref(
+    x: np.ndarray,        # float64, shape [N, C, H, W]
+    w: np.ndarray,        # float64, shape [M, C, kH, kW]
+    bias,                 # float64 shape [M] or None
+    stride_h: int,
+    stride_w: int,
+    pad_top: int,
+    pad_left: int,
+    dilation_h: int,
+    dilation_w: int,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray:
+    """Reference 2-D convolution in float64 matching ConvKernel's NCHW output."""
+    N, C, H, W = x.shape
+    M, _, kH, kW = w.shape
+    y = np.zeros((N, M, out_h, out_w), dtype=np.float64)
+
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for khi in range(kH):
+                ih = oh * stride_h + khi * dilation_h - pad_top
+                if ih < 0 or ih >= H:
+                    continue
+                for kwi in range(kW):
+                    iw = ow * stride_w + kwi * dilation_w - pad_left
+                    if iw < 0 or iw >= W:
+                        continue
+                    # x[:, :, ih, iw]  shape [N, C]
+                    # w[:, :, khi, kwi] shape [M, C]
+                    # einsum('nc,mc->nm') → [N, M]
+                    y[:, :, oh, ow] += np.einsum(
+                        "nc,mc->nm", x[:, :, ih, iw], w[:, :, khi, kwi]
+                    )
+
+    if bias is not None:
+        y += bias.reshape(1, M, 1, 1)
+
+    return y
 # expected/<c_name>.dat files and loaded at runtime by fread(), matching
 # the same approach used for large weight tensors.
 LARGE_EXPECTED_THRESHOLD = 4096
@@ -156,6 +197,25 @@ class _SimulateMixin:
                 arrays[sn.output.onnx_name] = dtype.truncate(result).reshape(
                     sn.output.shape
                 )
+                continue
+
+            if isinstance(sn, ConvNode):
+                arrays[sn.output.onnx_name] = dtype.truncate(
+                    _conv2d_ref(
+                        x=arrays[sn.inputs[0].onnx_name],
+                        w=arrays[sn.inputs[1].onnx_name],
+                        bias=(arrays[sn.inputs[2].onnx_name]
+                              if sn.has_bias else None),
+                        stride_h=sn.stride_h,
+                        stride_w=sn.stride_w,
+                        pad_top=sn.pad_top,
+                        pad_left=sn.pad_left,
+                        dilation_h=sn.dilation_h,
+                        dilation_w=sn.dilation_w,
+                        out_h=sn.out_h,
+                        out_w=sn.out_w,
+                    )
+                ).reshape(sn.output.shape)
                 continue
 
             a = arrays[sn.inputs[0].onnx_name]

@@ -25,7 +25,7 @@ from onnx import shape_inference, TensorProto
 
 from typing import Union
 from .tensor import TensorInfo
-from .nodes  import ScheduledNode, MatmulNode, SchedulerError
+from .nodes  import ScheduledNode, MatmulNode, ConvNode, SchedulerError
 from .dtype  import DataType, AP_FIXED_16_8
 
 
@@ -160,10 +160,12 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
-        self._nodes: List[Union[ScheduledNode, MatmulNode]] = []
+        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode]] = []
         for idx, node in enumerate(graph.node):
             if node.op_type == "MatMul":
                 sn = MatmulNode.from_onnx_node(node, self._tensors, idx, align_elems)
+            elif node.op_type == "Conv":
+                sn = ConvNode.from_onnx_node(node, self._tensors, idx, align_elems)
             else:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
@@ -173,7 +175,7 @@ class OnnxGraph:
     # ------------------------------------------------------------------ #
 
     @property
-    def nodes(self) -> List[Union[ScheduledNode, MatmulNode]]:
+    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode]]:
         return self._nodes
 
     @property

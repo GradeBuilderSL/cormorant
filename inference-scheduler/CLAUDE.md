@@ -54,12 +54,13 @@ inference_scheduler.py   CLI entry point
 requirements.txt
 src/
   dtype.py               DataType abstraction (ap_fixed<W,I>, float32)
+  layout.py              TensorLayout frozen dataclass (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo: metadata + C declaration emitters
   nodes.py               ScheduledNode: ONNX op → VectorOPKernel call
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
-    _core.py             Alloc-size computation, large-tensor lists, pool sizing
+    _core.py             _compute_tensor_layouts() → TensorLayout; large-tensor lists, pool sizing
     _header.py           generate_header()  → include/inference.h
     _source.py           generate_source()  → src/inference.c
     _buf_impl.py         generate_buf_impl() → src/inference_buf.c
@@ -71,7 +72,7 @@ test/
   gen_test_models.py     Build all test ONNX models
   helpers.py             _model(), _models_exist() shared by test modules
   models/                Pre-generated ONNX models (single_add.onnx, etc.)
-  test_*.py              pytest test modules (360 tests total)
+  test_*.py              pytest test modules (591 tests total)
 ```
 
 ## Key Abstractions
@@ -117,6 +118,7 @@ Supported ops and opcodes:
 | `Div` | `OP_DIV` (3) | binary | |
 | `Relu` | `OP_RELU` (4) | unary | b=NULL |
 | `Clip(min=0,max=6)` | `OP_RELU6` (5) | unary | exact bounds required |
+| `MatMul` | — | binary | dispatched to MatmulKernel |
 
 **Broadcasting**: One input per binary op may broadcast. Rules:
 - Right-align input shape to output shape
@@ -137,11 +139,11 @@ for (unsigned _i = 0u; _i < 4u; _i++) {
 Multi-mixin class. `_CoreMixin.__init__` computes padded allocation sizes for all
 tensors accounting for broadcast alignment gaps. All other mixins read `self._alloc_sizes`.
 
-Allocation rules (`_compute_alloc_sizes`):
-- Non-broadcast tensors: `alloc_size == numel`
-- Advancing inputs/output of a broadcast node: `outer_count * aligned_chunk_size`
-- Repeating input: `aligned_chunk_size` (one block, reused every iteration)
-- Padded sizes propagate forward through downstream non-broadcast nodes
+Allocation rules (`_compute_tensor_layouts` → `TensorLayout`):
+- Phase 1: all tensors seeded as `TensorLayout.flat(numel)`
+- Phase 2: broadcast VectorOP nodes set advancing/repeating layouts with alignment-padded strides
+- Phase 3: layout propagates forward through non-broadcast, non-MatmulNode chains
+- MatmulNode reads row strides directly from `TensorLayout.gap` at emit time
 
 ### Cache Coherency Model
 
@@ -187,6 +189,8 @@ typedef uint16_t Data_t;              // ap_fixed<16,8>
 
 int  inference_init(const char *instance_name);  // alloc DMA bufs, load weights
 void inference_run(inference_buf_t *in, inference_buf_t *out);
+// signature lists all graph inputs then all graph outputs;
+// models may have multiple of each.
 void inference_deinit(void);
 
 // inference_buf.c (platform-specific)

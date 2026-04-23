@@ -318,7 +318,18 @@ the `design_matmul_vecop` bitstream and both UIO devices active on the board.
 
 ```bash
 .venv/bin/python test/gen_mixed_kernel_models.py
-# Creates: test/models/mixed_matmul_relu.onnx, mixed_add_matmul.onnx, etc.
+# Creates 14 models in test/models/:
+#   mixed_matmul_relu.onnx          mixed_add_matmul.onnx
+#   mixed_matmul_add_relu.onnx      mixed_two_layer_mlp.onnx
+#   mixed_add_matmul_unaligned.onnx mixed_matmul_scale_bias.onnx
+#   mixed_outer_matmul_relu.onnx    mixed_relu6_matmul_add.onnx
+#   mixed_residual.onnx             mixed_batch_matmul_relu.onnx
+#   mixed_sub_div_matmul.onnx       mixed_two_input_matmul.onnx
+#   mixed_two_output.onnx           mixed_two_input_two_output.onnx
+# The last three models exercise multiple graph inputs and/or outputs:
+#   mixed_two_input_matmul:      two inputs (X1, X2), one output
+#   mixed_two_output:            one input, two outputs (Yadd, Yrelu)
+#   mixed_two_input_two_output:  two inputs (X1, X2), two outputs (Yadd, Yrelu)
 ```
 
 ### 2. Load the bitstream on the board

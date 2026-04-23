@@ -35,7 +35,7 @@ Models produced:
   sat_sub_neg.onnx          X[1,256] - 63 - 65.5 -> Y; elements [0..128] saturate to min (-128)
   sat_div_pos.onnx          X[1,256] / (1/256) -> Y=i; elements [128..255] saturate to max (+127.996)
   sat_div_neg.onnx          X[1,256] / (-1/256) -> Y=-i; elements [128..255] saturate to min (-128)
-  unsupported.onnx          Conv node — must trigger a SchedulerError
+  unsupported.onnx          Tanh node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
   python test/gen_test_models.py [--out-dir /path/to/models]
@@ -1173,30 +1173,20 @@ def make_sat_div_neg(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-# Model 34: unsupported op (Conv)                                    #
+# Model 34: unsupported op (Tanh)                                    #
 # ------------------------------------------------------------------ #
 
 def make_unsupported(out_dir: str) -> None:
-    """A single Conv node — must cause SchedulerError."""
-    # Small 1x1 conv so the model is valid ONNX
-    W = np.ones((4, 1, 1, 1), dtype=np.float32)
+    """A single Tanh node — must cause SchedulerError."""
+    X = _float32("X", [1, 8])
+    Y = _float32("Y", [1, 8])
 
-    X = _float32("X", [1, 1, 4, 4])
-    Y = _float32("Y", [1, 4, 4, 4])
-    w_init = _initializer("W", W)
-
-    conv_node = oh.make_node(
-        "Conv",
-        inputs=["X", "W"],
-        outputs=["Y"],
-        kernel_shape=[1, 1],
-    )
+    tanh_node = oh.make_node("Tanh", inputs=["X"], outputs=["Y"])
     graph = oh.make_graph(
-        nodes=[conv_node],
+        nodes=[tanh_node],
         name="unsupported",
         inputs=[X],
         outputs=[Y],
-        initializer=[w_init],
     )
     model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
     model.ir_version = 8

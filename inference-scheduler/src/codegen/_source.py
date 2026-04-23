@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode
+from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode
 from ..tensor import LARGE_WEIGHT_THRESHOLD
 from ._banners import _banner, _file_banner
 
@@ -125,6 +125,7 @@ class _SourceMixin:
             isinstance(sn, MatmulNode) and sn.outer_count > 1
             for sn in nodes
         )
+        need_run_conv = self._has_conv_nodes
 
         titles = []
         if need_run_op and need_run_op_at:
@@ -139,16 +140,20 @@ class _SourceMixin:
             titles.append("run_matmul_at() — MatmulKernel dispatch helper")
         elif need_run_matmul:
             titles.append("run_matmul() — MatmulKernel dispatch helper")
+        if need_run_conv:
+            titles.append("run_conv() — ConvKernel dispatch helper")
         title = " / ".join(titles) if titles else "Kernel dispatch helpers"
 
         parts = [_banner(title)]
 
-        # Look up the VectorOP and Matmul kernel descriptors (if active)
+        # Look up the VectorOP, Matmul, and Conv kernel descriptors (if active)
         from ..kernels import KERNEL_REGISTRY
-        vop_kd = KERNEL_REGISTRY.get("VectorOPKernel")
-        mm_kd  = KERNEL_REGISTRY.get("MatmulKernel")
-        vop_var = vop_kd.c_var if vop_kd else "s_vectoropkernel"
-        mm_var  = mm_kd.c_var  if mm_kd  else "s_matmulkernel"
+        vop_kd  = KERNEL_REGISTRY.get("VectorOPKernel")
+        mm_kd   = KERNEL_REGISTRY.get("MatmulKernel")
+        conv_kd = KERNEL_REGISTRY.get("ConvKernel")
+        vop_var  = vop_kd.c_var  if vop_kd  else "s_vectoropkernel"
+        mm_var   = mm_kd.c_var   if mm_kd   else "s_matmulkernel"
+        conv_var = conv_kd.c_var if conv_kd else "s_convkernel"
 
         if need_run_op:
             parts.append(
@@ -309,6 +314,67 @@ class _SourceMixin:
                 f"    XMatmulkernel_Set_c_batch_stride(&{mm_var}, c_stride);\n"
                 f"    XMatmulkernel_Start(&{mm_var});\n"
                 f"    while (!XMatmulkernel_IsDone(&{mm_var})) {{}}\n"
+                "}\n"
+            )
+
+        if need_run_conv:
+            parts.append(
+                "/*\n"
+                " * run_conv() — program XConvkernel AXI-Lite registers,\n"
+                " * start the kernel, and poll until done.\n"
+                " *\n"
+                " *   x / weight / bias / y   DMA buffer pointers\n"
+                " *                            (physical addresses via inference_buf_phys()).\n"
+                " *                            bias may be NULL when has_bias == 0;\n"
+                " *                            ConvKernel never reads gmem2 in that case.\n"
+                " *   batch     input batch size (N)\n"
+                " *   in_ch     input channels (C)\n"
+                " *   in_h/w    input spatial dimensions\n"
+                " *   out_ch    output channels (M)\n"
+                " *   out_h/w   output spatial dimensions\n"
+                " *   kh/kw     filter kernel size\n"
+                " *   stride_h/w   convolution stride\n"
+                " *   dilation_h/w convolution dilation\n"
+                " *   pad_top/left  padding (top row / left column)\n"
+                " *   has_bias  1 = add per-channel bias; 0 = skip bias\n"
+                " */\n"
+                "static void run_conv(\n"
+                "    inference_buf_t *x,\n"
+                "    inference_buf_t *weight,\n"
+                "    inference_buf_t *bias,\n"
+                "    inference_buf_t *y,\n"
+                "    unsigned batch,\n"
+                "    unsigned in_ch,  unsigned in_h,  unsigned in_w,\n"
+                "    unsigned out_ch, unsigned out_h, unsigned out_w,\n"
+                "    unsigned kh,     unsigned kw,\n"
+                "    unsigned stride_h, unsigned stride_w,\n"
+                "    unsigned dilation_h, unsigned dilation_w,\n"
+                "    unsigned pad_top, unsigned pad_left,\n"
+                "    unsigned has_bias)\n"
+                "{\n"
+                f"    XConvkernel_Set_x     (&{conv_var}, inference_buf_phys(x));\n"
+                f"    XConvkernel_Set_weight(&{conv_var}, inference_buf_phys(weight));\n"
+                f"    XConvkernel_Set_bias  (&{conv_var},"
+                " bias ? inference_buf_phys(bias) : (u64)0);\n"
+                f"    XConvkernel_Set_y     (&{conv_var}, inference_buf_phys(y));\n"
+                f"    XConvkernel_Set_batch     (&{conv_var}, batch);\n"
+                f"    XConvkernel_Set_in_ch     (&{conv_var}, in_ch);\n"
+                f"    XConvkernel_Set_in_h      (&{conv_var}, in_h);\n"
+                f"    XConvkernel_Set_in_w      (&{conv_var}, in_w);\n"
+                f"    XConvkernel_Set_out_ch    (&{conv_var}, out_ch);\n"
+                f"    XConvkernel_Set_out_h     (&{conv_var}, out_h);\n"
+                f"    XConvkernel_Set_out_w     (&{conv_var}, out_w);\n"
+                f"    XConvkernel_Set_kh        (&{conv_var}, kh);\n"
+                f"    XConvkernel_Set_kw        (&{conv_var}, kw);\n"
+                f"    XConvkernel_Set_stride_h  (&{conv_var}, stride_h);\n"
+                f"    XConvkernel_Set_stride_w  (&{conv_var}, stride_w);\n"
+                f"    XConvkernel_Set_dilation_h(&{conv_var}, dilation_h);\n"
+                f"    XConvkernel_Set_dilation_w(&{conv_var}, dilation_w);\n"
+                f"    XConvkernel_Set_pad_top   (&{conv_var}, pad_top);\n"
+                f"    XConvkernel_Set_pad_left  (&{conv_var}, pad_left);\n"
+                f"    XConvkernel_Set_has_bias  (&{conv_var}, has_bias);\n"
+                f"    XConvkernel_Start(&{conv_var});\n"
+                f"    while (!XConvkernel_IsDone(&{conv_var})) {{}}\n"
                 "}\n"
             )
 

@@ -14,7 +14,7 @@ and how to extend it.
 4. [Step 2 — Tensor Classification (TensorInfo)](#4-step-2--tensor-classification-tensorinfo)
 5. [Step 3 — Op Mapping (ScheduledNode)](#5-step-3--op-mapping-schedulednode)
 6. [Broadcasting Algorithm](#6-broadcasting-algorithm)
-7. [Step 4 — Allocation Sizing (_CoreMixin)](#7-step-4--allocation-sizing-_coremixin)
+7. [Step 4 — Allocation Sizing and TensorLayout (_CoreMixin)](#7-step-4--allocation-sizing-and-tensorlayout-_coremixin)
 8. [Step 5 — Code Generation (CodeGenerator)](#8-step-5--code-generation-codegenerator)
 9. [DataType Abstraction](#9-datatype-abstraction)
 10. [Fixed-Point Simulation (_SimulateMixin)](#10-fixed-point-simulation-_simulatemixin)
@@ -37,6 +37,7 @@ model.onnx
 │  3. Build tensor registry: weights, inputs, intermediates, outputs   │
 │  4. For each node: ScheduledNode.from_onnx_node()                    │
 │     - Map op_type → (op_code, arity)                                 │
+│     - MatMul nodes are wrapped as MatmulNode (separate class)        │
 │     - Validate broadcasting constraints                              │
 │     - Compute: outer_count, chunk_size, aligned_chunk_size           │
 └──────────────────────────────────────────────────────────────────────┘
@@ -47,14 +48,14 @@ model.onnx
 ┌──────────────────────────────────────────────────────────────────────┐
 │  CodeGenerator._CoreMixin (src/codegen/_core.py)                     │
 │                                                                      │
-│  5. _compute_alloc_sizes()                                           │
+│  5. _compute_tensor_layouts()                                        │
 │     - Seed with natural sizes (numel)                                │
 │     - Override for broadcast nodes (padded stride layouts)           │
 │     - Forward-propagate padding through non-broadcast nodes          │
 │  6. _compute_pool_bytes() — total DMA memory needed                  │
 └──────────────────────────────────────────────────────────────────────┘
     │
-    ▼ alloc_sizes dict
+    ▼ TensorLayout dict
     │
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -76,12 +77,13 @@ model.onnx
 inference_scheduler.py   CLI entry point (argparse + file I/O)
 src/
   dtype.py               DataType ABC + ApFixed, Float32 implementations
+  layout.py              TensorLayout frozen dataclass — DMA buffer geometry (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo dataclass — metadata + C code emitters
   nodes.py               ScheduledNode dataclass — op mapping + C call emitters
   graph.py               OnnxGraph — ONNX loading, shape inference, node scheduling
   codegen/
     __init__.py          CodeGenerator class (assembles all mixins via MRO)
-    _core.py             _CoreMixin: __init__, alloc sizes, pool size, helpers
+    _core.py             _CoreMixin: __init__, tensor layouts, pool size, helpers
     _header.py           _HeaderMixin: generate_header()
     _source.py           _SourceMixin: generate_source()
     _buf_impl.py         _BufImplMixin: generate_buf_impl(), generate_setup_script()
@@ -234,6 +236,13 @@ Here `bias` does not advance (`b_advances = False`) — it repeats at offset 0
 every iteration (a single-row bias added to each of 4 output rows). `X` and `Y`
 both advance — they each hold 4 chunks strided by `CHUNK_STRIDE`.
 
+### MatmulNode
+
+MatMul operations are handled by a separate `MatmulNode` class (also in `src/nodes.py`) that drives the `MatmulKernel` IP. Key fields: `n`, `k`, `m` (matrix dimensions), `outer_count`, `b_batch_stride`. `emit_call(layouts)` checks `TensorLayout.gap` on A and Y to choose between:
+
+- Natural form: `run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride)`
+- Row-strided form: when A or Y has alignment gaps — decomposes into batch=N, n=1 to walk each row independently
+
 ---
 
 ## 6. Broadcasting Algorithm
@@ -340,39 +349,49 @@ and on-device execution produce identical memory patterns.
 
 In a non-broadcast binary op where the output buffer was padded by an earlier
 broadcast node, both inputs may appear to "stride" even though neither is
-technically broadcasting. The scheduler handles this in `_compute_alloc_sizes()`:
+technically broadcasting. The scheduler handles this in `_compute_tensor_layouts()`:
 sizes are propagated forward through the topological node order, and all co-inputs
 of a non-broadcast node are raised to the same padded alloc size.
 
 ---
 
-## 7. Step 4 — Allocation Sizing (_CoreMixin)
+## 7. Step 4 — Allocation Sizing and TensorLayout (_CoreMixin)
 
-`_compute_alloc_sizes()` returns `{onnx_name: alloc_size_in_elements}` for every
-tensor that needs a DMA buffer.
+### TensorLayout
 
-### The Algorithm
+`TensorLayout` in `src/layout.py` is a frozen dataclass describing a tensor's DMA buffer geometry:
 
-**Pass 1 — Seed with natural sizes**: every tensor starts at its `numel`.
+| Field | Meaning |
+|-------|---------|
+| `numel` | Logical element count (`product(shape)`) |
+| `alloc` | Actual DMA buffer size in elements (`>= numel`) |
+| `n_chunks` | Number of data blocks in the buffer (`1` for flat/repeating, `outer_count` for advancing) |
+| `chunk` | Data elements per block (`numel // n_chunks`) |
+| `stride` | Buffer elements between block starts (`>= chunk`; `stride - chunk` = gap) |
 
-**Pass 2 — Broadcast nodes**: for each node with `outer_count > 1`:
-- Output: `alloc = outer_count × aligned_chunk_size`
-- Advancing input (strides through output): same `alloc`
-- Repeating input (fixed at offset 0): just `aligned_chunk_size` (one block)
+Derived properties: `is_strided = stride > chunk`, `gap = stride - chunk`.
 
-**Pass 3 — Non-broadcast propagation**: processed in topological order.
-For a non-broadcast node, find the maximum alloc among its inputs. If that
-exceeds the output's current alloc, raise the output. Then raise every input
-to the same alloc. This handles the case where a Relu follows a broadcast Add:
-the Relu's input (the Add's output) has a padded alloc, so the Relu's output
-must match, and the `run_op()` call gets `size = padded_alloc` to process all
-elements (data + gaps) in one sweep.
+Factory methods: `flat(numel)`, `advancing(numel, n_chunks, stride)`, `repeating(numel, alloc)`.
 
-**Why process gaps in non-broadcast ops?** The gaps contain zeros (set by
-`memset` at allocation time or padded in the ROM array). Running Relu over zeros
-still produces zeros — correct. Running Add with a zero-padded partner and a
-zero-padded output is also a no-op on the gaps. This avoids complicating
-downstream nodes with chunk-by-chunk loops.
+### The Algorithm: `_compute_tensor_layouts()`
+
+Returns `{onnx_name: TensorLayout}`. Three phases:
+
+**Phase 1 — Seed all tensors as flat**: every tensor starts with `TensorLayout.flat(numel)`.
+
+**Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`, MatmulNode excluded):
+- Output → `advancing(numel, outer_count, aligned_chunk_size)`
+- Advancing inputs (stride through the output) → same advancing layout
+- Repeating input (bias at offset 0 each iteration) → `repeating(numel, aligned_chunk_size)`
+
+A `_should_update_advancing()` guard ensures the flat→advancing transition fires even when `stride == chunk` (no gap), which would leave `alloc == numel` and fool a naive `alloc > cur.alloc` check.
+
+**Phase 3 — Non-broadcast, non-MatmulNode propagation** (topological order):
+For each such node, find the dominant input (highest alloc with n_chunks > 1). If any input alloc exceeds the output alloc, raise the output (inheriting dominant stride/n_chunks). Then raise every co-input below the output alloc to match.
+
+MatmulNode is excluded: it reads A and Y with per-row strides derived from `TensorLayout.gap` at emit time, not via alloc propagation.
+
+**Why propagate into non-broadcast nodes?** Gap slots in advancing buffers contain zeros (DMA memory is zeroed at allocation, ROM arrays pad gaps with zero). Passing `size = alloc` to run_op() processes data + gaps in one call; the gap slots produce correct zero outputs (Relu(0)=0, Add(x,0)=x, etc.) without needing per-chunk loops.
 
 ### Pool Size Calculation
 
@@ -398,7 +417,8 @@ class CodeGenerator(
 All mixins share state through `self`:
 - `self._graph` — the `OnnxGraph` instance
 - `self._dtype` — the active `DataType` (default: `AP_FIXED_16_8`)
-- `self._alloc_sizes` — computed by `_CoreMixin.__init__`
+- `self._layouts` — `{onnx_name: TensorLayout}` computed by `_CoreMixin.__init__`
+- `self._alloc_sizes` — derived thin view: `{k: v.alloc for k, v in self._layouts.items()}`
 - `self._embed_large_weights`, `self._embed_large_expected` — CLI flags
 
 ### _SourceMixin — inference.c
@@ -411,7 +431,7 @@ _source_includes()                 ← #include "inference.h", xvectoropkernel.h
 _source_op_defines()               ← #define VECTOROP_ADD 0u …
 _weight_arrays()                   ← ROM arrays + DMA pointers for each weight
 _buffer_declarations()             ← comments for I/O, DMA pointers for intermediates
-_kernel_instance()                 ← static XVectoropkernel s_kernel;
+_kernel_instance()                 ← static XVectoropkernel s_vectoropkernel; static XMatmulkernel s_matmulkernel;
 _run_op_helper()                   ← static void run_op(…) and/or run_op_at(…)
 [_load_weight_helper()]            ← only when large weights exist
 _init_function()                   ← inference_init() + inference_deinit()
@@ -457,6 +477,16 @@ Notice that `run_op()` passes **physical addresses** to the kernel registers.
 The kernel's AXI master ports use these physical addresses to read/write DDR
 directly. The CPU never sees these transfers — it only writes to the AXI-Lite
 control registers and polls the done flag.
+
+### _SourceMixin — run_matmul() and run_matmul_at()
+
+Emitted when the graph contains `MatmulNode` operations.
+
+`run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride)` — programs the `XMatmulkernel` AXI-Lite registers and polls for completion. Row strides are in elements; zero means batch=1 (no striding).
+
+`run_matmul_at(a, a_off, b, b_off, c, c_off, ...)` — offset-based variant for the outer-loop decomposition when one operand has a leading dimension absent from the other.
+
+When a MatMul's A or Y buffer has alignment gaps (`TensorLayout.gap > 0`), `MatmulNode.emit_call()` uses the row-strided decomposition: `batch = N, n = 1`. This walks each row independently and skips the gap slots between rows.
 
 ---
 
@@ -622,11 +652,15 @@ inference_init():
     memcpy(virtual_ptr, rom_data, ...)   ← CPU writes weight data
     sync_to_device(weight_buf)           ← flush once; weights never change
 
-inference_run(X, Y):
-  sync_to_device(X)                      ← flush user input(s) before first op
-  [all kernel calls — no sync inside]
-  sync_from_device(Y)                    ← invalidate output(s) after last op
+inference_run(X1, X2, Yadd, Yrelu):
+  sync_to_device(X1)       ← flush all graph inputs
+  sync_to_device(X2)
+  [all kernel calls]
+  sync_from_device(Yadd)   ← invalidate all graph outputs
+  sync_from_device(Yrelu)
 ```
+
+`inference_run()` accepts all graph inputs followed by all graph outputs. Models with multiple inputs flush each one; models with multiple outputs invalidate each one.
 
 **Internal buffers (intermediates) are never synced.** After the first kernel
 writes an intermediate result to DDR, the next kernel reads it from DDR directly

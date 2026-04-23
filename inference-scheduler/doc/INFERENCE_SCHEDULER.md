@@ -72,12 +72,15 @@ to program the AXI-Lite control registers and poll for completion.
 
 | ONNX op | Hardware op code | Arity | Notes |
 |---------|-----------------|-------|-------|
+| `MatMul` | MatmulKernel | binary | `C[n,m] = A[n,k] @ B[k,m]`; supports batched matmul and broadcast weight |
 | `Add` | `VECTOROP_ADD` (0) | binary | `c[i] = saturate(a[i] + b[i])` |
 | `Sub` | `VECTOROP_SUB` (1) | binary | `c[i] = saturate(a[i] - b[i])` |
 | `Mul` | `VECTOROP_MUL` (2) | binary | `c[i] = saturate(a[i] * b[i])` |
 | `Div` | `VECTOROP_DIV` (3) | binary | `c[i] = saturate(a[i] / b[i])` |
 | `Relu` | `VECTOROP_RELU` (4) | unary | `c[i] = max(a[i], 0)` |
 | `Clip(min=0, max=6)` | `VECTOROP_RELU6` (5) | unary | `c[i] = min(max(a[i], 0), 6)` |
+
+`MatMul` is dispatched to a separate hardware kernel (`MatmulKernel`) via the `XMatmulkernel` driver. All other ops use `VectorOPKernel`.
 
 Any other ONNX op causes the scheduler to exit with a `SchedulerError`.
 
@@ -101,7 +104,11 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 # Generate the test ONNX models (needed for the test suite only)
+# VectorOPKernel models
 .venv/bin/python test/gen_test_models.py
+
+# Mixed-kernel models (MatMul + VectorOP)
+.venv/bin/python test/gen_mixed_kernel_models.py
 ```
 
 Dependencies (from `requirements.txt`): `onnx`, `numpy`.
@@ -285,30 +292,45 @@ void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n
 
 ```c
 /*
- * inference_init() — open the hardware kernel, allocate DMA buffers for all
+ * inference_init() — open the hardware kernel(s), allocate DMA buffers for all
  * internal weights and intermediate tensors, load weight data, and flush to DDR.
  *
- * instance_name:
- *   Linux:      UIO device path, e.g. "/dev/uio0"
+ * One const char * parameter per hardware kernel active in the model, in
+ * registry order (VectorOPKernel before MatmulKernel).
+ *
+ * Each instance name:
+ *   Linux:      UIO sysfs name, e.g. "VectorOPKernel_0"
  *   Bare-metal: device name from xparameters.h, e.g. "VectorOPKernel"
  *
  * Returns 0 on success, non-zero on failure.
  * On failure, inference_deinit() is called internally — do not call it again.
  */
-int inference_init(const char *instance_name);
+
+/* Single-kernel model (VectorOPKernel only): */
+int inference_init(const char *vectoropkernel_instance);
+
+/* Multi-kernel model (VectorOPKernel + MatmulKernel): */
+int inference_init(const char *vectoropkernel_instance,
+                   const char *matmulkernel_instance);
 
 /*
  * inference_run() — execute the full inference graph.
+ *
+ * Signature varies by model: all graph inputs first, then all graph outputs.
+ * Examples:
+ *   Single input, single output: inference_run(X, Y)
+ *   Two inputs, one output:      inference_run(X1, X2, Y)
+ *   One input, two outputs:      inference_run(X, Yadd, Yrelu)
+ *   Two inputs, two outputs:     inference_run(X1, X2, Yadd, Yrelu)
  *
  * The caller allocates input and output buffers with inference_buf_alloc() and
  * fills inputs via inference_buf_ptr() before calling this function.
  * After the call, results are available at inference_buf_ptr(output).
  *
- * inference_run() manages all cache coherency internally:
- *   - Flushes inputs to DDR before the first kernel invocation
- *   - Invalidates outputs from DDR after the last kernel invocation
+ * Flushes all graph inputs to DDR, executes the full kernel sequence, then
+ * invalidates all graph outputs.
  */
-void inference_run(inference_buf_t *X, inference_buf_t *Y);
+void inference_run(inference_buf_t *<inputs...>, inference_buf_t *<outputs...>);
 
 /*
  * inference_deinit() — release all DMA buffers and close the pool.
