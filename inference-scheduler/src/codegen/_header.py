@@ -210,20 +210,59 @@ class _HeaderMixin:
         )
         lines.append("")
 
+        # UIO device name defaults — one macro per active kernel
+        lines.append(_banner("UIO device name defaults"))
+        lines.append(
+            "/*\n"
+            " * Default UIO sysfs device names for the hardware kernels used by\n"
+            " * this model.  These match the DT node labels in the DTBO overlay\n"
+            " * (check: cat /sys/class/uio/uio0/name on the board).\n"
+            " *\n"
+            " * Override at CMake configure time:\n"
+            " *   cmake -DINFERENCE_VECTOROPKERNEL_INSTANCE=my_vop ...\n"
+            " * or define the macro before including this header.\n"
+            " */"
+        )
+        for kd in self._active_kernels:
+            lines.append(
+                f"#ifndef {kd.instance_macro}\n"
+                f"#  define {kd.instance_macro}  \"{kd.uio_default}\"\n"
+                f"#endif"
+            )
+        lines.append("")
+
         # inference_init()
         lines.append(_banner("Inference API"))
+        # Build init signature
+        active = self._active_kernels
+        if len(active) == 1:
+            init_params = f"const char *{active[0].init_param}"
+            param_doc = (
+                f" * {active[0].init_param}  "
+                f"UIO sysfs name (Linux) or xparameters.h name (bare-metal).\n"
+                f" *              Default: \"{active[0].uio_default}\"\n"
+            )
+        else:
+            param_doc_lines = []
+            for kd in active:
+                param_doc_lines.append(
+                    f" * {kd.init_param}  "
+                    f"UIO name for {kd.name}. Default: \"{kd.uio_default}\""
+                )
+            param_doc = "\n".join(param_doc_lines) + "\n"
+            init_params = ",\n    ".join(
+                f"const char *{kd.init_param}" for kd in active
+            )
         lines.append(
             "/*\n"
             " * inference_init() — initialise the DMA pool, weight buffers,\n"
-            " *                    and the XVectoropkernel driver.\n"
+            " *                    and all hardware kernel drivers.\n"
             " *\n"
-            " * instance_name  bare-metal: device name string (see xparameters.h)\n"
-            " *                Linux:      UIO device path, e.g. \"/dev/uio0\"\n"
-            " *\n"
+            f"{param_doc}"
             " * Returns 0 on success, non-zero on failure.\n"
             " */"
         )
-        lines.append("int  inference_init(const char *instance_name);")
+        lines.append(f"int  inference_init({init_params});")
         lines.append("")
         lines.append(
             "/*\n"

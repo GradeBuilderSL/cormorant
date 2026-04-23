@@ -6,33 +6,33 @@ For each ONNX model in the configured list:
   1. Generate a C inference project locally (inference_scheduler.py)
   2. Upload the project to the remote board via SSH/SFTP
   3. Build on the remote machine  (cmake -DINFERENCE_TARGET=LINUX + make)
-  4. Run the test binary as root  (sudo ./build/test_inference <instance_name>)
+  4. Run the test binary as root  (sudo ./build/test_inference)
   5. Collect pass/fail results and print a summary report
 
 Prerequisites on the remote machine:
   - gcc/g++, cmake ≥ 3.19, make
   - XRT runtime installed (xrt.h reachable via pkg-config or /opt/xilinx/xrt)
-  - A UIO device whose /sys/class/uio/uio*/name matches the configured
-    instance name (default "fabric"); verify with:
+  - UIO devices whose /sys/class/uio/uio*/name values match the configured
+    per-kernel instance names (see remote.uio_devices in the config); verify:
       cat /sys/class/uio/uio*/name
   - Passwordless sudo for the SSH user, OR log in directly as root
 
 Usage:
   # Run all models listed in the config file
-  python run_remote_tests.py --config test/remote_config.json
+  python run_remote_tests.py --config remote_config.json
 
   # Override model list on the command line
-  python run_remote_tests.py --config test/remote_config.json \\
+  python run_remote_tests.py --config remote_config.json \\
       --models test/models/single_add.onnx test/models/relu_chain.onnx
 
   # Verify SSH connectivity and remote prerequisites without running tests
-  python run_remote_tests.py --config test/remote_config.json --check-only
+  python run_remote_tests.py --config remote_config.json --check-only
 
   # Keep remote directories after the run (for debugging build/run failures)
-  python run_remote_tests.py --config test/remote_config.json --no-cleanup
+  python run_remote_tests.py --config remote_config.json --no-cleanup
 
   # Show full build + test output for every model, not only failures
-  python run_remote_tests.py --config test/remote_config.json --verbose
+  python run_remote_tests.py --config remote_config.json --verbose
 """
 
 import argparse
@@ -55,6 +55,12 @@ except ImportError:
     print("error: paramiko is required.", file=sys.stderr)
     print("  .venv/bin/pip install paramiko", file=sys.stderr)
     sys.exit(1)
+
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from src.kernels import KERNEL_REGISTRY as _KERNEL_REGISTRY
+except ImportError:
+    _KERNEL_REGISTRY = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -89,14 +95,19 @@ _DEFAULTS: dict = {
         "connect_timeout": 15,
     },
     "remote": {
-        "work_dir":   "/tmp/inference_hw_tests",
-        "driver_dir": None,        # remote path containing xvectoropkernel*.{c,h}
-                                   # used when driver files live on the board already
-        "uio_device": "fabric",    # UIO sysfs name (cat /sys/class/uio/uio*/name)
-        "cmake_args": [],          # extra -D flags forwarded to cmake
+        "work_dir":    "/tmp/inference_hw_tests",
+        "driver_dir":  None,       # remote path with ALL kernel driver files
+        "driver_dirs": {},         # per-kernel: {"VectorOPKernel": "/path", ...}
+        # Per-kernel UIO sysfs names (cat /sys/class/uio/uio*/name).
+        # Keys are kernel names from KERNEL_REGISTRY (e.g. "VectorOPKernel").
+        # Empty dict means use the defaults compiled into the test binary.
+        "uio_devices": {},
+        "uio_device":  None,       # DEPRECATED — use uio_devices instead
+        "cmake_args":  [],         # extra -D flags forwarded to cmake
     },
     "local": {
-        "driver_dir": None,        # local path; scheduler copies drivers into project
+        "driver_dir":  None,       # single local path; scheduler bundles into project
+        "driver_dirs": {},         # per-kernel: {"VectorOPKernel": "/path", ...}
     },
     "build": {
         "jobs":    4,
@@ -313,6 +324,57 @@ class RemoteSession:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Config helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _uio_devices_from_cfg(cfg: dict) -> dict:
+    """Return per-kernel UIO sysfs name dict (handles old uio_device string too)."""
+    remote = cfg["remote"]
+    if remote.get("uio_devices"):
+        return dict(remote["uio_devices"])
+    legacy = remote.get("uio_device")
+    if legacy:
+        return {"VectorOPKernel": legacy}
+    return {}
+
+
+def _cmake_instance_flags(uio_devices: dict) -> List[str]:
+    """Convert per-kernel UIO name map to cmake -D compile-definition flags."""
+    flags = []
+    for kernel_name, uio_name in uio_devices.items():
+        macro = f"INFERENCE_{kernel_name.upper()}_INSTANCE"
+        flags.append(f'-D{macro}=\\"{uio_name}\\"')
+    return flags
+
+
+def _resolve_local_driver(cfg: dict, merge_dir: Path) -> Optional[Path]:
+    """
+    Return a single local driver directory for inference_scheduler.py --driver-dir.
+
+    With local.driver_dir set: returns it directly.
+    With local.driver_dirs dict set: merges all source directories into *merge_dir*
+      and returns that.  Useful for multi-kernel models where each kernel's HLS
+      output lives in a separate directory.
+    """
+    single = cfg["local"].get("driver_dir")
+    per_kernel = cfg["local"].get("driver_dirs", {})
+
+    if single:
+        return Path(single)
+    if not per_kernel:
+        return None
+
+    merge_dir.mkdir(parents=True, exist_ok=True)
+    for kdir in per_kernel.values():
+        src = Path(kdir)
+        if src.is_dir():
+            for f in src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, merge_dir / f.name)
+    return merge_dir
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Project generation (local)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -347,7 +409,7 @@ def generate_project(model_path: Path, out_dir: Path,
 def build_remote(session: RemoteSession,
                  project_dir: str,
                  build_dir: str,
-                 uio_device: str,
+                 uio_devices: dict,
                  extra_cmake: List[str],
                  jobs: int,
                  timeout: int) -> Tuple[bool, str]:
@@ -358,14 +420,17 @@ def build_remote(session: RemoteSession,
       cmake -S <project_dir> -B <build_dir> -DINFERENCE_TARGET=LINUX ...
       make -C <build_dir> -j<jobs> test_inference
 
+    *uio_devices* maps kernel name → UIO sysfs name and is forwarded as per-kernel
+    cmake -D flags (e.g. -DINFERENCE_VECTOROPKERNEL_INSTANCE=\"VectorOPKernel_0\").
+    An empty dict means the defaults compiled into the test binary are used.
+
     Returns (success, combined_log).
     """
     cmake_flags = [
         "-DINFERENCE_TARGET=LINUX",
-        f'-DINFERENCE_TEST_INSTANCE=\\"{uio_device}\\"',
         # weights/ and expected/ subdirs live under the project source tree
         f"-DINFERENCE_WEIGHTS_DIR={project_dir}",
-    ] + extra_cmake
+    ] + _cmake_instance_flags(uio_devices) + extra_cmake
 
     cmake_cmd = (
         f"cmake -S {project_dir} -B {build_dir} "
@@ -393,7 +458,6 @@ def build_remote(session: RemoteSession,
 def run_test(session: RemoteSession,
              project_dir: str,
              build_dir: str,
-             uio_device: str,
              use_sudo: bool,
              timeout: int) -> Tuple[bool, str]:
     """
@@ -406,6 +470,9 @@ def run_test(session: RemoteSession,
     SSH user is not root; if the user is already root, sudo is skipped.
     The test passes when the binary exits with code 0 and prints "PASSED".
 
+    UIO device names are baked into the binary via CMake compile definitions at
+    build time (INFERENCE_*_INSTANCE macros); no runtime argument is needed.
+
     Returns (passed, full_output).
     """
     binary = f"{build_dir}/test_inference"
@@ -414,7 +481,7 @@ def run_test(session: RemoteSession,
     # passwordless sudo is not configured, rather than hanging for a password.
     prefix = "sudo -n " if use_sudo else ""
 
-    cmd = f"cd {project_dir} && {prefix}{binary} {uio_device}"
+    cmd = f"cd {project_dir} && {prefix}{binary}"
 
     try:
         out, err, rc = session.exec(cmd, timeout=timeout)
@@ -443,9 +510,10 @@ def run_model_test(model_path: Path,
     result = TestResult(model_name=name)
 
     local_project = tmp_root / name
-    local_driver  = (
-        Path(cfg["local"]["driver_dir"]) if cfg["local"].get("driver_dir") else None
-    )
+    merge_dir     = tmp_root / f"{name}_drv_merge"
+    local_driver  = _resolve_local_driver(cfg, merge_dir)
+    uio_devices   = _uio_devices_from_cfg(cfg)
+
     work_dir        = cfg["remote"]["work_dir"].rstrip("/")
     remote_project  = f"{work_dir}/{name}"
     remote_build    = f"{remote_project}/build"
@@ -459,9 +527,6 @@ def run_model_test(model_path: Path,
     _step_done(ok, dur)
     if not ok:
         return result
-
-    # Optionally copy drivers from the remote machine's driver_dir later
-    # (see _copy_remote_drivers below, invoked after upload).
 
     # ── 2. Upload ────────────────────────────────────────────────────────── #
     _step_print(name, "upload", "uploading...")
@@ -478,19 +543,41 @@ def run_model_test(model_path: Path,
         result.steps.append(StepResult("upload", False, str(exc), dur))
         return result
 
-    # ── 2b. Copy drivers from remote driver_dir (if configured) ─────────── #
-    remote_driver_dir = cfg["remote"].get("driver_dir")
-    if remote_driver_dir and not local_driver:
-        _step_print(name, "drivers", "copying remote drivers...")
-        t0 = time.monotonic()
-        ok, drv_log = _copy_remote_drivers(
-            session, remote_driver_dir, remote_project
-        )
-        dur = time.monotonic() - t0
-        _step_done(ok, dur)
-        result.steps.append(StepResult("drivers", ok, drv_log, dur))
-        if not ok:
-            return result
+    # ── 2b. Copy drivers from remote (if configured and no local bundle) ── #
+    remote_driver_dirs = cfg["remote"].get("driver_dirs", {})
+    remote_driver_dir  = cfg["remote"].get("driver_dir")
+    if not local_driver:
+        if remote_driver_dirs:
+            # Per-kernel remote dirs — copy each kernel's files separately
+            all_ok_drv, drv_parts = True, []
+            for kname, kdir in remote_driver_dirs.items():
+                _step_print(name, "drivers", f"copying {kname} drivers...")
+                t0 = time.monotonic()
+                ok, drv_log = _copy_remote_drivers(
+                    session, kdir, remote_project, kernel_names=[kname]
+                )
+                dur = time.monotonic() - t0
+                _step_done(ok, dur)
+                drv_parts.append(drv_log)
+                if not ok:
+                    all_ok_drv = False
+            result.steps.append(StepResult("drivers", all_ok_drv,
+                                           "\n".join(drv_parts)))
+            if not all_ok_drv:
+                return result
+
+        elif remote_driver_dir:
+            # Single shared remote directory for all kernel files
+            _step_print(name, "drivers", "copying remote drivers...")
+            t0 = time.monotonic()
+            ok, drv_log = _copy_remote_drivers(
+                session, remote_driver_dir, remote_project
+            )
+            dur = time.monotonic() - t0
+            _step_done(ok, dur)
+            result.steps.append(StepResult("drivers", ok, drv_log, dur))
+            if not ok:
+                return result
 
     # ── 3. Build ─────────────────────────────────────────────────────────── #
     _step_print(name, "build", "cmake + make...")
@@ -499,7 +586,7 @@ def run_model_test(model_path: Path,
         session,
         project_dir = remote_project,
         build_dir   = remote_build,
-        uio_device  = cfg["remote"]["uio_device"],
+        uio_devices = uio_devices,
         extra_cmake = cfg["remote"].get("cmake_args", []),
         jobs        = cfg["build"]["jobs"],
         timeout     = cfg["build"]["timeout"],
@@ -517,7 +604,6 @@ def run_model_test(model_path: Path,
         session,
         project_dir = remote_project,
         build_dir   = remote_build,
-        uio_device  = cfg["remote"]["uio_device"],
         use_sudo    = cfg["run"]["use_sudo"],
         timeout     = cfg["run"]["timeout"],
     )
@@ -529,19 +615,43 @@ def run_model_test(model_path: Path,
 
 
 def _copy_remote_drivers(session: RemoteSession,
-                         src_dir: str, project_dir: str) -> Tuple[bool, str]:
+                         src_dir: str, project_dir: str,
+                         kernel_names: Optional[List[str]] = None) -> Tuple[bool, str]:
     """
-    Copy XVectoropkernel driver files from an existing directory on the remote
-    machine into <project_dir>/driver/.  Used when the drivers are already
-    installed on the board (not bundled from local).
+    Copy kernel driver files from an existing directory on the remote machine
+    into <project_dir>/driver/.  Used when drivers are pre-deployed on the board.
+
+    *kernel_names* limits copying to the given kernel entries in KERNEL_REGISTRY.
+    When None (or registry unavailable), falls back to the VectorOPKernel file list.
     """
-    driver_files = [
-        "xvectoropkernel.h",
-        "xvectoropkernel_hw.h",
-        "xvectoropkernel.c",
-        "xvectoropkernel_sinit.c",
-        "xvectoropkernel_linux.c",
-    ]
+    if _KERNEL_REGISTRY and kernel_names:
+        driver_files: List[str] = []
+        seen: set = set()
+        for kname in kernel_names:
+            kd = _KERNEL_REGISTRY.get(kname)
+            if kd:
+                for f in kd.driver_files:
+                    if f not in seen:
+                        seen.add(f)
+                        driver_files.append(f)
+    elif _KERNEL_REGISTRY:
+        # copy all registered kernel files
+        driver_files = []
+        seen = set()
+        for kd in _KERNEL_REGISTRY.values():
+            for f in kd.driver_files:
+                if f not in seen:
+                    seen.add(f)
+                    driver_files.append(f)
+    else:
+        driver_files = [
+            "xvectoropkernel.h",
+            "xvectoropkernel_hw.h",
+            "xvectoropkernel.c",
+            "xvectoropkernel_sinit.c",
+            "xvectoropkernel_linux.c",
+        ]
+
     dst = f"{project_dir}/driver"
     missing = []
     for fname in driver_files:
@@ -576,27 +686,19 @@ def check_prerequisites(session: RemoteSession, cfg: dict) -> bool:
     Verify that the remote machine has the tools and devices required to
     build and run the inference tests.  Returns True if all checks pass.
     """
-    uio = cfg["remote"]["uio_device"]
+    uio_devices = _uio_devices_from_cfg(cfg)
+
     checks = [
-        # (shell command that exits 0 on success, label, description expr)
-        (f"cmake --version 2>&1 | head -1", "cmake"),
-        (f"make --version  2>&1 | head -1", "make"),
-        (f"gcc  --version  2>&1 | head -1", "gcc"),
+        # (shell command that exits 0 on success, label)
+        ("cmake --version 2>&1 | head -1", "cmake"),
+        ("make --version  2>&1 | head -1", "make"),
+        ("gcc  --version  2>&1 | head -1", "gcc"),
         (
             "pkg-config --exists xrt 2>/dev/null && echo 'xrt via pkg-config' || "
             "{ [ -f /opt/xilinx/xrt/include/xrt.h ] && echo 'xrt at /opt/xilinx/xrt'; } || "
             "{ [ -f /usr/include/xrt/xrt.h ]        && echo 'xrt at /usr/include/xrt'; } || "
             "echo '__MISSING__'",
             "xrt headers",
-        ),
-        # XVectoropkernel_Initialize() scans /sys/class/uio/*/name for a
-        # device whose sysfs name matches the instance name string.
-        # Check the same way: look for a name file containing the instance name.
-        (
-            f"match=$(grep -rl '^{uio}$' /sys/class/uio/*/name 2>/dev/null | head -1); "
-            f"[ -n \"$match\" ] && echo \"/dev/uio$(echo $match | grep -o 'uio[0-9]*' | tail -1 | sed 's/uio//')\" "
-            f"|| echo '__MISSING__'",
-            f"uio device ({uio})",
         ),
         (
             "sudo -n true 2>/dev/null && echo 'passwordless sudo OK' || "
@@ -605,6 +707,23 @@ def check_prerequisites(session: RemoteSession, cfg: dict) -> bool:
             "sudo / root access",
         ),
     ]
+
+    # Add one UIO check per configured kernel instance name.
+    # X*_Initialize() scans /sys/class/uio/*/name for a string match.
+    for kernel_name, uio_name in uio_devices.items():
+        checks.append((
+            f"match=$(grep -rl '^{uio_name}$' /sys/class/uio/*/name 2>/dev/null | head -1); "
+            f"[ -n \"$match\" ] && echo \"/dev/uio$(echo $match | grep -o 'uio[0-9]*' | tail -1 | sed 's/uio//')\" "
+            f"|| echo '__MISSING__'",
+            f"uio ({kernel_name}: {uio_name})",
+        ))
+
+    if not uio_devices:
+        checks.append((
+            "grep -rl '' /sys/class/uio/*/name 2>/dev/null | head -1 | "
+            "xargs -r cat 2>/dev/null || echo '__MISSING__'",
+            "uio devices (using header defaults)",
+        ))
 
     all_ok = True
     for cmd, label in checks:
@@ -682,7 +801,7 @@ def parse_args(argv=None) -> argparse.Namespace:
             Remote prerequisites:
               cmake ≥ 3.19, make, gcc
               XRT runtime (xrt.h + libxrt_core.so)
-              UIO device whose sysfs name matches remote.uio_device (default: "fabric")
+              UIO devices listed in remote.uio_devices (e.g. "VectorOPKernel_0")
                 verify: cat /sys/class/uio/uio*/name
               Passwordless sudo  -OR-  SSH as root (user: "root")
         """),

@@ -36,7 +36,7 @@ fails the test.
 |-------------|---------------|
 | `gcc` ≥ 11, `cmake` ≥ 3.19, `make` | `gcc --version`, `cmake --version` |
 | XRT runtime (`xrt.h` + `libxrt_core.so`) | `pkg-config --exists xrt && echo ok` |
-| VectorOPKernel overlay loaded | `cat /sys/class/uio/uio*/name` — must print `fabric` (or your configured name) |
+| Kernel overlay(s) loaded | `cat /sys/class/uio/uio*/name` — must print the names in `remote.uio_devices` |
 | Passwordless sudo, or SSH as root | `sudo -n true && echo ok` |
 
 The `--check-only` flag verifies all of these remotely before running any tests
@@ -83,10 +83,13 @@ Minimum required change: set `ssh.host` to your board's IP or hostname.
 | `ssh.password` | `null` | SSH password; `null` when using key auth |
 | `ssh.connect_timeout` | `15` | TCP connect timeout in seconds |
 | `remote.work_dir` | `"/tmp/inference_hw_tests"` | Base directory on the board; created automatically, cleaned up after the run |
-| `remote.uio_device` | `"fabric"` | UIO sysfs device name — the string in `/sys/class/uio/uio*/name`, **not** a `/dev/uioN` path |
-| `remote.driver_dir` | `null` | Path **on the board** to copy driver sources from; takes precedence over `local.driver_dir` when set |
+| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names — `{"KernelName": "sysfs_name"}`. The string in `/sys/class/uio/uio*/name`, **not** a `/dev/uioN` path. Empty dict uses defaults from the test binary headers. |
+| `remote.uio_device` | `null` | **Deprecated.** Old single-string UIO name; treated as `{"VectorOPKernel": value}`. Use `uio_devices` instead. |
+| `remote.driver_dir` | `null` | Path **on the board** to copy all kernel driver sources from |
+| `remote.driver_dirs` | `{}` | Per-kernel paths **on the board**: `{"VectorOPKernel": "/path", ...}` |
 | `remote.cmake_args` | `[]` | Extra `-D` flags appended to the `cmake` invocation |
-| `local.driver_dir` | `null` | Path **on the local machine** to bundle driver sources into each project before upload |
+| `local.driver_dir` | `null` | Single local directory with all driver files to bundle into each project before upload |
+| `local.driver_dirs` | `{}` | Per-kernel local paths; files are merged before upload: `{"VectorOPKernel": "/path1", "MatmulKernel": "/path2"}` |
 | `build.jobs` | `4` | Parallel `make -j` jobs on the board |
 | `build.timeout` | `180` | Combined cmake + make timeout in seconds |
 | `run.timeout` | `120` | Per-model `test_inference` execution timeout in seconds |
@@ -94,21 +97,44 @@ Minimum required change: set `ssh.host` to your board's IP or hostname.
 | `cleanup` | `true` | Remove `remote.work_dir` after all tests finish |
 | `models` | `[]` | List of model paths relative to the `inference-scheduler` directory |
 
+### UIO device names
+
+Each hardware kernel has a UIO sysfs name set by the device tree overlay (DTSI).
+For the `design_matmul_vecop` bitstream the names are:
+
+| Kernel | UIO sysfs name |
+|--------|---------------|
+| `VectorOPKernel` | `VectorOPKernel_0` |
+| `MatmulKernel` | `MatmulKernel_0` |
+
+Verify after loading the DTBO:
+```bash
+cat /sys/class/uio/uio*/name
+# VectorOPKernel_0
+# MatmulKernel_0
+```
+
+These names are passed to cmake as `-DINFERENCE_VECTOROPKERNEL_INSTANCE` and
+`-DINFERENCE_MATMULKERNEL_INSTANCE` compile definitions, which override the
+matching `#ifndef` macros in `inference.h`.
+
 ### Driver source resolution
 
-The runner needs the XVectoropkernel driver sources (`xvectoropkernel.h`,
-`xvectoropkernel_hw.h`, `xvectoropkernel.c`, `xvectoropkernel_sinit.c`,
-`xvectoropkernel_linux.c`) in each generated project's `driver/` directory.
-Two options:
+The runner places kernel driver sources (`.c`/`.h` files) in the project's
+`driver/` directory before uploading. Four options, evaluated in priority order:
 
-- **`local.driver_dir`** — copy sources from the local machine into each project
-  before uploading. Use this when driver sources are available locally from Vitis
-  HLS synthesis.
-- **`remote.driver_dir`** — copy sources from a directory already on the board.
-  Use this when driver sources are pre-deployed (e.g., in `/root/driver/`). This
-  path must be an SSH-reachable path on the board, not a local path.
+1. **`local.driver_dirs`** — per-kernel local paths; the runner merges them into
+   one directory and passes it to `inference_scheduler.py --driver-dir`. Best for
+   multi-kernel models where each kernel's HLS output lives separately.
+2. **`local.driver_dir`** — single local directory with all driver files. Use for
+   single-kernel models or when you have pre-merged the files.
+3. **`remote.driver_dirs`** — per-kernel paths **on the board**; the runner copies
+   each kernel's files via SSH after upload.
+4. **`remote.driver_dir`** — single board-side directory for all driver files.
 
-When both are set, `remote.driver_dir` takes precedence.
+When `local.*` is set, the drivers are bundled before upload and `remote.*`
+driver options are skipped. When none is set, `driver/` contains only a
+`README.md` and the build will fail until you populate it manually.
 
 ---
 
@@ -128,7 +154,7 @@ Verify SSH connectivity and all board prerequisites without running any tests:
 .venv/bin/python run_remote_tests.py --config remote_config.json --check-only
 ```
 
-Example output:
+Example output (VectorOPKernel-only model):
 
 ```
 Connecting to root@192.168.100.8:22 …
@@ -139,8 +165,15 @@ Remote prerequisites
     OK      make                         GNU Make 4.3
     OK      gcc                          gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
     OK      xrt headers                  xrt via pkg-config
-    OK      uio device (fabric)          /dev/uio4
     OK      sudo / root access           passwordless sudo OK
+    OK      uio (VectorOPKernel: VectorOPKernel_0)  /dev/uio4
+```
+
+For a mixed-kernel model with both kernels configured:
+
+```
+    OK      uio (VectorOPKernel: VectorOPKernel_0)  /dev/uio4
+    OK      uio (MatmulKernel: MatmulKernel_0)      /dev/uio5
 ```
 
 ### Subset of models
@@ -247,18 +280,87 @@ quantization rounding mismatch between the Python simulator and the hardware. Se
 
 ### UIO device not found
 
-The prerequisite check reports `MISSING uio device (fabric)`:
+The prerequisite check reports `MISSING uio (VectorOPKernel: VectorOPKernel_0)`:
 
 ```bash
 # On the board: list UIO device names
 cat /sys/class/uio/uio*/name
 
-# If the name differs from "fabric", update remote_config.json:
-#   "uio_device": "actual_name_here"
+# Expected for design_matmul_vecop:
+# VectorOPKernel_0
+# MatmulKernel_0
 ```
 
-The driver scans `/sys/class/uio/uio*/name` for a string match — `uio_device`
-must be the sysfs name, not a `/dev/uioN` path.
+If the names differ (older bitstream or different DTSI), update `remote.uio_devices`
+in your config to match. The driver scans `/sys/class/uio/uio*/name` for a string
+match — these must be sysfs names, not `/dev/uioN` paths.
+
+If no UIO devices appear at all, the DTBO overlay may not be loaded:
+
+```bash
+# Load the overlay (KV260 with fpgautil)
+fpgautil -b design_matmul_vecop.bit.bin -o matmul_vecop.dtbo
+
+# Verify
+cat /sys/class/uio/uio*/name
+```
+
+---
+
+---
+
+## Multi-Kernel Models (MatmulKernel + VectorOPKernel)
+
+Models that combine both kernels (e.g., `MatMul → Relu`, `Add → MatMul`) require
+the `design_matmul_vecop` bitstream and both UIO devices active on the board.
+
+### 1. Generate mixed-kernel test models
+
+```bash
+.venv/bin/python test/gen_mixed_kernel_models.py
+# Creates: test/models/mixed_matmul_relu.onnx, mixed_add_matmul.onnx, etc.
+```
+
+### 2. Load the bitstream on the board
+
+```bash
+# On the KV260
+fpgautil -b design_matmul_vecop.bit.bin -o matmul_vecop.dtbo
+cat /sys/class/uio/uio*/name
+# VectorOPKernel_0
+# MatmulKernel_0
+```
+
+### 3. Use remote_config_mixed.json
+
+```bash
+# Edit paths for your local HLS output directories
+$EDITOR remote_config_mixed.json
+
+# Preflight check
+.venv/bin/python run_remote_tests.py \
+    --config remote_config_mixed.json --check-only
+
+# Run all mixed-kernel models
+.venv/bin/python run_remote_tests.py --config remote_config_mixed.json
+```
+
+The runner merges driver files from `local.driver_dirs.VectorOPKernel` and
+`local.driver_dirs.MatmulKernel` before uploading.  The generated `CMakeLists.txt`
+passes both UIO names as compile definitions:
+
+```
+cmake … -DINFERENCE_VECTOROPKERNEL_INSTANCE="VectorOPKernel_0" \
+         -DINFERENCE_MATMULKERNEL_INSTANCE="MatmulKernel_0"
+```
+
+### 4. Config files by bitstream
+
+| Config file | Bitstream | Kernels |
+|-------------|-----------|---------|
+| `remote_config_vectorop.json` | `vadd_kv260` | VectorOPKernel only |
+| `remote_config_matmul.json` | `matmul_kv260` | MatmulKernel only |
+| `remote_config_mixed.json` | `design_matmul_vecop` | Both |
 
 ---
 

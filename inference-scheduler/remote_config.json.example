@@ -19,8 +19,10 @@
     "work_dir": "/tmp/inference_hw_tests",
     "_work_dir_note": "Base directory on the remote machine. Created automatically. Cleaned up after each run unless --no-cleanup is set.",
 
-    "uio_device": "fabric",
-    "_uio_device_note": "UIO sysfs name for VectorOPKernel — the string in /sys/class/uio/uio*/name, NOT a /dev/uioN path. Verify with: cat /sys/class/uio/uio*/name",
+    "uio_devices": {
+      "VectorOPKernel": "VectorOPKernel_0"
+    },
+    "_uio_devices_note": "Per-kernel UIO sysfs names — the strings in /sys/class/uio/uio*/name, NOT /dev/uioN paths. Verify with: cat /sys/class/uio/uio*/name. For multi-kernel models add all active kernels, e.g. also \"MatmulKernel\": \"MatmulKernel_0\".",
 
     "driver_dir": null,
     "_driver_dir_note": "Path on the REMOTE machine to copy XVectoropkernel driver sources from. Takes precedence over local.driver_dir when set.",
@@ -30,7 +32,9 @@
 
   "local": {
     "driver_dir": null,
-    "_driver_dir_note": "Path on the LOCAL machine to bundle driver sources into each project before upload. Example: '../build/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src'"
+    "_driver_dir_note": "Single local path containing ALL kernel driver files to bundle into each project before upload. Use for single-kernel models or a pre-merged directory.",
+    "driver_dirs": {},
+    "_driver_dirs_note": "Per-kernel local paths for multi-kernel models, e.g. {\"VectorOPKernel\": \"../build/.../VectorOPKernel_v1_0/src\", \"MatmulKernel\": \"../matmul/build/.../MatmulKernel_v1_0/src\"}. Files are merged automatically before upload."
   },
 
   "build": {

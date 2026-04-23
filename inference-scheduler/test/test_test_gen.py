@@ -58,15 +58,15 @@ class TestTestGen(unittest.TestCase):
         self.assertIn("printf(", t)
 
     def test_linux_default_instance(self):
-        # The Linux default is the UIO sysfs name, not a /dev/uioN path.
+        # The UIO sysfs name is the DT node label from the DTBO overlay.
         # XVectoropkernel_Initialize() scans /sys/class/uio/*/name for the match.
         t = self._test_src("single_add.onnx")
-        self.assertIn('"fabric"', t)
+        self.assertIn("VectorOPKernel_0", t)
         self.assertNotIn("/dev/uio0", t)
 
     def test_baremetal_default_instance(self):
         t = self._test_src("single_add.onnx")
-        self.assertIn("VectorOPKernel", t)
+        self.assertIn("VectorOPKernel_0", t)
 
     def test_passed_message(self):
         t = self._test_src("single_add.onnx")

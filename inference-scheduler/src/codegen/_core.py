@@ -41,10 +41,11 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from ..graph  import OnnxGraph
-from ..nodes  import ScheduledNode, MatmulNode
-from ..tensor import TensorInfo, LARGE_WEIGHT_THRESHOLD
-from ..dtype  import DataType, AP_FIXED_16_8
+from ..graph   import OnnxGraph
+from ..nodes   import ScheduledNode, MatmulNode
+from ..kernels import KernelDesc, KERNEL_REGISTRY
+from ..tensor  import TensorInfo, LARGE_WEIGHT_THRESHOLD
+from ..dtype   import DataType, AP_FIXED_16_8
 from ._banners import _file_banner
 
 
@@ -211,6 +212,22 @@ class _CoreMixin:
         return (total + page - 1) & ~(page - 1)
 
     @property
+    def _active_kernels(self) -> List[KernelDesc]:
+        """Ordered list of KernelDesc for each kernel type present in the graph.
+
+        Order follows KERNEL_REGISTRY insertion order (VectorOPKernel before
+        MatmulKernel before any future kernels), not the graph's node order.
+        This makes the generated inference_init() parameter order deterministic
+        regardless of which node appears first in the model.
+        """
+        present = {sn.kernel_name for sn in self._graph.nodes}
+        return [kd for kd in KERNEL_REGISTRY.values() if kd.name in present]
+
+    # ------------------------------------------------------------------
+    # Backward-compat helpers (kept for existing code and tests)
+    # ------------------------------------------------------------------
+
+    @property
     def _has_matmul_nodes(self) -> bool:
         """True when the graph contains at least one MatmulNode."""
         return any(isinstance(sn, MatmulNode) for sn in self._graph.nodes)
@@ -222,8 +239,9 @@ class _CoreMixin:
 
     @property
     def _driver_prefix(self) -> str:
-        """Lowercase driver filename prefix — 'xmatmulkernel' or 'xvectoropkernel'."""
-        return "xmatmulkernel" if self._has_matmul_nodes else "xvectoropkernel"
+        """Driver prefix for the first active kernel — kept for backward compat."""
+        ak = self._active_kernels
+        return ak[0].driver_prefix if ak else "xvectoropkernel"
 
     @property
     def large_weight_tensors(self) -> List[TensorInfo]:
@@ -278,9 +296,13 @@ class _CoreMixin:
             if sn.arity == 2 and sn.b_advances:
                 result[sn.inputs[1].onnx_name] = (n, chunk_macro, stride_macro)
 
-        # Pass 2 — non-broadcast nodes: propagate stride to their outputs.
+        # Pass 2 — non-broadcast VectorOP nodes: propagate stride to their outputs.
+        # MatmulNode is excluded: it reads/writes its own row layout and does not
+        # inherit a broadcast chunk-stride descriptor from its inputs.
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
+                continue
+            if isinstance(sn, MatmulNode):
                 continue
             if sn.output.onnx_name in result:
                 continue  # already classified in pass 1
@@ -289,4 +311,38 @@ class _CoreMixin:
                     result[sn.output.onnx_name] = result[inp.onnx_name]
                     break
 
+        return result
+
+    def _get_matmul_strides(self) -> dict:
+        """
+        {output_onnx_name: (a_row_stride, c_row_stride)} for MatmulNodes
+        whose A input or Y output DMA buffer has alignment-gap padding.
+
+        When A is a strided intermediate (produced by a broadcast VectorOP),
+        its rows in the DMA buffer are separated by aligned_chunk gaps.
+        MatmulKernel must skip those gaps by using a_row_stride = alloc//N
+        instead of the natural K.
+
+        When Y feeds a downstream broadcast VectorOP as an advancing input,
+        its alloc is padded to N*aligned_M.  MatmulKernel must write each row
+        at that padded stride using c_row_stride = alloc//N instead of M.
+
+        Only applies to outer_count==1 MatmulNodes (the outer-loop case
+        handles its own strides via a/c_outer_stride).
+        """
+        result: dict = {}
+        for sn in self._graph.nodes:
+            if not isinstance(sn, MatmulNode):
+                continue
+            if sn.outer_count > 1:
+                continue
+            a = sn.inputs[0]
+            n = sn.n
+            a_alloc = self._alloc_sizes.get(a.onnx_name, a.numel)
+            a_row_stride = (a_alloc // n) if a_alloc > a.numel else 0
+            y = sn.output
+            y_alloc = self._alloc_sizes.get(y.onnx_name, y.numel)
+            c_row_stride = (y_alloc // n) if y_alloc > y.numel else 0
+            if a_row_stride != 0 or c_row_stride != 0:
+                result[y.onnx_name] = (a_row_stride, c_row_stride)
         return result

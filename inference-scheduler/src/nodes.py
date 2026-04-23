@@ -39,7 +39,7 @@ iteration starts at a 16-byte-aligned physical address.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import onnx
 
@@ -203,6 +203,8 @@ def _broadcast_info(
 @dataclass
 class ScheduledNode:
     """One ONNX operator mapped to one or more VectorOPKernel invocations."""
+
+    kernel_name: ClassVar[str] = "VectorOPKernel"
 
     onnx_node:   onnx.NodeProto
     op_code:     int                   # OP_ADD … OP_RELU6
@@ -436,6 +438,8 @@ class ScheduledNode:
 class MatmulNode:
     """One ONNX MatMul operator mapped to one or more XMatmulkernel invocations.
 
+    kernel_name identifies this node's hardware kernel for the registry lookup.
+
     Supports four shapes:
 
       2-D   A[N,K]        @ B[K,M]           → Y[N,M]
@@ -457,6 +461,8 @@ class MatmulNode:
     Compatibility fields (always fixed):
     chunk_size, aligned_chunk_size, a_advances, b_advances, arity
     """
+
+    kernel_name: ClassVar[str] = "MatmulKernel"
 
     onnx_node:      onnx.NodeProto
     inputs:         List[TensorInfo]   # [A, B]
@@ -739,14 +745,34 @@ class MatmulNode:
             f"{batch_str}{outer_str} */"
         )
 
-    def emit_call(self, op_size: Optional[int] = None) -> str:
+    def emit_call(self, op_size: Optional[int] = None,
+                  a_row_stride: int = 0, c_row_stride: int = 0) -> str:
         """Emit the run_matmul() or run_matmul_at() call for this node.
-        op_size is accepted for interface compatibility but ignored."""
+
+        op_size is accepted for interface compatibility but ignored.
+
+        a_row_stride / c_row_stride are non-zero when the A input or Y output
+        DMA buffer has alignment-gap padding (e.g. A was produced by a
+        broadcast VectorOP, or Y feeds one downstream).  In that case the
+        kernel is called with batch=N, n=1 so that the batch stride acts as
+        a per-row stride, allowing the kernel to skip alignment gaps.
+        """
         a = self.inputs[0].c_name
         b = self.inputs[1].c_name
         c = self.output.c_name
 
         if self.outer_count == 1:
+            if a_row_stride != 0 or c_row_stride != 0:
+                # Row-strided decomposition: N calls of (1 × K) × (K × M).
+                # a_batch_stride = a_row_stride (or natural K if only c is strided)
+                # c_batch_stride = c_row_stride (or natural M if only a is strided)
+                eff_a = a_row_stride if a_row_stride != 0 else self.k
+                eff_c = c_row_stride if c_row_stride != 0 else self.m
+                return (
+                    f"    run_matmul({a}, {b}, {c},\n"
+                    f"               1u, {self.k}u, {self.m}u, {self.n}u,\n"
+                    f"               {eff_a}u, {self.b_batch_stride}u, {eff_c}u);"
+                )
             return (
                 f"    run_matmul({a}, {b}, {c},\n"
                 f"               {self.n}u, {self.k}u, {self.m}u, {self.batch}u,\n"
