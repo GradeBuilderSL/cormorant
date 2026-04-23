@@ -385,7 +385,7 @@ class ScheduledNode:
             f"  shape={self.output.shape}{broadcast} */"
         )
 
-    def emit_call(self, op_size: Optional[int] = None) -> str:
+    def emit_call(self, layouts: dict) -> str:
         """
         Emit the C kernel call(s) for this node.
 
@@ -395,8 +395,9 @@ class ScheduledNode:
           - weights were flushed once in inference_init()
           - internal (kernel-to-kernel) buffers need no sync
 
-        op_size overrides chunk_size for the non-broadcast case when the
-        output buffer is larger than numel due to upstream alignment padding.
+        layouts is {onnx_name: TensorLayout}.  For non-broadcast nodes the
+        output's alloc_size is used as op_size so run_op() covers the full
+        padded buffer when the output inherited stride from upstream.
         """
         a  = self.inputs[0].c_name
         b  = self.inputs[1].c_name if self.arity == 2 else "NULL"
@@ -404,7 +405,8 @@ class ScheduledNode:
         op = OP_NAMES[self.op_code]
 
         if self.outer_count == 1:
-            size = op_size if op_size is not None else self.chunk_size
+            y_lay = layouts.get(self.output.onnx_name)
+            size  = y_lay.alloc if y_lay is not None else self.chunk_size
             return f"    run_op({a}, {b}, {c}, {size}u, {op});"
 
         # Broadcasting: loop over outer_count chunks with run_op_at().
@@ -745,23 +747,26 @@ class MatmulNode:
             f"{batch_str}{outer_str} */"
         )
 
-    def emit_call(self, op_size: Optional[int] = None,
-                  a_row_stride: int = 0, c_row_stride: int = 0) -> str:
+    def emit_call(self, layouts: dict) -> str:
         """Emit the run_matmul() or run_matmul_at() call for this node.
 
-        op_size is accepted for interface compatibility but ignored.
+        layouts is {onnx_name: TensorLayout}.
 
-        a_row_stride / c_row_stride are non-zero when the A input or Y output
-        DMA buffer has alignment-gap padding (e.g. A was produced by a
-        broadcast VectorOP, or Y feeds one downstream).  In that case the
-        kernel is called with batch=N, n=1 so that the batch stride acts as
-        a per-row stride, allowing the kernel to skip alignment gaps.
+        When the A input or Y output DMA buffer has alignment gaps
+        (layout.gap > 0), the kernel is called with batch=N, n=1 so the
+        batch stride acts as a per-row stride, allowing MatmulKernel to skip
+        alignment gaps between rows.
         """
         a = self.inputs[0].c_name
         b = self.inputs[1].c_name
         c = self.output.c_name
 
         if self.outer_count == 1:
+            a_lay = layouts.get(self.inputs[0].onnx_name)
+            y_lay = layouts.get(self.output.onnx_name)
+            a_row_stride = a_lay.stride if (a_lay and a_lay.gap > 0) else 0
+            c_row_stride = y_lay.stride if (y_lay and y_lay.gap > 0) else 0
+
             if a_row_stride != 0 or c_row_stride != 0:
                 # Row-strided decomposition: N calls of (1 × K) × (K × M).
                 # a_batch_stride = a_row_stride (or natural K if only c is strided)

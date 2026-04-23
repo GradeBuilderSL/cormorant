@@ -517,24 +517,10 @@ class _SourceMixin:
             for t in outputs
         ]
 
-        matmul_strides = self._get_matmul_strides()
-
         body_lines = []
         for sn in graph.nodes:
             body_lines.append(sn.emit_comment())
-            if isinstance(sn, MatmulNode):
-                strides = matmul_strides.get(sn.output.onnx_name, (0, 0))
-                body_lines.append(
-                    sn.emit_call(a_row_stride=strides[0], c_row_stride=strides[1])
-                )
-            elif sn.outer_count == 1:
-                # Pass the alloc_size so run_op() covers the full padded
-                # buffer when the output inherited stride from upstream.
-                body_lines.append(
-                    sn.emit_call(op_size=self._alloc_sizes[sn.output.onnx_name])
-                )
-            else:
-                body_lines.append(sn.emit_call())
+            body_lines.append(sn.emit_call(self._layouts))
             body_lines.append("")
         if body_lines and body_lines[-1] == "":
             body_lines.pop()

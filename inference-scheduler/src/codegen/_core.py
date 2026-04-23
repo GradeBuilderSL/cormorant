@@ -46,6 +46,7 @@ from ..nodes   import ScheduledNode, MatmulNode
 from ..kernels import KernelDesc, KERNEL_REGISTRY
 from ..tensor  import TensorInfo, LARGE_WEIGHT_THRESHOLD
 from ..dtype   import DataType, AP_FIXED_16_8
+from ..layout  import TensorLayout
 from ._banners import _file_banner
 
 
@@ -64,129 +65,176 @@ class _CoreMixin:
         # declarations.  Defaults to ap_fixed<16,8> (the standard KV260 type).
         # Pass dtype=FLOAT32 (or any DataType subclass) for other types.
         self._dtype               = dtype if dtype is not None else AP_FIXED_16_8
-        # Precompute padded allocation sizes for all tensors (accounts for
-        # broadcast alignment gaps).  Computed once; used by header, init,
-        # and pool-size calculations.
-        self._alloc_sizes         = self._compute_alloc_sizes()
+        # Unified layout map: {onnx_name: TensorLayout} for every tensor.
+        # Accounts for broadcast alignment gaps and propagated padding.
+        # _alloc_sizes is derived for backward-compatibility with callers that
+        # only need the flat {name: alloc_elements} view.
+        self._layouts             = self._compute_tensor_layouts()
+        self._alloc_sizes         = {k: v.alloc for k, v in self._layouts.items()}
 
-    def _compute_alloc_sizes(self) -> dict:
+    def _compute_tensor_layouts(self) -> dict:
         """
-        Return {onnx_name: alloc_size_in_elements} for every tensor that
-        needs a DMA buffer, accounting for broadcast alignment padding.
+        Return {onnx_name: TensorLayout} for every tensor in the graph.
 
-        For non-broadcast tensors: alloc_size == t.numel.
-        For advancing buffers in a broadcast node: outer_count * aligned_chunk.
-        For repeating buffers in a broadcast node: aligned_chunk (one block).
-        When a tensor appears in multiple nodes the maximum size is used.
+        Three-phase computation:
+
+          Phase 1 — Seed all tensors as flat (alloc == numel).
+
+          Phase 2 — VectorOP broadcast nodes (outer_count > 1, not MatmulNode):
+            advancing inputs and the output get advancing-strided layouts
+            (n_chunks == outer_count, stride == aligned_chunk_size).
+            Repeating inputs (bias at offset 0 each iteration) get a single
+            padded block (n_chunks == 1, alloc == aligned_chunk_size).
+            MatmulNode is excluded: its outer loop uses physical-address offsets
+            rather than alignment-padded chunks.
+
+          Phase 3 — Non-broadcast non-MatmulNode propagation (topological order):
+            When an input has a larger alloc than the output, the output
+            inherits the alloc and (if the dominant input is strided) also
+            inherits n_chunks and stride.  Co-inputs whose alloc is smaller
+            than the output are raised to match, acquiring the same layout
+            structure so that a single run_op() call with size=alloc is valid
+            for every buffer in the operation.
+            MatmulNode is excluded: it reads A/Y with per-row strides derived
+            from its inputs' layouts at emit time, not via alloc propagation.
         """
-        sizes: dict = {}
-
-        # Seed with natural sizes
         all_tensors = (
             self._graph.weight_tensors
             + self._graph.intermediate_tensors
             + self._graph.input_tensors
             + self._graph.output_tensors
         )
-        for t in all_tensors:
-            sizes[t.onnx_name] = t.numel
 
-        # Override for VectorOP nodes that use chunk-based broadcasting.
-        # MatmulNode is excluded even when outer_count > 1: its outer loop
-        # uses physical-address offsets rather than alignment-padded chunks,
-        # so buffer sizes are just numel (set above) with no padding needed.
+        # Phase 1: seed all tensors as flat.
+        layouts: dict = {t.onnx_name: TensorLayout.flat(t.numel)
+                         for t in all_tensors}
+
+        # Phase 2: broadcast VectorOP nodes.
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
             if isinstance(sn, MatmulNode):
                 continue
-            total = sn.outer_count * sn.aligned_chunk_size
 
-            # Output always advances through the full padded range
-            sizes[sn.output.onnx_name] = max(
-                sizes.get(sn.output.onnx_name, 0), total
-            )
-            # Input a
-            a_size = total if sn.a_advances else sn.aligned_chunk_size
-            sizes[sn.inputs[0].onnx_name] = max(
-                sizes.get(sn.inputs[0].onnx_name, 0), a_size
-            )
-            # Input b (binary ops only)
-            if sn.arity == 2:
-                b_size = total if sn.b_advances else sn.aligned_chunk_size
-                sizes[sn.inputs[1].onnx_name] = max(
-                    sizes.get(sn.inputs[1].onnx_name, 0), b_size
+            n      = sn.outer_count          # number of loop iterations
+            chunk  = sn.chunk_size           # data elements per iteration
+            stride = sn.aligned_chunk_size   # buffer elements per iteration (>= chunk)
+            alloc  = n * stride
+
+            def _should_update_advancing(cur: TensorLayout) -> bool:
+                # Update if switching from flat to advancing (n_chunks==1 → >1),
+                # or if a later broadcast node needs a larger allocation.
+                # When stride == chunk (no gap), alloc == numel so the pure-alloc
+                # comparison would wrongly skip the flat→advancing transition.
+                return cur.n_chunks == 1 or alloc > cur.alloc
+
+            # Output: advancing-strided.
+            out_name = sn.output.onnx_name
+            if _should_update_advancing(layouts[out_name]):
+                layouts[out_name] = TensorLayout.advancing(
+                    sn.output.numel, n, stride
                 )
 
-        # Propagate padded sizes through non-broadcast VectorOP nodes.
-        # When a node's input was padded by an upstream broadcast op, its
-        # output buffer must be at least as large so run_op() can process
-        # the full padded range (including alignment gap elements) in one
-        # call.  Additionally, any co-input (e.g. a weight) whose numel is
-        # smaller than the padded size is raised to that size so run_op()'s
-        # uniform size argument is valid for every buffer in the operation.
-        # Nodes are in topological order, so one forward pass is sufficient.
-        #
-        # MatmulNode is explicitly excluded: its inputs (A[N,K], B[K,M]) and
-        # output (Y[N,M]) have inherently different element counts, so the
-        # "uniform size" invariant does not apply.
+            # Input a: advancing or repeating.
+            a_name = sn.inputs[0].onnx_name
+            if sn.a_advances:
+                if _should_update_advancing(layouts[a_name]):
+                    layouts[a_name] = TensorLayout.advancing(
+                        sn.inputs[0].numel, n, stride
+                    )
+            else:
+                new_alloc = max(layouts[a_name].alloc, stride)
+                if new_alloc > layouts[a_name].alloc:
+                    layouts[a_name] = TensorLayout.repeating(
+                        sn.inputs[0].numel, new_alloc
+                    )
+
+            # Input b: advancing or repeating (binary ops only).
+            if sn.arity == 2:
+                b_name = sn.inputs[1].onnx_name
+                if sn.b_advances:
+                    if _should_update_advancing(layouts[b_name]):
+                        layouts[b_name] = TensorLayout.advancing(
+                            sn.inputs[1].numel, n, stride
+                        )
+                else:
+                    new_alloc = max(layouts[b_name].alloc, stride)
+                    if new_alloc > layouts[b_name].alloc:
+                        layouts[b_name] = TensorLayout.repeating(
+                            sn.inputs[1].numel, new_alloc
+                        )
+
+        # Phase 3: propagate layout through non-broadcast non-MatmulNode chains.
+        # Nodes are in topological order; one forward pass is sufficient.
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
             if isinstance(sn, MatmulNode):
                 continue
-            max_input = max(sizes.get(inp.onnx_name, inp.numel)
-                            for inp in sn.inputs)
-            out = sn.output.onnx_name
-            if max_input > sizes[out]:
-                sizes[out] = max_input
-            # Raise every co-input to the same padded alloc so the kernel
-            # never reads past the end of any buffer.
-            padded = sizes[out]
-            for inp in sn.inputs:
-                if sizes.get(inp.onnx_name, inp.numel) < padded:
-                    sizes[inp.onnx_name] = padded
 
-        return sizes
+            input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
+            max_input_alloc = max(l.alloc for l in input_layouts)
+
+            out_name = sn.output.onnx_name
+            out_lay  = layouts[out_name]
+
+            # Find the dominant strided input (highest alloc with n_chunks > 1).
+            dominant = None
+            for l in input_layouts:
+                if l.n_chunks > 1:
+                    if dominant is None or l.alloc > dominant.alloc:
+                        dominant = l
+
+            # Update output layout if any input has a larger alloc.
+            if max_input_alloc > out_lay.alloc:
+                if dominant is not None:
+                    layouts[out_name] = TensorLayout.advancing(
+                        out_lay.numel, dominant.n_chunks, dominant.stride
+                    )
+                else:
+                    layouts[out_name] = TensorLayout(
+                        numel=out_lay.numel, alloc=max_input_alloc,
+                        n_chunks=1, chunk=out_lay.numel, stride=max_input_alloc
+                    )
+
+            # Raise every co-input whose alloc is smaller than the output's.
+            # The dominant layout for inheritance is the (possibly updated) output.
+            out_lay  = layouts[out_name]
+            out_dom  = out_lay if out_lay.n_chunks > 1 else None
+
+            for inp in sn.inputs:
+                cur = layouts[inp.onnx_name]
+                if cur.alloc >= out_lay.alloc:
+                    continue
+                if out_dom is not None:
+                    layouts[inp.onnx_name] = TensorLayout.advancing(
+                        cur.numel, out_dom.n_chunks, out_dom.stride
+                    )
+                else:
+                    layouts[inp.onnx_name] = TensorLayout(
+                        numel=cur.numel, alloc=out_lay.alloc,
+                        n_chunks=1, chunk=cur.numel, stride=out_lay.alloc
+                    )
+
+        return layouts
 
     def _strided_weight_params(self) -> dict:
         """
-        Return {onnx_name: (outer_count, aligned_chunk_size)} for weight
-        tensors whose alloc_size was raised above numel by backward
-        propagation in _compute_alloc_sizes().
+        Return {onnx_name: (n_chunks, stride)} for weight tensors whose DMA
+        buffer has alignment gaps (n_chunks > 1 and stride > chunk).
 
         These weights are used as co-inputs to non-broadcast nodes alongside
-        strided (padded) intermediate buffers.  Their ROM arrays must be
-        emitted in strided layout — data elements interleaved with zero-
-        padding in the gap slots — so that a single run_op() call with
-        size=alloc_size is valid for every buffer in the operation.
-
-        outer_count and aligned_chunk_size are derived from the strided
-        co-input's entry in _broadcast_io_map().
+        advancing-strided intermediates.  Their ROM arrays are emitted in
+        strided layout — data elements interleaved with zero padding in the
+        gap slots — so that a single run_op() call with size=alloc is valid
+        for every buffer in the operation.
         """
-        io_map = self._broadcast_io_map()
         result: dict = {}
-
-        for sn in self._graph.nodes:
-            if sn.outer_count > 1:
+        for t in self._graph.weight_tensors:
+            lay = self._layouts.get(t.onnx_name)
+            if lay is None or lay.n_chunks <= 1 or not lay.is_strided:
                 continue
-            # Find outer_count from any strided non-weight co-input.
-            outer_count = None
-            for inp in sn.inputs:
-                if inp.onnx_name in io_map:
-                    outer_count = io_map[inp.onnx_name][0]
-                    break
-            if outer_count is None:
-                continue
-            # Record stride params for each weight input that was padded.
-            for inp in sn.inputs:
-                if not inp.is_weight:
-                    continue
-                alloc = self._alloc_sizes.get(inp.onnx_name, inp.numel)
-                if alloc <= inp.numel:
-                    continue
-                result[inp.onnx_name] = (outer_count, alloc // outer_count)
-
+            result[t.onnx_name] = (lay.n_chunks, lay.stride)
         return result
 
     def _compute_pool_bytes(self) -> int:
@@ -195,7 +243,7 @@ class _CoreMixin:
         per buffer, rounded up to a 4 KiB page boundary.
 
         Covers: weight tensors + intermediate tensors + model inputs + outputs.
-        Uses _alloc_sizes (which accounts for broadcast alignment padding) and
+        Uses _layouts (which accounts for broadcast alignment padding) and
         dtype.bytes_per_elem so the result is correct regardless of the data type.
         Used to size the u-dma-buf pool and advertised as
         INFERENCE_BUF_POOL_SIZE_BYTES in the generated header.
@@ -205,8 +253,8 @@ class _CoreMixin:
 
         bpe   = self._dtype.bytes_per_elem
         total = sum(
-            _align64(size * bpe)
-            for size in self._alloc_sizes.values()
+            _align64(lay.alloc * bpe)
+            for lay in self._layouts.values()
         )
         page = 4096
         return (total + page - 1) & ~(page - 1)
@@ -265,84 +313,50 @@ class _CoreMixin:
         every tensor whose DMA buffer has alignment-gap padding and therefore
         needs strided fill/print logic.
 
-        Two categories:
-          1. Direct participants of a broadcast node: the advancing inputs and
-             the output of any node with outer_count > 1.
-          2. Outputs of non-broadcast nodes whose inputs are strided (stride
-             propagation).  E.g. a Relu applied to a broadcast intermediate
-             buffer produces a strided output that must be iterated chunk-by-
-             chunk even though Relu itself is not a broadcast op.
-
-        Repeating tensors (bias at offset 0 every iteration) are not included.
-        Nodes are processed in topological order so one forward pass suffices.
+        The integer values (outer_count) come from self._layouts.  The C macro
+        name strings are derived from the broadcast node whose output sets the
+        stride (pass 1), propagated through non-broadcast non-MatmulNode chains
+        (pass 2 — Fix A: MatmulNode excluded to prevent its output inheriting
+        a stride descriptor it doesn't use).
         """
-        result = {}
+        canonical: dict = {}   # onnx_name → c_up prefix string for C macros
 
-        # Pass 1 — VectorOP broadcast nodes: collect advancing inputs and outputs.
-        # MatmulNode is excluded: its outer_count > 1 means a run_matmul_at()
-        # loop with physical offsets, not chunk-stride alignment macros.
+        # Pass 1 — advancing inputs + output of each broadcast VectorOP node.
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
             if isinstance(sn, MatmulNode):
                 continue
-            c_up         = sn.output.c_name.upper()
-            chunk_macro  = f"INFERENCE_{c_up}_CHUNK"
-            stride_macro = f"INFERENCE_{c_up}_CHUNK_STRIDE"
-            n = sn.outer_count
-            result[sn.output.onnx_name] = (n, chunk_macro, stride_macro)
+            c_up = sn.output.c_name.upper()
+            canonical[sn.output.onnx_name] = c_up
             if sn.a_advances:
-                result[sn.inputs[0].onnx_name] = (n, chunk_macro, stride_macro)
+                canonical[sn.inputs[0].onnx_name] = c_up
             if sn.arity == 2 and sn.b_advances:
-                result[sn.inputs[1].onnx_name] = (n, chunk_macro, stride_macro)
+                canonical[sn.inputs[1].onnx_name] = c_up
 
-        # Pass 2 — non-broadcast VectorOP nodes: propagate stride to their outputs.
-        # MatmulNode is excluded: it reads/writes its own row layout and does not
-        # inherit a broadcast chunk-stride descriptor from its inputs.
+        # Pass 2 — propagate through non-broadcast non-MatmulNode chains.
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
             if isinstance(sn, MatmulNode):
                 continue
-            if sn.output.onnx_name in result:
-                continue  # already classified in pass 1
+            if sn.output.onnx_name in canonical:
+                continue
             for inp in sn.inputs:
-                if inp.onnx_name in result:
-                    result[sn.output.onnx_name] = result[inp.onnx_name]
+                if inp.onnx_name in canonical:
+                    canonical[sn.output.onnx_name] = canonical[inp.onnx_name]
                     break
 
-        return result
-
-    def _get_matmul_strides(self) -> dict:
-        """
-        {output_onnx_name: (a_row_stride, c_row_stride)} for MatmulNodes
-        whose A input or Y output DMA buffer has alignment-gap padding.
-
-        When A is a strided intermediate (produced by a broadcast VectorOP),
-        its rows in the DMA buffer are separated by aligned_chunk gaps.
-        MatmulKernel must skip those gaps by using a_row_stride = alloc//N
-        instead of the natural K.
-
-        When Y feeds a downstream broadcast VectorOP as an advancing input,
-        its alloc is padded to N*aligned_M.  MatmulKernel must write each row
-        at that padded stride using c_row_stride = alloc//N instead of M.
-
-        Only applies to outer_count==1 MatmulNodes (the outer-loop case
-        handles its own strides via a/c_outer_stride).
-        """
+        # Build result: combine canonical string prefixes with integer values
+        # from _layouts.  Only include tensors that actually have n_chunks > 1
+        # (advancing-strided buffers) — repeating/flat tensors are excluded.
         result: dict = {}
-        for sn in self._graph.nodes:
-            if not isinstance(sn, MatmulNode):
-                continue
-            if sn.outer_count > 1:
-                continue
-            a = sn.inputs[0]
-            n = sn.n
-            a_alloc = self._alloc_sizes.get(a.onnx_name, a.numel)
-            a_row_stride = (a_alloc // n) if a_alloc > a.numel else 0
-            y = sn.output
-            y_alloc = self._alloc_sizes.get(y.onnx_name, y.numel)
-            c_row_stride = (y_alloc // n) if y_alloc > y.numel else 0
-            if a_row_stride != 0 or c_row_stride != 0:
-                result[y.onnx_name] = (a_row_stride, c_row_stride)
+        for name, c_up in canonical.items():
+            lay = self._layouts.get(name)
+            if lay and lay.n_chunks > 1:
+                result[name] = (
+                    lay.n_chunks,
+                    f"INFERENCE_{c_up}_CHUNK",
+                    f"INFERENCE_{c_up}_CHUNK_STRIDE",
+                )
         return result

@@ -105,17 +105,14 @@ class _SimulateMixin:
         {onnx_name: ndarray}  for every tensor visited (inputs, weights,
         intermediates, outputs), float64 in logical shape.
         """
-        dtype     = self._dtype
-        bcast_map = self._broadcast_io_map()
+        dtype = self._dtype
         ramp_inputs: Dict[str, np.ndarray] = {}
 
         for t in self._graph.input_tensors:
             idx = np.arange(t.numel, dtype=np.int64)
-            if t.onnx_name in bcast_map:
-                n, _, _  = bcast_map[t.onnx_name]
-                chunk    = t.numel // n
-                stride   = self._alloc_sizes[t.onnx_name] // n   # aligned_chunk_size
-                positions = (idx // chunk) * stride + (idx % chunk)
+            lay = self._layouts.get(t.onnx_name)
+            if lay and lay.n_chunks > 1:
+                positions = (idx // lay.chunk) * lay.stride + (idx % lay.chunk)
             else:
                 positions = idx
             ramp_inputs[t.onnx_name] = dtype.ramp_to_float(positions).reshape(t.shape)
@@ -219,19 +216,16 @@ class _SimulateMixin:
         -------
         ndarray with dtype == self._dtype.np_storage, length _alloc_sizes[name]
         """
-        dtype      = self._dtype
-        bcast_map  = self._broadcast_io_map()
-        alloc_size = self._alloc_sizes[name]
-        buf        = np.zeros(alloc_size, dtype=dtype.np_storage)
-        flat       = logical.flatten()
-        encoded    = dtype.float_to_storage(flat.astype(np.float64))
+        dtype = self._dtype
+        lay   = self._layouts.get(name)
+        alloc = lay.alloc if lay is not None else len(logical.flatten())
+        buf   = np.zeros(alloc, dtype=dtype.np_storage)
+        flat  = logical.flatten()
+        encoded = dtype.float_to_storage(flat.astype(np.float64))
 
-        if name in bcast_map:
-            n, _, _  = bcast_map[name]
-            chunk    = len(flat) // n
-            stride   = alloc_size // n
+        if lay and lay.n_chunks > 1:
             idx      = np.arange(len(flat), dtype=np.int64)
-            pos      = (idx // chunk) * stride + (idx % chunk)
+            pos      = (idx // lay.chunk) * lay.stride + (idx % lay.chunk)
             buf[pos] = encoded
         else:
             buf[:len(flat)] = encoded

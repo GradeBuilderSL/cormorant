@@ -407,74 +407,91 @@ class TestAllocSizesForMixedModels(unittest.TestCase):
 
 @unittest.skipUnless(_mixed_models_exist(),
                      "Run test/gen_mixed_kernel_models.py first")
-class TestGetMatmulStrides(unittest.TestCase):
+class TestMatmulLayoutStrides(unittest.TestCase):
     """
-    Fix C: _get_matmul_strides() must return correct (a_row_stride, c_row_stride)
-    for each MatmulNode that has alignment-padded inputs or outputs.
+    Fix C: MatmulNode row strides are now derived from TensorLayout.
+
+    _layouts[name].gap > 0 (stride > chunk) indicates alignment padding;
+    the emitted run_matmul() then uses the row-strided decomposition.
 
     mixed_matmul_relu:     MatMul(X,W)->Z, Relu(Z)->Y — no broadcast VectorOP,
-      no padding → _get_matmul_strides must be empty.
+      no padding → no MatmulNode needs row strides.
 
     mixed_add_matmul:      Add(X,bias)->Z, MatMul(Z,W)->Y — Z.numel==32==Z.alloc
-      (K==aligned_chunk), Y.alloc==Y.numel → no strides needed.
+      (K==aligned_chunk, gap=0), Y.alloc==Y.numel → no strides needed.
 
     mixed_matmul_add_relu: MatMul(X,W)->Z, Add(Z,bias)->A, Relu(A)->Y
-      Z.alloc=32 > Z.numel=16 → c_row_stride=32/4=8.
-      X.alloc==X.numel → a_row_stride=0.
+      Z.layout: n_chunks=4, stride=8, chunk=4, gap=4 → c_row_stride=8.
+      X.layout: flat (gap=0) → a_row_stride=0.
 
     mixed_two_layer_mlp:   MatMul(X,W1)->z1, …, MatMul(h1,W2)->z2, …
-      z1.alloc=32 > z1.numel=24 → first MatMul c_row_stride=8.
-      h1.alloc=32 > h1.numel=24 → second MatMul a_row_stride=8.
-      z2.alloc=32 > z2.numel=16 → second MatMul c_row_stride=8.
+      z1.layout: n_chunks=4, stride=8, chunk=6, gap=2 → c_row_stride=8.
+      h1.layout: n_chunks=4, stride=8, chunk=6, gap=2 → a_row_stride=8.
+      z2.layout: n_chunks=4, stride=8, chunk=4, gap=4 → c_row_stride=8.
     """
 
-    def _strides(self, name: str) -> dict:
-        return _gen(name)._get_matmul_strides()
+    def _matmul_strides(self, name: str) -> dict:
+        """Return {output_name: (a_row_stride, c_row_stride)} for MatmulNodes
+        that need row-strided decomposition (gap > 0 on A input or Y output)."""
+        from src.nodes import MatmulNode
+        gen = _gen(name)
+        result = {}
+        for sn in gen._graph.nodes:
+            if not isinstance(sn, MatmulNode):
+                continue
+            if sn.outer_count > 1:
+                continue
+            a_lay = gen._layouts.get(sn.inputs[0].onnx_name)
+            y_lay = gen._layouts.get(sn.output.onnx_name)
+            a_row = a_lay.stride if (a_lay and a_lay.gap > 0) else 0
+            c_row = y_lay.stride if (y_lay and y_lay.gap > 0) else 0
+            if a_row != 0 or c_row != 0:
+                result[sn.output.onnx_name] = (a_row, c_row)
+        return result
 
     def test_matmul_relu_no_strides_needed(self):
         """No broadcast VectorOP in graph → no MatmulNode needs strides."""
-        strides = self._strides("mixed_matmul_relu.onnx")
+        strides = self._matmul_strides("mixed_matmul_relu.onnx")
         self.assertEqual(strides, {})
 
     def test_add_matmul_no_strides_needed(self):
-        """Z.numel==Z.alloc (K equals aligned_chunk) and Y has no downstream
-        broadcast → no strides needed for the MatMul node."""
-        strides = self._strides("mixed_add_matmul.onnx")
+        """Z.gap==0 (K equals aligned_chunk) and Y.gap==0 → no strides needed."""
+        strides = self._matmul_strides("mixed_add_matmul.onnx")
         self.assertEqual(strides, {})
 
     def test_matmul_add_relu_a_row_stride_zero(self):
-        """X is the graph input with natural layout — a_row_stride must be 0."""
-        strides = self._strides("mixed_matmul_add_relu.onnx")
+        """X is the graph input with flat layout — a_row_stride must be 0."""
+        strides = self._matmul_strides("mixed_matmul_add_relu.onnx")
         a_row, _ = strides["Z"]
         self.assertEqual(a_row, 0)
 
     def test_matmul_add_relu_c_row_stride(self):
-        """Z.alloc=32, N=4 → c_row_stride=8 (rows padded to aligned_chunk)."""
-        strides = self._strides("mixed_matmul_add_relu.onnx")
+        """Z.layout.stride=8, gap=4 → c_row_stride=8."""
+        strides = self._matmul_strides("mixed_matmul_add_relu.onnx")
         _, c_row = strides["Z"]
         self.assertEqual(c_row, 8)
 
     def test_two_layer_mlp_z1_a_row_stride_zero(self):
-        """First MatMul reads X which has natural layout — a_row_stride=0."""
-        strides = self._strides("mixed_two_layer_mlp.onnx")
+        """First MatMul reads X which has flat layout — a_row_stride=0."""
+        strides = self._matmul_strides("mixed_two_layer_mlp.onnx")
         a_row, _ = strides["z1"]
         self.assertEqual(a_row, 0)
 
     def test_two_layer_mlp_z1_c_row_stride(self):
-        """z1.alloc=32, N=4 → c_row_stride=8."""
-        strides = self._strides("mixed_two_layer_mlp.onnx")
+        """z1.layout.stride=8, gap>0 → c_row_stride=8."""
+        strides = self._matmul_strides("mixed_two_layer_mlp.onnx")
         _, c_row = strides["z1"]
         self.assertEqual(c_row, 8)
 
     def test_two_layer_mlp_z2_a_row_stride(self):
-        """h1.alloc=32, N=4 → a_row_stride=8 (reading strided h1)."""
-        strides = self._strides("mixed_two_layer_mlp.onnx")
+        """h1.layout.stride=8, gap>0 → a_row_stride=8 (reading strided h1)."""
+        strides = self._matmul_strides("mixed_two_layer_mlp.onnx")
         a_row, _ = strides["z2"]
         self.assertEqual(a_row, 8)
 
     def test_two_layer_mlp_z2_c_row_stride(self):
-        """z2.alloc=32, N=4 → c_row_stride=8."""
-        strides = self._strides("mixed_two_layer_mlp.onnx")
+        """z2.layout.stride=8, gap>0 → c_row_stride=8."""
+        strides = self._matmul_strides("mixed_two_layer_mlp.onnx")
         _, c_row = strides["z2"]
         self.assertEqual(c_row, 8)
 
@@ -595,6 +612,713 @@ class TestHeaderSizeMacrosForMixedModels(unittest.TestCase):
         """z2 is the second MatMul output — no CHUNK macro emitted."""
         h = self._hdr("mixed_two_layer_mlp.onnx")
         self.assertNotIn("INFERENCE_Z2_CHUNK", h)
+
+
+def _new_mixed_models_exist() -> bool:
+    return os.path.isfile(_mixed_model("mixed_add_matmul_unaligned.onnx"))
+
+
+def _matmul_strides(gen) -> dict:
+    """Return {output_name: (a_row_stride, c_row_stride)} for MatmulNodes
+    that need row-strided decomposition (gap > 0 on A input or Y output)
+    and have outer_count == 1."""
+    from src.nodes import MatmulNode
+    result = {}
+    for sn in gen._graph.nodes:
+        if not isinstance(sn, MatmulNode) or sn.outer_count > 1:
+            continue
+        a_lay = gen._layouts.get(sn.inputs[0].onnx_name)
+        y_lay = gen._layouts.get(sn.output.onnx_name)
+        a_row = a_lay.stride if (a_lay and a_lay.gap > 0) else 0
+        c_row = y_lay.stride if (y_lay and y_lay.gap > 0) else 0
+        if a_row or c_row:
+            result[sn.output.onnx_name] = (a_row, c_row)
+    return result
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestAddMatmulUnaligned(unittest.TestCase):
+    """mixed_add_matmul_unaligned: Add(X[4,6], bias[6])→Z[4,6], MatMul(Z,W[6,4])→Y[4,4].
+    K=6 unaligned → aligned_chunk=8, gap=2 in Z's layout.
+    Y is a MatmulNode output (Fix A: not in bcast_map).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_add_matmul_unaligned.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,6] numel=24, outer=4, aligned_chunk=8 → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_z_layout(self):
+        """Z: n_chunks=4, chunk=6, stride=8, gap=2."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.chunk, 6)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 2)
+
+    def test_y_alloc(self):
+        """Y is MatmulNode output (Fix A) — alloc must equal numel (16), not 32."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 16)
+
+    def test_y_not_in_bcast_map(self):
+        """Y is a MatmulNode output — must NOT be in _broadcast_io_map (Fix A)."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("Y", bmap)
+
+    def test_z_in_bcast_map(self):
+        """Z is an advancing input of broadcast Add — must be in the map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Z", bmap)
+
+    def test_matmul_strides(self):
+        """a_row_stride=8 (Z has gap=2), c_row_stride=0 (Y flat)."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("Y", strides)
+        a_row, c_row = strides["Y"]
+        self.assertEqual(a_row, 8)
+        self.assertEqual(c_row, 0)
+
+    def test_run_matmul_call(self):
+        """run_matmul(Z, W, Y, 1u, 6u, 4u, 4u, 8u, 0u, 4u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 6u, 4u, 4u", src)
+        self.assertIn("8u, 0u, 4u", src)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestMatmulScaleBias(unittest.TestCase):
+    """mixed_matmul_scale_bias: MatMul(X[4,8],W[8,4])→Z, Mul(Z,scale[4])→S, Add(S,bias[4])→Y.
+    Mul and Add both broadcast (outer=4, chunk=4, aligned=8) → gap=4.
+    MatMul: c_row_stride=8 (Z has gap), a_row_stride=0 (X flat).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_matmul_scale_bias.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,4] numel=16, downstream broadcast → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_s_alloc(self):
+        """S[4,4] is Mul output with outer=4, aligned=8 → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["S"], 32)
+
+    def test_y_alloc(self):
+        """Y[4,4] is Add output with outer=4, aligned=8 → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 32)
+
+    def test_z_layout_gap(self):
+        """Z: n_chunks=4, stride=8, chunk=4, gap=4."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 4)
+
+    def test_matmul_c_row_stride(self):
+        """c_row_stride=8 (Z gap=4), a_row_stride=0 (X flat)."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("Z", strides)
+        a_row, c_row = strides["Z"]
+        self.assertEqual(a_row, 0)
+        self.assertEqual(c_row, 8)
+
+    def test_run_matmul_call(self):
+        """Strided form: run_matmul(X, W, Z, 1u, 8u, 4u, 4u, 8u, 0u, 8u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 8u, 4u, 4u", src)
+        self.assertIn("8u, 0u, 8u", src)
+
+    def test_header_s_chunk_defined(self):
+        """INFERENCE_S_CHUNK must be emitted (S is Mul output)."""
+        hdr = self.gen.generate_header()
+        self.assertIn("INFERENCE_S_CHUNK", hdr)
+
+    def test_header_y_chunk_defined(self):
+        """INFERENCE_Y_CHUNK must be emitted (Y is Add output)."""
+        hdr = self.gen.generate_header()
+        self.assertIn("INFERENCE_Y_CHUNK", hdr)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestOuterMatmulRelu(unittest.TestCase):
+    """mixed_outer_matmul_relu: A[2,3,4,6] @ B[3,6,4] → Z[2,3,4,4], Relu(Z) → Y[2,3,4,4].
+    outer_count=2, batch=3, n=4, k=6, m=4.
+    No VectorOP broadcast → Z and Y are flat.
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_outer_matmul_relu.onnx")
+
+    def test_z_alloc(self):
+        """Z[2,3,4,4] numel=96, no broadcast VectorOP → alloc=96 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 96)
+
+    def test_y_alloc(self):
+        """Y[2,3,4,4] numel=96 → alloc=96 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 96)
+
+    def test_z_layout_flat(self):
+        """Z: flat layout (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_y_not_in_bcast_map(self):
+        """Y is MatmulNode output — not in bcast_map (Fix A)."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("Y", bmap)
+
+    def test_outer_loop_emitted(self):
+        """run_matmul_at() inside a for-loop over 2 outer iterations."""
+        src = self.gen.generate_source()
+        self.assertIn("run_matmul_at(", src)
+        self.assertIn("_i < 2u", src)
+
+    def test_outer_strides_in_source(self):
+        """A outer stride=72, B outer stride=0, C outer stride=48."""
+        src = self.gen.generate_source()
+        self.assertIn("_i * 72u", src)
+        self.assertIn("_i * 0u", src)
+        self.assertIn("_i * 48u", src)
+
+    def test_inner_dimensions(self):
+        """Inner call: n=4, k=6, m=4, batch=3."""
+        src = self.gen.generate_source()
+        self.assertIn("4u, 6u, 4u, 3u", src)
+
+    def test_relu_runs_on_full_z(self):
+        """Relu: run_op(Z, NULL, Y, 96u, VECTOROP_RELU)."""
+        src = self.gen.generate_source()
+        self.assertIn("run_op(", src)
+        self.assertIn("96u", src)
+        self.assertIn("VECTOROP_RELU", src)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestRelu6MatmulAdd(unittest.TestCase):
+    """mixed_relu6_matmul_add: Relu6(X[4,8])→Z[4,8], MatMul(Z,W[8,6])→A[4,6], Add(A,bias[6])→Y[4,6].
+    Add broadcasts (outer=4, chunk=6, aligned=8) → A.alloc=32 (gap=2).
+    MatMul: a_row_stride=0 (Z flat, K=8 aligned), c_row_stride=8 (A gap=2).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_relu6_matmul_add.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,8] numel=32, K=8 aligned — no gap → alloc=32 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_z_layout_flat(self):
+        """Z: flat (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_a_alloc(self):
+        """A[4,6] numel=24, outer=4, aligned_chunk=8 → alloc=32 (gap=2)."""
+        self.assertEqual(self.gen._alloc_sizes["A"], 32)
+
+    def test_a_layout(self):
+        """A: n_chunks=4, chunk=6, stride=8, gap=2."""
+        lay = self.gen._layouts["A"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.chunk, 6)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 2)
+
+    def test_a_not_in_bcast_map_as_matmul_output(self):
+        """A is a MatmulNode output — Fix A: must NOT be in bcast_map via pass 2
+        (it IS in bcast_map via pass 1 as the broadcast Add output)."""
+        bmap = self.gen._broadcast_io_map()
+        # A must be in the map because it's the advancing input of Add (pass 1).
+        self.assertIn("A", bmap)
+
+    def test_matmul_strides(self):
+        """a_row_stride=0 (Z flat, K=8), c_row_stride=8 (A gap=2)."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("A", strides)
+        a_row, c_row = strides["A"]
+        self.assertEqual(a_row, 0)
+        self.assertEqual(c_row, 8)
+
+    def test_run_matmul_call(self):
+        """Strided form: run_matmul(Z, W, A, 1u, 8u, 6u, 4u, 8u, 0u, 8u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 8u, 6u, 4u", src)
+        self.assertIn("8u, 0u, 8u", src)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestResidual(unittest.TestCase):
+    """mixed_residual: MatMul(X[4,8], W[8,4])→Z[4,4], Add(Z, res[4,4])→Y[4,4].
+    res is a weight with shape [4,4] == Z shape — non-broadcast Add.
+    Z.alloc=16 (flat), Y.alloc=16 (flat).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_residual.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,4] numel=16, non-broadcast downstream → alloc=16 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 16)
+
+    def test_y_alloc(self):
+        """Y[4,4] numel=16, non-broadcast Add → alloc=16 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 16)
+
+    def test_z_layout_flat(self):
+        """Z: flat (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_y_not_in_bcast_map(self):
+        """No broadcast nodes → Y not in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("Y", bmap)
+
+    def test_matmul_natural_call(self):
+        """Natural form: run_matmul(X, W, Z, 4u, 8u, 4u, 1u, 0u, 0u, 0u)."""
+        src = self.gen.generate_source()
+        self.assertIn("4u, 8u, 4u, 1u", src)
+        self.assertIn("0u, 0u, 0u", src)
+
+    def test_add_non_broadcast(self):
+        """Non-broadcast Add: run_op(Z, res, Y, 16u, VECTOROP_ADD)."""
+        src = self.gen.generate_source()
+        self.assertIn("run_op(", src)
+        self.assertIn("16u", src)
+        self.assertIn("VECTOROP_ADD", src)
+
+    def test_no_chunk_macros(self):
+        """No CHUNK macros for Z or Y (both flat, no broadcast)."""
+        hdr = self.gen.generate_header()
+        self.assertNotIn("INFERENCE_Z_CHUNK", hdr)
+        self.assertNotIn("INFERENCE_Y_CHUNK", hdr)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestBatchMatmulRelu(unittest.TestCase):
+    """mixed_batch_matmul_relu: A[2,4,6] @ B[6,4] → Z[2,4,4], Relu(Z) → Y[2,4,4].
+    B is 2-D (broadcasts across A's batch). outer_count=1, batch=2.
+    Z.alloc=32 (flat), Y.alloc=32 (flat).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_batch_matmul_relu.onnx")
+
+    def test_z_alloc(self):
+        """Z[2,4,4] numel=32, no broadcast VectorOP → alloc=32 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_y_alloc(self):
+        """Y[2,4,4] numel=32 → alloc=32 (flat)."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 32)
+
+    def test_z_layout_flat(self):
+        """Z: flat (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_y_not_in_bcast_map(self):
+        """Y is MatmulNode output — not in bcast_map (Fix A)."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("Y", bmap)
+
+    def test_no_outer_loop(self):
+        """outer_count=1 → no run_matmul_at(), uses plain run_matmul()."""
+        src = self.gen.generate_source()
+        self.assertNotIn("run_matmul_at(", src)
+
+    def test_run_matmul_batched(self):
+        """Natural batched form: run_matmul(A, B, Z, 4u, 6u, 4u, 2u, 24u, 0u, 16u)."""
+        src = self.gen.generate_source()
+        self.assertIn("4u, 6u, 4u, 2u", src)
+        self.assertIn("24u, 0u, 16u", src)
+
+    def test_relu_on_full_z(self):
+        """Relu: run_op(Z, NULL, Y, 32u, VECTOROP_RELU)."""
+        src = self.gen.generate_source()
+        self.assertIn("run_op(", src)
+        self.assertIn("32u", src)
+        self.assertIn("VECTOROP_RELU", src)
+
+
+@unittest.skipUnless(_new_mixed_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestSubDivMatmul(unittest.TestCase):
+    """mixed_sub_div_matmul: Sub(X[4,6],offset[6])→S, Div(S,scale[6])→D, MatMul(D,W[6,4])→Y.
+    Sub and Div both broadcast (outer=4, chunk=6, aligned=8) → gap=2.
+    Y: flat(16) — MatmulNode output (Fix A).
+    MatMul: a_row_stride=8 (D gap=2), c_row_stride=0 (Y flat).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_sub_div_matmul.onnx")
+
+    def test_s_alloc(self):
+        """S[4,6] numel=24, outer=4, aligned=8 → alloc=32 (gap=2)."""
+        self.assertEqual(self.gen._alloc_sizes["S"], 32)
+
+    def test_d_alloc(self):
+        """D[4,6] numel=24, outer=4, aligned=8 → alloc=32 (gap=2)."""
+        self.assertEqual(self.gen._alloc_sizes["D"], 32)
+
+    def test_y_alloc(self):
+        """Y is MatmulNode output (Fix A) — alloc=16 (flat, numel=16)."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 16)
+
+    def test_d_layout(self):
+        """D: n_chunks=4, chunk=6, stride=8, gap=2."""
+        lay = self.gen._layouts["D"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.chunk, 6)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 2)
+
+    def test_y_not_in_bcast_map(self):
+        """Y is MatmulNode output — Fix A: not in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("Y", bmap)
+
+    def test_s_in_bcast_map(self):
+        """S is advancing input of Sub broadcast → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("S", bmap)
+
+    def test_matmul_strides(self):
+        """a_row_stride=8 (D gap=2), c_row_stride=0 (Y flat)."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("Y", strides)
+        a_row, c_row = strides["Y"]
+        self.assertEqual(a_row, 8)
+        self.assertEqual(c_row, 0)
+
+    def test_run_matmul_call(self):
+        """Strided form: run_matmul(D, W, Y, 1u, 6u, 4u, 4u, 8u, 0u, 4u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 6u, 4u, 4u", src)
+        self.assertIn("8u, 0u, 4u", src)
+
+
+def _multi_io_models_exist() -> bool:
+    return os.path.isfile(_mixed_model("mixed_two_input_two_output.onnx"))
+
+
+@unittest.skipUnless(_multi_io_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestTwoInputMatmul(unittest.TestCase):
+    """mixed_two_input_matmul: Add(X1[4,8], X2[4,8])→Z[4,8] (same-shape, non-broadcast),
+    MatMul(Z[4,8], W[8,4])→Y[4,4].
+    Two graph inputs (X1, X2), one output (Y).  Z and Y are flat.
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_two_input_matmul.onnx")
+
+    def test_x1_alloc(self):
+        """X1[4,8] numel=32, flat → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["X1"], 32)
+
+    def test_x2_alloc(self):
+        """X2[4,8] numel=32, flat → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["X2"], 32)
+
+    def test_z_alloc(self):
+        """Z[4,8] non-broadcast Add output → alloc=32 (flat, numel=32)."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_y_alloc(self):
+        """Y[4,4] MatmulNode output, flat → alloc=16."""
+        self.assertEqual(self.gen._alloc_sizes["Y"], 16)
+
+    def test_z_layout_flat(self):
+        """Z: flat (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_y_layout_flat(self):
+        """Y: flat (n_chunks=1, gap=0)."""
+        lay = self.gen._layouts["Y"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.gap, 0)
+
+    def test_no_broadcast_chunk_macros(self):
+        """No broadcast VectorOP nodes → bcast_map is empty."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertEqual(bmap, {})
+
+    def test_no_chunk_macros_in_header(self):
+        """No CHUNK macros should appear (no broadcast nodes)."""
+        hdr = self.gen.generate_header()
+        self.assertNotIn("INFERENCE_Z_CHUNK", hdr)
+        self.assertNotIn("INFERENCE_Y_CHUNK", hdr)
+
+    def test_natural_matmul_call(self):
+        """Natural form: run_matmul(Z, W, Y, 4u, 8u, 4u, 1u, 0u, 0u, 0u)."""
+        src = self.gen.generate_source()
+        self.assertIn("4u, 8u, 4u, 1u", src)
+        self.assertIn("0u, 0u, 0u", src)
+
+    def test_two_inputs_in_run_signature(self):
+        """inference_run() must accept both X1 and X2."""
+        src = self.gen.generate_source()
+        self.assertIn("inference_buf_t *X1", src)
+        self.assertIn("inference_buf_t *X2", src)
+
+    def test_sync_to_device_for_both_inputs(self):
+        """Both inputs are flushed before the first kernel call."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_to_device(X1)", src)
+        self.assertIn("sync_to_device(X2)", src)
+
+    def test_one_sync_from_device(self):
+        """Only Y is invalidated after the kernel."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_from_device(Y)", src)
+        self.assertNotIn("sync_from_device(X1)", src)
+        self.assertNotIn("sync_from_device(X2)", src)
+
+    def test_header_inference_run_two_inputs(self):
+        """Header declaration lists X1 and X2 as parameters."""
+        hdr = self.gen.generate_header()
+        self.assertIn("inference_buf_t *X1", hdr)
+        self.assertIn("inference_buf_t *X2", hdr)
+
+
+@unittest.skipUnless(_multi_io_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestTwoOutput(unittest.TestCase):
+    """mixed_two_output: X[4,8]→MatMul→Z[4,4], Add(Z,bias[4])→Yadd[4,4] (broadcast),
+    Relu(Z)→Yrelu[4,4] (phase-3 propagation from Z).
+    One input (X), two outputs (Yadd, Yrelu).
+    Z.alloc=32 (advancing, gap=4).  Yrelu inherits Z's advancing layout.
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_two_output.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,4] numel=16, advancing input of broadcast Add → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_z_layout(self):
+        """Z: n_chunks=4, chunk=4, stride=8, gap=4."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.chunk, 4)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 4)
+
+    def test_yadd_alloc(self):
+        """Yadd[4,4] output of broadcast Add → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Yadd"], 32)
+
+    def test_yrelu_alloc(self):
+        """Yrelu[4,4] inherits Z's advancing layout via phase 3 → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Yrelu"], 32)
+
+    def test_yrelu_layout(self):
+        """Yrelu: n_chunks=4, stride=8 (propagated from Z through Relu)."""
+        lay = self.gen._layouts["Yrelu"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.stride, 8)
+
+    def test_z_in_bcast_map(self):
+        """Z is the advancing input of broadcast Add → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Z", bmap)
+
+    def test_yadd_in_bcast_map(self):
+        """Yadd is the direct output of broadcast Add → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Yadd", bmap)
+
+    def test_yrelu_in_bcast_map(self):
+        """Yrelu inherits Z's canonical prefix via phase-2 propagation → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Yrelu", bmap)
+
+    def test_yrelu_uses_yadd_macros(self):
+        """Yrelu's bcast_map entry references INFERENCE_YADD_CHUNK macros."""
+        bmap = self.gen._broadcast_io_map()
+        _, chunk_macro, stride_macro = bmap["Yrelu"]
+        self.assertEqual(chunk_macro,  "INFERENCE_YADD_CHUNK")
+        self.assertEqual(stride_macro, "INFERENCE_YADD_CHUNK_STRIDE")
+
+    def test_matmul_c_row_stride(self):
+        """Z has gap=4 → c_row_stride=8; X is flat → a_row_stride=0."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("Z", strides)
+        a_row, c_row = strides["Z"]
+        self.assertEqual(a_row, 0)
+        self.assertEqual(c_row, 8)
+
+    def test_run_matmul_strided_call(self):
+        """Strided form: run_matmul(X, W, Z, 1u, 8u, 4u, 4u, 8u, 0u, 8u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 8u, 4u, 4u", src)
+        self.assertIn("8u, 0u, 8u", src)
+
+    def test_two_outputs_in_run_signature(self):
+        """inference_run() must accept Yadd and Yrelu."""
+        src = self.gen.generate_source()
+        self.assertIn("inference_buf_t *Yadd", src)
+        self.assertIn("inference_buf_t *Yrelu", src)
+
+    def test_sync_from_device_for_both_outputs(self):
+        """Both outputs are invalidated after all kernel ops."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_from_device(Yadd)", src)
+        self.assertIn("sync_from_device(Yrelu)", src)
+
+    def test_one_sync_to_device(self):
+        """Only X is flushed before the first kernel call."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_to_device(X)", src)
+        self.assertNotIn("sync_to_device(Y", src)
+
+    def test_header_yrelu_size_uses_yadd_stride_macro(self):
+        """INFERENCE_YRELU_SIZE must reference INFERENCE_YADD_CHUNK_STRIDE."""
+        hdr = self.gen.generate_header()
+        self.assertIn("INFERENCE_YRELU_SIZE", hdr)
+        self.assertIn("INFERENCE_YADD_CHUNK_STRIDE", hdr)
+        self.assertIn("4u * INFERENCE_YADD_CHUNK_STRIDE", hdr)
+
+    def test_header_two_outputs_in_run_declaration(self):
+        """Header inference_run() declaration lists Yadd and Yrelu."""
+        hdr = self.gen.generate_header()
+        self.assertIn("inference_buf_t *Yadd", hdr)
+        self.assertIn("inference_buf_t *Yrelu", hdr)
+
+
+@unittest.skipUnless(_multi_io_models_exist(),
+                     "Run test/gen_mixed_kernel_models.py first")
+class TestTwoInputTwoOutput(unittest.TestCase):
+    """mixed_two_input_two_output:
+    X1[4,8] → MatMul(X1, W[8,4]) → Z[4,4],
+    Add(Z, X2[4]) → Yadd[4,4]  (broadcast, outer=4, chunk=4; X2 is a graph input),
+    Relu(Z)       → Yrelu[4,4] (phase-3 propagation from Z).
+    Two inputs (X1, X2), two outputs (Yadd, Yrelu).
+    Z.alloc=32 (advancing, gap=4).  X2.alloc=8 (repeating, n_chunks=1).
+    INFERENCE_X2_SIZE = 4u (numel, not alloc=8).
+    """
+
+    def setUp(self):
+        self.gen = _gen("mixed_two_input_two_output.onnx")
+
+    def test_z_alloc(self):
+        """Z[4,4] advancing input of broadcast Add → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Z"], 32)
+
+    def test_z_layout(self):
+        """Z: n_chunks=4, stride=8, gap=4."""
+        lay = self.gen._layouts["Z"]
+        self.assertEqual(lay.n_chunks, 4)
+        self.assertEqual(lay.stride, 8)
+        self.assertEqual(lay.gap, 4)
+
+    def test_x2_alloc(self):
+        """X2[4] repeating graph input (co-input to broadcast Add) → alloc=8."""
+        self.assertEqual(self.gen._alloc_sizes["X2"], 8)
+
+    def test_x2_layout(self):
+        """X2: n_chunks=1 (repeating), alloc=8, chunk=4, stride=8."""
+        lay = self.gen._layouts["X2"]
+        self.assertEqual(lay.n_chunks, 1)
+        self.assertEqual(lay.alloc, 8)
+        self.assertEqual(lay.chunk, 4)
+        self.assertEqual(lay.stride, 8)
+
+    def test_yadd_alloc(self):
+        """Yadd[4,4] output of broadcast Add → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Yadd"], 32)
+
+    def test_yrelu_alloc(self):
+        """Yrelu[4,4] inherits Z's advancing layout → alloc=32."""
+        self.assertEqual(self.gen._alloc_sizes["Yrelu"], 32)
+
+    def test_x2_not_in_bcast_map(self):
+        """X2 has n_chunks=1 (repeating) → excluded from bcast_map result."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertNotIn("X2", bmap)
+
+    def test_z_in_bcast_map(self):
+        """Z is the advancing input of broadcast Add → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Z", bmap)
+
+    def test_yrelu_in_bcast_map(self):
+        """Yrelu inherits Z's canonical prefix → in bcast_map."""
+        bmap = self.gen._broadcast_io_map()
+        self.assertIn("Yrelu", bmap)
+
+    def test_header_x2_size_is_numel(self):
+        """INFERENCE_X2_SIZE must be t.numel=4 (not alloc=8)."""
+        hdr = self.gen.generate_header()
+        self.assertIn("INFERENCE_X2_SIZE", hdr)
+        self.assertIn("4u", hdr)
+        self.assertNotIn("8u * INFERENCE", hdr)
+
+    def test_matmul_c_row_stride(self):
+        """Z has gap=4 → c_row_stride=8; X1 is flat → a_row_stride=0."""
+        strides = _matmul_strides(self.gen)
+        self.assertIn("Z", strides)
+        a_row, c_row = strides["Z"]
+        self.assertEqual(a_row, 0)
+        self.assertEqual(c_row, 8)
+
+    def test_run_matmul_strided_call(self):
+        """Strided form: run_matmul(X1, W, Z, 1u, 8u, 4u, 4u, 8u, 0u, 8u)."""
+        src = self.gen.generate_source()
+        self.assertIn("1u, 8u, 4u, 4u", src)
+        self.assertIn("8u, 0u, 8u", src)
+
+    def test_two_inputs_in_run_signature(self):
+        """inference_run() must accept X1 and X2."""
+        src = self.gen.generate_source()
+        self.assertIn("inference_buf_t *X1", src)
+        self.assertIn("inference_buf_t *X2", src)
+
+    def test_two_outputs_in_run_signature(self):
+        """inference_run() must accept Yadd and Yrelu."""
+        src = self.gen.generate_source()
+        self.assertIn("inference_buf_t *Yadd", src)
+        self.assertIn("inference_buf_t *Yrelu", src)
+
+    def test_sync_to_device_for_both_inputs(self):
+        """Both X1 and X2 are flushed before the first kernel call."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_to_device(X1)", src)
+        self.assertIn("sync_to_device(X2)", src)
+
+    def test_sync_from_device_for_both_outputs(self):
+        """Both Yadd and Yrelu are invalidated after all kernel ops."""
+        src = self.gen.generate_source()
+        self.assertIn("sync_from_device(Yadd)", src)
+        self.assertIn("sync_from_device(Yrelu)", src)
+
+    def test_header_two_inputs_in_run_declaration(self):
+        """Header inference_run() declaration lists X1 and X2."""
+        hdr = self.gen.generate_header()
+        self.assertIn("inference_buf_t *X1", hdr)
+        self.assertIn("inference_buf_t *X2", hdr)
+
+    def test_header_two_outputs_in_run_declaration(self):
+        """Header inference_run() declaration lists Yadd and Yrelu."""
+        hdr = self.gen.generate_header()
+        self.assertIn("inference_buf_t *Yadd", hdr)
+        self.assertIn("inference_buf_t *Yrelu", hdr)
 
 
 if __name__ == "__main__":
