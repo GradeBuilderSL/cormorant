@@ -10,24 +10,13 @@ from ._banners import _file_banner
 # The file banner (with model info / timestamp) is prepended by
 # generate_buf_impl().  INFERENCE_BYTES_PER_ELEM comes from inference.h.
 _BUF_IMPL_TEMPLATE = r"""
-////////////////////////////////////////////////////////////////////////
-/* inference_buf_t definition                                          */
-////////////////////////////////////////////////////////////////////////
-
+/* inference_buf_t struct is defined in inference.h so that inference.c
+ * can declare static view instances.  This file provides the implementation. */
 #include "inference.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-struct inference_buf {
-    void    *virt;    /* CPU-accessible virtual address */
-    uint64_t phys;    /* physical DDR address for AXI DMA registers */
-    unsigned  count;  /* number of Data_t elements allocated */
-#ifdef __linux__
-    unsigned  bo;     /* XRT buffer object handle (xclBufferHandle = unsigned) */
-#endif
-};
 
 ////////////////////////////////////////////////////////////////////////
 /* Platform-independent accessors                                      */
@@ -46,6 +35,22 @@ uint64_t inference_buf_phys(const inference_buf_t *buf)
 unsigned inference_buf_count(const inference_buf_t *buf)
 {
     return buf->count;
+}
+
+void inference_buf_init_view(inference_buf_t *view,
+                              inference_buf_t *base,
+                              unsigned offset_elems,
+                              unsigned count_elems)
+{
+    uint64_t byte_off  = (uint64_t)offset_elems * INFERENCE_BYTES_PER_ELEM;
+    view->virt         = (char *)base->virt + (size_t)byte_off;
+    view->phys         = base->phys + byte_off;
+    view->count        = count_elems;
+    view->is_owner     = 0u;
+#ifdef __linux__
+    view->bo           = base->bo;
+    view->bo_offset    = base->bo_offset + byte_off;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -155,20 +160,22 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
         return NULL;
     }
 
-    buf->virt  = virt;
-    buf->phys  = props.paddr;
-    buf->count = n_elem;
-    buf->bo    = (unsigned)bo;
+    buf->virt      = virt;
+    buf->phys      = props.paddr;
+    buf->count     = n_elem;
+    buf->bo        = (unsigned)bo;
+    buf->is_owner  = 1u;
+    buf->bo_offset = 0;
     return buf;
 }
 
 void inference_buf_free(inference_buf_t *buf)
 {
-    if (buf) {
-        xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
-        xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
-        free(buf);
-    }
+    if (!buf || !buf->is_owner)
+        return;
+    xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
+    xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
+    free(buf);
 }
 
 /* Flush: write dirty CPU cache lines to DDR before the AXI master reads. */
@@ -176,7 +183,7 @@ void inference_buf_sync_to_device(inference_buf_t *buf)
 {
     xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
               XCL_BO_SYNC_BO_TO_DEVICE,
-              buf->count * INFERENCE_BYTES_PER_ELEM, 0);
+              buf->count * INFERENCE_BYTES_PER_ELEM, buf->bo_offset);
 }
 
 /* Invalidate: drop CPU cache lines after the AXI master has written. */
@@ -184,7 +191,7 @@ void inference_buf_sync_from_device(inference_buf_t *buf)
 {
     xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
               XCL_BO_SYNC_BO_FROM_DEVICE,
-              buf->count * INFERENCE_BYTES_PER_ELEM, 0);
+              buf->count * INFERENCE_BYTES_PER_ELEM, buf->bo_offset);
 }
 
 #else  /* bare-metal */
@@ -214,19 +221,20 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     mem = malloc(bytes);
     if (!mem) { free(buf); return NULL; }
 
-    buf->virt  = mem;
+    buf->virt     = mem;
     /* VA == PA on Xilinx standalone with identity-mapped DDR */
-    buf->phys  = (uint64_t)(uintptr_t)mem;
-    buf->count = n_elem;
+    buf->phys     = (uint64_t)(uintptr_t)mem;
+    buf->count    = n_elem;
+    buf->is_owner = 1u;
     return buf;
 }
 
 void inference_buf_free(inference_buf_t *buf)
 {
-    if (buf) {
-        free(buf->virt);
-        free(buf);
-    }
+    if (!buf || !buf->is_owner)
+        return;
+    free(buf->virt);
+    free(buf);
 }
 
 void inference_buf_sync_to_device(inference_buf_t *buf)

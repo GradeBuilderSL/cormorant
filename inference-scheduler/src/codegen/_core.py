@@ -267,6 +267,42 @@ class _CoreMixin:
             result[t.onnx_name] = (lay.n_chunks, lay.stride)
         return result
 
+    def _compute_pool_layout(self):
+        """
+        Compute per-buffer offsets for the single contiguous pool allocation.
+
+        Returns (layout, total_elems) where:
+          layout     = list of (onnx_name, offset_in_elems, alloc_in_elems)
+                       for all weights + non-reshape-alias intermediates, in
+                       declaration order (weights first, then intermediates)
+          total_elems = total pool size in elements (sum of aligned alloc sizes)
+
+        Each slot is padded to a 64-byte boundary to ensure DMA cache-line
+        alignment between sub-buffers.
+        """
+        bpe       = self._dtype.bytes_per_elem
+        align_to  = 64 // bpe   # elements per 64-byte boundary
+        def align_up(n):
+            return (n + align_to - 1) & ~(align_to - 1)
+
+        reshape_aliases = self._reshape_aliases
+        layout  = []
+        offset  = 0
+
+        for t in self._graph.weight_tensors:
+            alloc = self._alloc_sizes[t.onnx_name]
+            layout.append((t.onnx_name, offset, alloc))
+            offset += align_up(alloc)
+
+        for t in self._graph.intermediate_tensors:
+            if t.onnx_name in reshape_aliases:
+                continue
+            alloc = self._alloc_sizes[t.onnx_name]
+            layout.append((t.onnx_name, offset, alloc))
+            offset += align_up(alloc)
+
+        return layout, offset
+
     def _compute_pool_bytes(self) -> int:
         """
         Total DMA memory needed for all model buffers, with 64-byte alignment

@@ -61,8 +61,10 @@ class TestSourceGen(unittest.TestCase):
         # inference_run() flushes graph inputs and invalidates graph outputs
         self.assertIn("inference_buf_sync_to_device(X)", s)
         self.assertIn("inference_buf_sync_from_device(Y)", s)
-        # inference_init() syncs weights once after loading
-        self.assertIn("inference_buf_sync_to_device(bias)", s)
+        # inference_init() syncs the entire weight pool once after loading —
+        # the single pool covers all weight and intermediate buffers.
+        self.assertIn("inference_buf_sync_to_device(s_alloc_pool)", s)
+        self.assertNotIn("inference_buf_sync_to_device(bias)", s)
 
     def test_run_op_call_add(self):
         s = self._source("single_add.onnx")

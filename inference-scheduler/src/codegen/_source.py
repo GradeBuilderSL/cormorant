@@ -101,6 +101,27 @@ class _SourceMixin:
         else:
             lines.append("/* (no intermediate buffers) */")
 
+        # Pool pointer and static view-struct backing storage
+        weights       = self._graph.weight_tensors
+        reshape_aliases = self._reshape_aliases
+        pool_tensors  = (
+            list(weights) +
+            [t for t in intermediates if t.onnx_name not in reshape_aliases]
+        )
+        if pool_tensors:
+            lines.append("")
+            lines.append(
+                "/* Pool allocation that owns all weight + intermediate DMA memory */"
+            )
+            lines.append("static inference_buf_t *s_alloc_pool = NULL;")
+            lines.append("")
+            lines.append(
+                "/* Static view-struct backing storage"
+                " (no heap allocation for sub-buffer metadata) */"
+            )
+            for t in pool_tensors:
+                lines.append(f"static inference_buf_t _s_buf_{t.c_name};")
+
         return "\n".join(lines)
 
     def _kernel_instance(self) -> str:
@@ -497,24 +518,45 @@ class _SourceMixin:
         weights       = graph.weight_tensors
         intermediates = graph.intermediate_tensors
 
+        reshape_aliases = self._reshape_aliases  # {out_name: src_c_name}
+        external        = {t.onnx_name for t in self.large_weight_tensors}
+
+        # Compute pool layout: list of (onnx_name, offset, alloc) + total_elems
+        pool_layout, total_pool_elems = self._compute_pool_layout()
+        # Build lookup: onnx_name -> (offset, alloc)
+        pool_map = {name: (off, alloc) for (name, off, alloc) in pool_layout}
+
+        # Determine if a pool is needed (at least one weight or non-alias intermediate)
+        need_pool = bool(pool_layout)
+
         alloc_lines: List[str] = []
 
-        if weights:
-            external = {t.onnx_name for t in self.large_weight_tensors}
+        if need_pool:
             alloc_lines.append(
-                "    /* Allocate DMA buffers for weights */"
+                "    /* One contiguous DMA allocation covers all weights and intermediate buffers.\n"
+                "     * Each sub-buffer is an aligned view; 64-byte gaps between slots ensure\n"
+                "     * cache-line alignment at every physical base address. */"
             )
+            alloc_lines.append(
+                f"    s_alloc_pool = inference_buf_alloc({total_pool_elems}u);"
+            )
+            alloc_lines.append(
+                "    if (!s_alloc_pool) { rc = -1; goto fail; }"
+            )
+            alloc_lines.append("")
+
+        if weights:
+            alloc_lines.append("    /* Weights */")
             for t in weights:
-                alloc_size = self._alloc_sizes[t.onnx_name]
+                off, alloc = pool_map[t.onnx_name]
                 alloc_lines.append(
-                    f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
+                    f"    inference_buf_init_view(&_s_buf_{t.c_name},"
+                    f" s_alloc_pool, {off}u, {alloc}u);"
                 )
                 alloc_lines.append(
-                    f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
+                    f"    {t.c_name} = &_s_buf_{t.c_name};"
                 )
                 if t.onnx_name in external:
-                    # Large weight: load data (t.numel elements) into the
-                    # buffer (alloc_size elements, may be larger due to padding)
                     alloc_lines.append(
                         f"    if (_load_weight({t.c_name},"
                         f" \"{t.c_name}\", {t.numel}u) != 0) {{ rc = -1; goto fail; }}"
@@ -524,42 +566,46 @@ class _SourceMixin:
                         f"    memcpy(inference_buf_ptr({t.c_name}),"
                         f" _rom_{t.c_name}, sizeof(_rom_{t.c_name}));"
                     )
-                # Sync once after loading — weight data never changes, so the
-                # AXI master can read it on every inference_run() without a
-                # repeated flush.
-                alloc_lines.append(
-                    f"    inference_buf_sync_to_device({t.c_name});"
-                )
+            alloc_lines.append("")
+            # Single sync for all weights
+            alloc_lines.append(
+                "    /* Flush all weights to device in one shot — intermediates get zeroed memory\n"
+                "     * (harmless; the hardware overwrites them before any CPU read). */"
+            )
+            alloc_lines.append("    inference_buf_sync_to_device(s_alloc_pool);")
             alloc_lines.append("")
 
         if intermediates:
-            reshape_aliases = self._reshape_aliases  # {out_name: src_c_name}
-            alloc_lines.append("    /* Allocate intermediate buffers */")
-            for t in intermediates:
-                if t.onnx_name in reshape_aliases:
-                    # Buffer alias — same physical memory as the source tensor.
+            # Emit reshape aliases last (they reference other intermediate/weight c_name pointers)
+            non_alias = [t for t in intermediates if t.onnx_name not in reshape_aliases]
+            alias_tensors = [t for t in intermediates if t.onnx_name in reshape_aliases]
+
+            if non_alias:
+                alloc_lines.append("    /* Intermediate buffers */")
+                for t in non_alias:
+                    off, alloc = pool_map[t.onnx_name]
+                    alloc_lines.append(
+                        f"    inference_buf_init_view(&_s_buf_{t.c_name},"
+                        f" s_alloc_pool, {off}u, {alloc}u);"
+                    )
+                    alloc_lines.append(
+                        f"    {t.c_name} = &_s_buf_{t.c_name};"
+                    )
+                alloc_lines.append("")
+
+            if alias_tensors:
+                alloc_lines.append("    /* Reshape aliases */")
+                for t in alias_tensors:
                     src_c = reshape_aliases[t.onnx_name]
                     alloc_lines.append(
-                        f"    {t.c_name} = {src_c};"
-                        f"  /* reshape alias */"
+                        f"    {t.c_name} = {src_c};  /* reshape alias */"
                     )
-                else:
-                    alloc_size = self._alloc_sizes[t.onnx_name]
-                    alloc_lines.append(
-                        f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
-                    )
-                    alloc_lines.append(
-                        f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
-                    )
-            alloc_lines.append("")
+                alloc_lines.append("")
 
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
-        # inference_deinit(): free owned buffers (safe on NULL), then close pool.
-        # Buffers must be freed before inference_buf_pool_deinit() because the
-        # Linux/XRT path needs the device handle open to call xclFreeBO().
-        # Reshape-alias buffers are NOT freed — they share memory with their source.
-        reshape_aliases = self._reshape_aliases
+        # inference_deinit(): null all weight and intermediate pointers,
+        # free the single pool, then close pool.
         deinit_free: List[str] = []
         for t in weights + intermediates:
             if t.onnx_name in reshape_aliases:
@@ -567,9 +613,11 @@ class _SourceMixin:
                     f"    {t.c_name} = NULL;  /* reshape alias — not owned */"
                 )
             else:
-                deinit_free.append(
-                    f"    inference_buf_free({t.c_name}); {t.c_name} = NULL;"
-                )
+                deinit_free.append(f"    {t.c_name} = NULL;")
+        if need_pool:
+            deinit_free.append(
+                "    inference_buf_free(s_alloc_pool); s_alloc_pool = NULL;"
+            )
         deinit_body = ("\n".join(deinit_free) + "\n") if deinit_free else ""
 
         load_helper = self._load_weight_helper() if self.large_weight_tensors else ""

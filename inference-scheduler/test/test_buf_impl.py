@@ -18,8 +18,14 @@ class TestBufImpl(unittest.TestCase):
         return cg.generate_buf_impl()
 
     def test_struct_definition(self):
-        b = self._buf("single_add.onnx")
-        self.assertIn("struct inference_buf", b)
+        """struct inference_buf is defined in inference.h (not inference_buf.c)
+        so that inference.c can declare static view instances."""
+        g  = OnnxGraph(_model("single_add.onnx"))
+        cg = CodeGenerator(g, model_path=_model("single_add.onnx"))
+        h = cg.generate_header()
+        b = cg.generate_buf_impl()
+        self.assertIn("struct inference_buf", h)
+        self.assertNotIn("struct inference_buf {", b)
 
     def test_linux_xrt_alloc(self):
         b = self._buf("single_add.onnx")

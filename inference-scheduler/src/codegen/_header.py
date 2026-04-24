@@ -142,12 +142,28 @@ class _HeaderMixin:
         # DMA buffer API
         lines.append(_banner("DMA-capable buffer API"))
         lines.append(
-            "/* Opaque DMA-capable buffer handle.\n"
-            " * Always allocate with inference_buf_alloc(); never create on the stack.\n"
+            "/* DMA-capable buffer handle.\n"
+            " * Allocate owners with inference_buf_alloc().\n"
+            " * Initialise static sub-buffer views with inference_buf_init_view().\n"
             " * Physical address (for kernel DMA registers) and virtual address (for\n"
-            " * CPU access) are managed internally. */"
+            " * CPU access) are exposed via inference_buf_phys() / inference_buf_ptr().\n"
+            " *\n"
+            " * The struct is defined here (not opaque) so that inference.c can\n"
+            " * declare static view instances without heap allocation. */"
         )
-        lines.append("typedef struct inference_buf inference_buf_t;")
+        lines.append(
+            "struct inference_buf {\n"
+            "    void     *virt;       /* CPU-accessible virtual address */\n"
+            "    uint64_t  phys;       /* physical DDR address for AXI DMA registers */\n"
+            "    unsigned  count;      /* number of Data_t elements allocated */\n"
+            "    uint8_t   is_owner;   /* 1 = owns the allocation; 0 = view (alias) */\n"
+            "#ifdef __linux__\n"
+            "    unsigned  bo;         /* XRT buffer object handle */\n"
+            "    uint64_t  bo_offset;  /* byte offset within the BO (0 for owners) */\n"
+            "#endif\n"
+            "};\n"
+            "typedef struct inference_buf inference_buf_t;"
+        )
         lines.append("")
         lines.append(
             "/* Allocate a buffer for n_elem Data_t elements from the DMA pool.\n"
@@ -176,6 +192,19 @@ class _HeaderMixin:
             "/* Number of Data_t elements that were allocated. */"
         )
         lines.append("unsigned inference_buf_count(const inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Initialise *view as a sub-buffer of *base starting at offset_elems\n"
+            " * elements.  The view shares the same physical memory as base; it does NOT\n"
+            " * own any allocation and must not be passed to inference_buf_free().\n"
+            " * The backing storage for *view must have static or longer lifetime. */"
+        )
+        lines.append(
+            "void inference_buf_init_view(inference_buf_t *view,\n"
+            "                             inference_buf_t *base,\n"
+            "                             unsigned offset_elems,\n"
+            "                             unsigned count_elems);"
+        )
         lines.append("")
         lines.append(
             "/* Sync buffer to device — flush CPU cache before the PL kernel reads.\n"
