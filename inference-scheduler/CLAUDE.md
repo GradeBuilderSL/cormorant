@@ -252,4 +252,4 @@ stub `README.md` files.
 | VectorOPKernel | `xvectoropkernel` | `xvectoropkernel.h`, `xvectoropkernel_hw.h`, `xvectoropkernel.c`, `xvectoropkernel_sinit.c`, `xvectoropkernel_linux.c` |
 | MatmulKernel | `xmatmulkernel` | `xmatmulkernel.h`, `xmatmulkernel_hw.h`, `xmatmulkernel.c`, … |
 | ConvKernel | `xconvkernel` | `xconvkernel.h`, `xconvkernel_hw.h`, `xconvkernel.c`, … |
-| PoolKernel | `xpoolkernel` | `xpoolkernel.h`, `xpoolkernel_hw.h`, `xpoolkernel.c`, … |
+| PoolKernel | `xpoolingkernel` | `xpoolingkernel.h`, `xpoolingkernel_hw.h`, `xpoolingkernel.c`, … |

@@ -1,223 +1,301 @@
-# vadd_hls — AXI-Stream Vector Operation IP Core
+# axi_demo — FPGA Neural-Network Inference Accelerator
 
-A Vitis HLS implementation of a configurable element-wise vector accelerator for Xilinx FPGAs. The kernel reads up to two input arrays, applies a runtime-selected operation, and writes the results to a third array.
+A set of Vitis HLS kernels for Xilinx FPGAs together with a Python
+code-generator that compiles ONNX models to self-contained C projects that
+drive the kernels on the KV260.
 
-## Features
+---
 
-- **Six runtime-selectable operations** — Add, Sub, Mul, Div, Relu, Relu6; chosen via AXI-Lite register
-- **Three AXI4 master ports** — two reads (`gmem0`/`gmem1`), one write (`gmem2`); independently banked
-- **Runtime vector length** — passed via AXI-Lite `size` register; no recompilation needed
-- **II=1 pipeline** — one element processed per clock cycle after burst ramp-up
-- **Saturating arithmetic** — results clipped to the representable range for `ap_fixed` types
-- **Configurable data type** — `float` (default), `double`, `half`, `uint8_t`, `ap_fixed<W,I>`
-- **IP catalog export** — produces a `ip_catalog.zip` ready to drop into a Vivado block design
-- **Inference scheduler** — Python tool that compiles ONNX models to C driver code targeting this IP
+## Hardware Kernels
 
-## Hardware Interface
+| Kernel | ONNX ops | AXI masters | Key feature |
+|--------|----------|-------------|-------------|
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | gmem0 (a, r), gmem1 (b, r), gmem2 (c, w) | II=1, runtime op selector |
+| **MatmulKernel** | `MatMul` | gmem0 (a, r), gmem1 (b, r), gmem2 (c, w) | Tiled GEMM, batched |
+| **ConvKernel** | `Conv` | gmem0 (x, r), gmem1 (w, r), gmem2 (bias, r), gmem3 (y, w) | NCHW, stride/dilation/padding/bias |
+| **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and Global variants | gmem0 (x, r), gmem1 (y, w) | NCHW, dilation, count_include_pad |
 
-```
-              ┌──────────────────────────────────────────┐
-              │  m_axi_gmem0  [AXI4, read]   ◄── a[]     │
-              │  m_axi_gmem1  [AXI4, read]   ◄── b[]     │
-              │  m_axi_gmem2  [AXI4, write]  ──► c[]     │
-              │                                          │
-              │  s_axi_ctrl   [AXI4-Lite]                │
-              │    a_addr  — base address of a[]         │
-              │    b_addr  — base address of b[]         │
-              │    c_addr  — base address of c[]         │
-              │    size    — number of elements          │
-              │    op      — operation selector (0–5)    │
-              │    ap_ctrl_hs — start / done / idle      │
-              └──────────────────────────────────────────┘
-```
+**Zero-cost transformations (no hardware call):**
+- `Reshape` — output pointer aliased to source buffer; no data copy.
+- `Gemm` — decomposed to `MatMul` + optional `Add` at model-load time.
 
-HLS infers AXI4 burst reads on `gmem0` and `gmem1` and a burst write on `gmem2`. Each bundle is an independent AXI4 master port, so all three can be connected to different memory banks or slaves. For unary operations (Relu, Relu6) no AXI transactions are issued on `gmem1`.
+All kernels use `ap_fixed<16,8>` as the default data type (configurable via
+CMake) and share the same `saturate_cast` / AP_TRN+AP_SAT saturation pattern.
 
-### Operation Codes
+---
 
-| `op` | Name | Expression | Arity |
-|------|------|------------|-------|
-| 0 | `OP_ADD` | `saturate_cast(a[i] + b[i])` | binary |
-| 1 | `OP_SUB` | `saturate_cast(a[i] - b[i])` | binary |
-| 2 | `OP_MUL` | `saturate_cast(a[i] * b[i])` | binary |
-| 3 | `OP_DIV` | `saturate_cast(a[i] / b[i])` | binary |
-| 4 | `OP_RELU` | `max(a[i], 0)` | unary |
-| 5 | `OP_RELU6` | `min(max(a[i], 0), 6)` | unary |
-
-## Project Structure
+## Repository Layout
 
 ```
 axi_demo/
-├── CMakeLists.txt              # Build system
-├── include/
-│   ├── Config.h.in             # CMake-generated configuration header
-│   └── VectorOP.h              # Op enum, saturate_cast, kernel declaration
-├── kernel/
-│   └── VectorOP.cpp            # HLS kernel source (6 operations)
-├── test/
-│   └── TestSimulation.cpp      # C simulation test (6 ops × sizes + saturation)
-├── platforms/
-│   └── kv260.json              # Xilinx KV260 Starter Kit
-├── scripts/
-│   └── Synthesis.tcl.in        # HLS synthesis + IP export TCL template
-├── doc/
-│   ├── SIMULATION_ISSUES.md    # PS VIP simulation quirks and workarounds
-│   └── INFERENCE_SCHEDULER.md  # Inference scheduler technical reference
-└── inference-scheduler/        # ONNX → XVectoropkernel code generator
-    ├── inference_scheduler.py  # CLI entry point
-    ├── requirements.txt
-    └── src/
-        ├── graph.py            # ONNX parsing and graph resolution
-        ├── nodes.py            # Op mapping and call emission
-        ├── tensor.py           # Weight encoding, buffer declarations
-        └── codegen.py          # C file assembly
+├── kernel/          VectorOPKernel — element-wise vector ops
+│   └── VectorOP.cpp
+├── matmul/          MatmulKernel — tiled matrix multiply
+│   └── kernel/MatmulKernel.cpp
+├── conv/            ConvKernel — 2-D NCHW convolution
+│   └── kernel/ConvKernel.cpp
+├── pool/            PoolingKernel — 2-D NCHW pooling
+│   └── kernel/PoolingKernel.cpp
+│
+├── include/         VectorOPKernel headers
+├── platforms/       Per-board JSON configs (kv260.json, …)
+├── scripts/         Synthesis.tcl.in — HLS + IP-export template
+├── doc/             Technical reference documents
+│
+└── inference-scheduler/   ONNX → C code-generator
+    ├── inference_scheduler.py
+    ├── src/
+    │   ├── graph.py        ONNX loading, shape inference, Gemm decomposition
+    │   ├── nodes.py        ScheduledNode / MatmulNode / ConvNode / PoolNode / ReshapeNode
+    │   ├── tensor.py       Weight encoding, buffer declarations
+    │   ├── kernels.py      KernelDesc registry (driver prefixes, file lists)
+    │   ├── dtype.py        DataType abstraction (ap_fixed<W,I>, float32)
+    │   ├── layout.py       TensorLayout (alloc sizes, broadcast strides)
+    │   └── codegen/        Multi-mixin code generator
+    │       ├── _core.py    Pool layout, tensor sizing
+    │       ├── _header.py  include/inference.h
+    │       ├── _source.py  src/inference.c
+    │       ├── _buf_impl.py src/inference_buf.c (XRT / bare-metal DMA)
+    │       ├── _test.py    test/test_inference.c
+    │       ├── _cmake.py   CMakeLists.txt
+    │       └── _simulate.py Fixed-point forward simulation
+    └── run_remote_tests.py  SSH-based hardware test runner
 ```
+
+---
 
 ## Prerequisites
 
-- **Xilinx Vitis 2024.x or 2025.x** — for HLS synthesis and IP export
-- **[hlslib](https://github.com/definelicht/hlslib)** — provides `FindVitis.cmake` and HLS simulation support. By default the build reads it from the sibling `gemm_hls` project; override with `-DVA_HLSLIB_DIR=…`
+- **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2` — HLS synthesis and IP export.
+  Source `settings64.sh` before building.
+- **[hlslib](https://github.com/definelicht/hlslib)** — provides `FindVitis.cmake`
+  and HLS simulation support.  Reads from sibling `gemm_hls/` by default;
+  override with `-DVA_HLSLIB_DIR=…`.
 - **CMake ≥ 3.19**
+- **Python ≥ 3.10** (inference-scheduler only)
 
-## Quick Start
+---
+
+## Building a Kernel
+
+Each kernel is a self-contained CMake project. The workflow is identical for
+all four:
 
 ```bash
-# 1. Source Vitis environment
-source /mnt/data/xilinx/2025.2/Vitis/settings64.sh
+# VectorOPKernel example — same steps apply to matmul/, conv/, pool/
+cd axi_demo          # (or cd matmul / conv / pool)
 
-# 2. Configure
 mkdir build && cd build
 cmake ../
 
-# 3. Run the C simulation test (no hardware needed)
+# C simulation test (no hardware needed)
 make TestSimulation
 ./TestSimulation
-```
 
-Expected output:
-```
-[1/8] size=1 ... PASS
-[2/8] size=8 ... PASS
-...
-[8/8] size=4096 ... PASS
-
-All 8 tests passed.
-```
-
-## Generating the Vivado IP
-
-```bash
-# Inside the build directory:
+# HLS synthesis + Vivado IP export
 make synthesize_kv260
+# → build/kv260/ip_catalog.zip
 ```
 
-This runs Vitis HLS synthesis for the `xck26-sfvc784-2LV-c` part at 300 MHz and exports a Vivado IP catalog archive:
-
-```
-build/kv260/ip_catalog.zip
-```
-
-To add the IP to a Vivado project:
-
-1. **IP Catalog → Add Repository** — point Vivado at the extracted `ip_catalog/` directory (or use the zip directly via **IP Catalog → Add Zip**)
-2. Instantiate **VectorOPKernel** in a block design
-3. Connect `m_axi_gmem0`, `m_axi_gmem1`, `m_axi_gmem2` to AXI4 memory interconnect (each can target a different bank)
-4. Connect `s_axi_ctrl` to an AXI-Lite master (e.g. Zynq PS M\_AXI\_HPM or MicroBlaze)
-
-## CMake Parameters
+### Key CMake parameters (VectorOPKernel)
 
 | Parameter | Default | Description |
 |---|---|---|
-| `VA_DATA_TYPE` | `float` | Element type: `float`, `double`, `half`, `uint8_t`, `ap_fixed<W,I>` |
+| `VA_DATA_TYPE` | `ap_fixed<16,8>` | Element type |
 | `VA_HLSLIB_DIR` | `../gemm_hls/hlslib` | Path to hlslib |
-| `VA_PLATFORM` | `xilinx_u250_…` | Vitis platform for the xclbin flow |
-| `VA_TARGET_CLOCK` | *(empty)* | Target clock in MHz; empty = platform default |
+| `VA_TARGET_CLOCK` | *(empty)* | Target MHz; empty = platform default (300 MHz) |
 
-### Changing the data type
+### Adding a new platform
 
-```bash
-cmake ../ -DVA_DATA_TYPE=double
-cmake ../ -DVA_DATA_TYPE="ap_fixed<16,8>"
-```
-
-The stream TDATA width adjusts automatically (64 bits for `double`, 16 bits for `ap_fixed<16,8>`).
-
-## Adding a New Platform
-
-Create `platforms/<name>.json`:
+Create `platforms/<name>.json` (required: `part`; optional: `board`, `clock`):
 
 ```json
-{
-  "description": "My board",
-  "part": "xczu9eg-ffvb1156-2-e",
-  "board": "xilinx.com:zcu102:part0:3.4",
-  "clock": 250
-}
+{ "part": "xczu9eg-ffvb1156-2-e", "board": "xilinx.com:zcu102:part0:3.4", "clock": 250 }
 ```
 
-Re-run cmake, then:
+Re-run cmake, then `make synthesize_<name>`.
 
-```bash
-make synthesize_<name>
+---
+
+## Kernel Interfaces
+
+### VectorOPKernel
+
+```
+gmem0 (a, read), gmem1 (b, read), gmem2 (c, write)
+s_axi_ctrl: a_addr, b_addr, c_addr, size, op, ap_ctrl_hs
 ```
 
-`board` and `clock` are optional (clock defaults to 300 MHz).
+| `op` | Name | Expression |
+|------|------|------------|
+| 0 | ADD  | `saturate_cast(a[i] + b[i])` |
+| 1 | SUB  | `saturate_cast(a[i] - b[i])` |
+| 2 | MUL  | `saturate_cast(a[i] * b[i])` |
+| 3 | DIV  | `saturate_cast(a[i] / b[i])` |
+| 4 | RELU | `max(a[i], 0)` |
+| 5 | RELU6 | `min(max(a[i], 0), 6)` |
+
+### MatmulKernel
+
+```
+gmem0 (a, read), gmem1 (b, read), gmem2 (c, write)
+s_axi_ctrl: a/b/c addresses, n, k, m, batch, a/b/c_batch_stride
+```
+
+Computes `c[batch][n][m] = a[batch][n][k] × b[batch][k][m]` with tiling.
+Batch strides enable strided-view broadcasting without data copies.
+
+### ConvKernel
+
+```
+gmem0 (x, read), gmem1 (weight, read), gmem2 (bias, read), gmem3 (y, write)
+s_axi_ctrl: all addresses + batch, in_ch, in_h/w, out_ch, out_h/w,
+            kh, kw, stride_h/w, dilation_h/w, pad_top, pad_left, has_bias
+```
+
+NCHW 2-D convolution. `groups=1` only. Bias is optional (`has_bias=0` skips
+gmem2 reads).
+
+### PoolingKernel
+
+```
+gmem0 (x, read), gmem1 (y, write)
+s_axi_ctrl: all addresses + batch, channels, in_h/w, out_h/w, pool_h/w,
+            stride_h/w, pad_top, pad_left, dil_h/w,
+            pool_type, lp_order, count_include_pad
+```
+
+| `pool_type` | Operation |
+|-------------|-----------|
+| 0 | MaxPool |
+| 1 | AveragePool |
+| 2 | LpPool (p = `lp_order`) |
+
+Global variants (GlobalMaxPool, GlobalAveragePool, GlobalLpPool) are handled
+by the scheduler setting `pool_h=in_h`, `pool_w=in_w`, `stride=1`, `pad=0`.
+
+---
 
 ## Inference Scheduler
 
-`inference-scheduler/` is a Python tool that takes an ONNX model and generates a C source file implementing the full inference loop on the KV260, using only `VectorOPKernel` invocations.
+`inference-scheduler/` reads an ONNX model and emits a complete C project:
 
-### Supported ONNX operators
-
-`Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(min=0, max=6)` — all element-wise ops that map directly to the six kernel operation codes. Unsupported ops cause the tool to exit with an error.
+```
+<out_dir>/
+├── CMakeLists.txt         INFERENCE_TARGET=BARE_METAL|LINUX
+├── include/inference.h    Public API: Data_t, size macros, struct inference_buf,
+│                          init / run / deinit declarations
+├── src/
+│   ├── inference.c        Weight ROMs, run_op/run_matmul/run_conv/run_pool helpers,
+│   │                      single-pool init, inference_run
+│   └── inference_buf.c    DMA buffer alloc/sync (Linux XRT or bare-metal Xil)
+├── test/test_inference.c  On-device smoke test: ramp fill → run → compare GT
+├── scripts/check_inference_setup.sh
+└── driver/                Kernel driver sources (copied from HLS output)
+```
 
 ### Quick start
 
 ```bash
 cd inference-scheduler
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Create environment and install dependencies
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# Generate test ONNX models (written to test/models/)
+# Generate all test ONNX models (required before running tests)
 .venv/bin/python test/gen_test_models.py
+.venv/bin/python test/gen_matmul_models.py
+.venv/bin/python test/gen_mixed_kernel_models.py
+.venv/bin/python test/gen_conv_models.py
+.venv/bin/python test/gen_pool_models.py
+.venv/bin/python test/gen_reshape_gemm_models.py
+.venv/bin/python test/gen_mixed_all_kernels_models.py
 
-# Compile an ONNX model to a C driver file
-.venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx -o inference.c
+# Generate a C project from an ONNX model
+.venv/bin/python inference_scheduler.py path/to/model.onnx --out-dir /tmp/out \
+    --driver-dir conv/build/kv260/conv_kv260/solution1/impl/misc/drivers/ConvKernel_v1_0/src
 
-# Run the test suite (28 tests)
-.venv/bin/python -m pytest test/test_scheduler.py -v
+# Run the full test suite (930 tests)
+.venv/bin/python -m pytest test/ -v
 ```
 
-### Generated file structure
+### Generated C API
 
-The emitted C file (`inference.c`) contains:
+```c
+// include/inference.h
+typedef uint16_t Data_t;              // ap_fixed<16,8>
+#define INFERENCE_BYTES_PER_ELEM  2u
+#define INFERENCE_ALIGN_BYTES    16u
+#define INFERENCE_BUF_POOL_SIZE_BYTES  N
 
-| Section | Description |
-|---------|-------------|
-| Includes | `xvectoropkernel.h`, `xil_cache.h`, `xil_types.h` |
-| `typedef uint16_t Data_t` | ap_fixed<16,8> element type |
-| `VECTOROP_*` defines | Op code constants matching `VectorOP.h` |
-| Weight arrays | `static const uint16_t name[N]` — float weights encoded as ap_fixed<16,8> |
-| Intermediate buffers | `static Data_t name[N]` — one buffer per intermediate tensor |
-| `run_op()` | Configures registers, flushes/invalidates cache, starts kernel, polls done |
-| `inference_init()` | Calls `XVectoropkernel_Initialize()` |
-| `inference_run()` | Sequential `run_op()` calls, one per ONNX node |
+struct inference_buf { … };          // defined here so inference.c can declare
+typedef struct inference_buf inference_buf_t;  // static view instances
 
-See `doc/INFERENCE_SCHEDULER.md` for the full technical reference.
+// One init parameter per active kernel (only present kernels appear):
+int  inference_init(const char *vectoropkernel_instance
+                    [, const char *matmulkernel_instance]
+                    [, const char *convkernel_instance]
+                    [, const char *poolkernel_instance]);
 
-## Synthesis Results (KV260, float)
+// All graph inputs then all graph outputs:
+void inference_run(inference_buf_t *<input…>, inference_buf_t *<output…>);
+void inference_deinit(void);
 
-| Metric | Value |
-|---|---|
-| Target device | xck26-sfvc784-2LV-c |
-| Clock target | 300 MHz |
-| Estimated Fmax | 409 MHz |
-| Loop II | 1 (achieved) |
-| BRAM | 0 |
-| DSP | 3 (floating-point adder) |
+// inference_buf.c
+inference_buf_t *inference_buf_alloc(unsigned n_elem);
+void             inference_buf_free(inference_buf_t *buf);
+Data_t          *inference_buf_ptr(inference_buf_t *buf);
+uint64_t         inference_buf_phys(const inference_buf_t *buf);
+void             inference_buf_sync_to_device(inference_buf_t *buf);
+void             inference_buf_sync_from_device(inference_buf_t *buf);
+```
+
+### DMA buffer model
+
+`inference_init()` makes **one** `inference_buf_alloc()` call that covers all
+weights and intermediate buffers.  Each tensor gets a `inference_buf_init_view()`
+slice at a 64-byte-aligned offset.  Weights are `memcpy`'d from ROM arrays and
+flushed to DDR in one shot.  `inference_run()` flushes graph inputs at the top
+and invalidates graph outputs at the bottom; intermediate buffers are never
+synced (the PL kernels access DDR directly via their AXI master ports).
+
+### Hardware test runner
+
+```bash
+# Copy and edit the appropriate template config
+cp remote_config_pool.json remote_config.json   # or _conv / _matmul / _vectorop
+
+# Run all models against the KV260 over SSH
+.venv/bin/python run_remote_tests.py remote_config.json
+```
+
+The runner generates each project locally, uploads it, builds on the board
+with `cmake + make`, executes `test_inference`, and reports PASS/FAIL per model.
+Driver directory paths in `local.driver_dirs` are validated before upload —
+a missing path fails fast with a clear error rather than a cryptic CMake error
+on the board.
+
+---
+
+## Data Type
+
+Default: `ap_fixed<16,8>` — 16-bit two's complement, 8 integer bits, 8
+fractional bits.  Encoding: `1.0 = 0x0100`, `0.5 = 0x0080`, range `[−128, 127.996]`.
+
+The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
+`float32` and other types to be used without changing any other source file.
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| `doc/INFERENCE_SCHEDULER.md` | Full inference scheduler technical reference |
+| `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
+| `inference-scheduler/CLAUDE.md` | Developer quick-reference (kernels, node classes, test matrix) |
+| `doc/SIMULATION_ISSUES.md` | PS VIP simulation quirks and workarounds |
+
+---
 
 ## License
 
-This project is released under the BSD 3-Clause License.
+BSD 3-Clause License.

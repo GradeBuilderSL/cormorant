@@ -1,0 +1,53 @@
+#pragma once
+
+#include <cstdint>
+@POOL_DATA_TYPE_INCLUDE@
+@POOL_HAVE_APFIXED_DEFINE@
+
+// ---------------------------------------------------------------------------
+// Element and accumulator types — configured by CMake.
+//
+// Default (Vitis HLS available):
+//   Data_t    = ap_fixed<16,8>   range [-128, 127.996], 1/256 LSB
+//   AccData_t = ap_fixed<32,16>  range [-32768, 32767.999]
+//
+// Fallback (no Vitis HLS):
+//   Data_t    = float
+//   AccData_t = float
+// ---------------------------------------------------------------------------
+using Data_t    = @POOL_DATA_TYPE@;
+using AccData_t = @POOL_ACC_DATA_TYPE@;
+
+// ---------------------------------------------------------------------------
+// Tile-size and window-limit constants — compile-time parameters for HLS.
+//
+// kTileC     Channel tile.  Must be a power of two so that
+//            ri & (kTileC-1) compiles to a bitwise AND for the II=1 lane
+//            rotation, and so that the dependency distance for acc[c1] equals
+//            kTileC >= operation latency (compare ~1 cycle, add ~2 cycles).
+//
+// kMaxPoolH  Compile-time upper bound on pool window height.
+// kMaxPoolW  Compile-time upper bound on pool window width.
+//            These bound the on-chip win_buf dimensions.
+//            Models with pool_h > kMaxPoolH or pool_w > kMaxPoolW are
+//            rejected by the inference scheduler at validation time.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kTileC    = @POOL_TILE_C@;
+static constexpr unsigned kMaxPoolH = @POOL_MAX_KH@;
+static constexpr unsigned kMaxPoolW = @POOL_MAX_KW@;
+
+// Pool type codes (match pool_type AXI-Lite register value).
+static constexpr unsigned kPoolMax = 0u;
+static constexpr unsigned kPoolAvg = 1u;
+static constexpr unsigned kPoolLp  = 2u;
+
+// Sentinel values for MAX pool initialisation.
+// kDataMin must equal the minimum representable Data_t value so that any
+// valid input beats the sentinel in the first comparison.
+// kAccMin is the same bound widened to the accumulator range.
+//   ap_fixed<16,8>:  minimum = -128;   ap_fixed<32,16>: minimum = -32768
+//   float fallback:  use -1e30 (no representable-range constraint)
+static constexpr float kDataMin = @POOL_DATA_MIN@;
+static constexpr float kAccMin  = @POOL_ACC_MIN@;
+
+static constexpr unsigned kSeed = 42;
