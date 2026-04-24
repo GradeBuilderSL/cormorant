@@ -169,6 +169,54 @@ def gen_conv_then_relu() -> None:
 
 
 # ---------------------------------------------------------------------------
+# conv_mnist_first_layer: Conv(+bias) → Relu  (MNIST-sized input)
+# X[1,1,28,28] * W[8,1,5,5] + B[8] → Z[1,8,24,24] → Relu → Y[1,8,24,24]
+# Classic first conv layer: 5×5 kernel, no padding, stride 1.
+# ---------------------------------------------------------------------------
+def gen_conv_mnist_first_layer() -> None:
+    w_data = (np.random.randn(8, 1, 5, 5) * 0.1).astype(np.float32)
+    b_data = np.zeros(8, dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    b_init = numpy_helper.from_array(b_data, name="B")
+
+    conv = helper.make_node("Conv",  inputs=["X", "W", "B"], outputs=["Z"], kernel_shape=[5, 5])
+    relu = helper.make_node("Relu",  inputs=["Z"],           outputs=["Y"])
+
+    graph = helper.make_graph(
+        [conv, relu], "conv_mnist_first_layer",
+        inputs=[_vi("X", [1, 1, 28, 28])],
+        outputs=[_vi("Y", [1, 8, 24, 24])],
+        initializer=[w_init, b_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_mnist_first_layer.onnx")
+
+
+# ---------------------------------------------------------------------------
+# conv_mnist_second_layer: Conv(+bias) → Relu  (MNIST-sized second conv layer)
+# X[1,8,14,14] * W[16,8,5,5] + B[16] → Z[1,16,10,10] → Relu → Y[1,16,10,10]
+# Follows conv_mnist_first_layer (after 2×2 max-pool on its output).
+# ---------------------------------------------------------------------------
+def gen_conv_mnist_second_layer() -> None:
+    w_data = (np.random.randn(16, 8, 5, 5) * 0.1).astype(np.float32)
+    b_data = np.zeros(16, dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    b_init = numpy_helper.from_array(b_data, name="B")
+
+    conv = helper.make_node("Conv",  inputs=["X", "W", "B"], outputs=["Z"], kernel_shape=[5, 5])
+    relu = helper.make_node("Relu",  inputs=["Z"],           outputs=["Y"])
+
+    graph = helper.make_graph(
+        [conv, relu], "conv_mnist_second_layer",
+        inputs=[_vi("X", [1, 8, 14, 14])],
+        outputs=[_vi("Y", [1, 16, 10, 10])],
+        initializer=[w_init, b_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_mnist_second_layer.onnx")
+
+
+# ---------------------------------------------------------------------------
 # conv_then_add_flat: Conv → Add with same-shape weight (non-broadcast)
 # Z[1,8,8,8] + scale[1,8,8,8] → Y  (no broadcasting, flat layout)
 # ---------------------------------------------------------------------------
@@ -360,6 +408,8 @@ if __name__ == "__main__":
     gen_conv_stride2()
     gen_conv_padded()
     gen_conv_batch2()
+    gen_conv_mnist_first_layer()
+    gen_conv_mnist_second_layer()
     gen_conv_then_relu()
     gen_conv_then_add_flat()
     gen_conv_relu_chain()
