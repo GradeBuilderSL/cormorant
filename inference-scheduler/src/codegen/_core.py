@@ -42,7 +42,7 @@ import os
 from typing import List, Optional
 
 from ..graph   import OnnxGraph
-from ..nodes   import ScheduledNode, MatmulNode, ConvNode, SchedulerError
+from ..nodes   import ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SchedulerError
 from ..kernels import KernelDesc, KERNEL_REGISTRY
 from ..tensor  import TensorInfo, LARGE_WEIGHT_THRESHOLD
 from ..dtype   import DataType, AP_FIXED_16_8
@@ -113,7 +113,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -169,7 +169,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -216,28 +216,35 @@ class _CoreMixin:
                         n_chunks=1, chunk=cur.numel, stride=out_lay.alloc
                     )
 
-        # Post-computation validation: ConvKernel writes NCHW-flat output.
-        # If a ConvNode output ended up with n_chunks > 1 it means a broadcast
-        # VectorOP downstream tried to assign an advancing layout — but ConvKernel
-        # only populated the first numel elements, so the gaps would be uninitialized.
-        # Detect this and raise a clear error rather than silently generating
-        # wrong code.  The correct fix is to use the Conv bias input for per-channel
-        # addition instead of a separate broadcast Add node after Conv.
+        # Post-computation validation: ConvKernel / PoolingKernel write flat NCHW
+        # output.  If the output ended up with n_chunks > 1 a broadcast VectorOP
+        # downstream tried to assign an advancing layout — the kernel only populates
+        # the first numel elements, so the gaps would be uninitialised.
         for sn in self._graph.nodes:
-            if not isinstance(sn, ConvNode):
-                continue
-            lay = layouts.get(sn.output.onnx_name)
-            if lay is not None and lay.n_chunks > 1:
-                raise SchedulerError(
-                    f"Conv node [{sn.index}] output '{sn.output.onnx_name}' "
-                    f"(shape={sn.output.shape}) feeds a broadcast VectorOP node, "
-                    f"which requires an advancing-strided buffer layout "
-                    f"(n_chunks={lay.n_chunks}). "
-                    f"ConvKernel writes a flat NCHW output, so adding a "
-                    f"per-channel bias via a separate broadcast Add after Conv "
-                    f"is not supported. Use the Conv operator's built-in bias "
-                    f"input (3rd Conv input) instead."
-                )
+            if isinstance(sn, ConvNode):
+                lay = layouts.get(sn.output.onnx_name)
+                if lay is not None and lay.n_chunks > 1:
+                    raise SchedulerError(
+                        f"Conv node [{sn.index}] output '{sn.output.onnx_name}' "
+                        f"(shape={sn.output.shape}) feeds a broadcast VectorOP node, "
+                        f"which requires an advancing-strided buffer layout "
+                        f"(n_chunks={lay.n_chunks}). "
+                        f"ConvKernel writes a flat NCHW output, so adding a "
+                        f"per-channel bias via a separate broadcast Add after Conv "
+                        f"is not supported. Use the Conv operator's built-in bias "
+                        f"input (3rd Conv input) instead."
+                    )
+            elif isinstance(sn, PoolNode):
+                lay = layouts.get(sn.output.onnx_name)
+                if lay is not None and lay.n_chunks > 1:
+                    raise SchedulerError(
+                        f"Pool node [{sn.index}] output '{sn.output.onnx_name}' "
+                        f"(shape={sn.output.shape}) feeds a broadcast VectorOP node, "
+                        f"which requires an advancing-strided buffer layout "
+                        f"(n_chunks={lay.n_chunks}). "
+                        f"PoolingKernel writes a flat NCHW output; insert a "
+                        f"non-broadcast node between the pool and the broadcast op."
+                    )
 
         return layouts
 
@@ -309,6 +316,24 @@ class _CoreMixin:
         return any(isinstance(sn, ConvNode) for sn in self._graph.nodes)
 
     @property
+    def _has_pool_nodes(self) -> bool:
+        """True when the graph contains at least one PoolNode."""
+        return any(isinstance(sn, PoolNode) for sn in self._graph.nodes)
+
+    @property
+    def _reshape_aliases(self) -> dict:
+        """Return {output_onnx_name: source_c_name} for all ReshapeNode outputs.
+
+        The reshape output shares the same DMA buffer as its source — no
+        allocation or free is needed; inference_init() just assigns the pointer.
+        """
+        result: dict = {}
+        for sn in self._graph.nodes:
+            if isinstance(sn, ReshapeNode):
+                result[sn.output.onnx_name] = sn.inputs[0].c_name
+        return result
+
+    @property
     def _has_vectorop_nodes(self) -> bool:
         """True when the graph contains at least one VectorOP ScheduledNode."""
         return any(isinstance(sn, ScheduledNode) for sn in self._graph.nodes)
@@ -353,7 +378,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
                 continue
             c_up = sn.output.c_name.upper()
             canonical[sn.output.onnx_name] = c_up
@@ -362,11 +387,11 @@ class _CoreMixin:
             if sn.arity == 2 and sn.b_advances:
                 canonical[sn.inputs[1].onnx_name] = c_up
 
-        # Pass 2 — propagate through non-broadcast non-MatmulNode/ConvNode chains.
+        # Pass 2 — propagate through non-broadcast non-special-node chains.
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
                 continue
             if sn.output.onnx_name in canonical:
                 continue

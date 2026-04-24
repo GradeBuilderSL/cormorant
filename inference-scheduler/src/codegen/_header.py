@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..nodes  import _ALIGN_BYTES, MatmulNode
+from ..nodes  import _ALIGN_BYTES, MatmulNode, ReshapeNode
 from ._banners import _banner
 
 
@@ -67,7 +67,7 @@ class _HeaderMixin:
         bcast_map       = self._broadcast_io_map()   # onnx_name → (n, chunk_macro, stride_macro)
         broadcast_nodes = [
             sn for sn in graph.nodes
-            if sn.outer_count > 1 and not isinstance(sn, MatmulNode)
+            if sn.outer_count > 1 and not isinstance(sn, (MatmulNode, ReshapeNode))
         ]
 
         # ---- Array-size macros ----

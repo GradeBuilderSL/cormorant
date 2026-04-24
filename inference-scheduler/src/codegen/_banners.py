@@ -5,7 +5,7 @@ import os
 import datetime
 
 from ..graph import OnnxGraph
-from ..nodes import OP_NAMES, MatmulNode, ConvNode
+from ..nodes import OP_NAMES, MatmulNode, ConvNode, PoolNode, ReshapeNode
 
 
 def _banner(title: str) -> str:
@@ -20,18 +20,22 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
 
     # Collect op names per node type
     ops_used = sorted({
-        "MatMul" if isinstance(sn, MatmulNode)
-        else "Conv"  if isinstance(sn, ConvNode)
+        "MatMul"   if isinstance(sn, MatmulNode)
+        else "Conv"    if isinstance(sn, ConvNode)
+        else "Reshape" if isinstance(sn, ReshapeNode)
+        else sn.onnx_node.op_type if isinstance(sn, PoolNode)
         else OP_NAMES[sn.op_code]
         for sn in graph.nodes
     })
     ops_str = ", ".join(ops_used) if ops_used else "(none)"
 
     # Identify which kernel(s) are used
-    has_matmul   = any(isinstance(sn, MatmulNode) for sn in graph.nodes)
-    has_conv     = any(isinstance(sn, ConvNode)   for sn in graph.nodes)
+    has_matmul   = any(isinstance(sn, MatmulNode)  for sn in graph.nodes)
+    has_conv     = any(isinstance(sn, ConvNode)    for sn in graph.nodes)
+    has_pool     = any(isinstance(sn, PoolNode)    for sn in graph.nodes)
     has_vectorop = any(
-        not isinstance(sn, (MatmulNode, ConvNode)) for sn in graph.nodes
+        not isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode))
+        for sn in graph.nodes
     )
     kernel_parts = []
     if has_vectorop:
@@ -40,6 +44,8 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
         kernel_parts.append("MatmulKernel (matrix multiply, tiled)")
     if has_conv:
         kernel_parts.append("ConvKernel (2-D convolution, NCHW)")
+    if has_pool:
+        kernel_parts.append("PoolingKernel (2-D pooling, NCHW)")
     kernel_line = " + ".join(kernel_parts) if kernel_parts else "unknown"
 
     lines = [

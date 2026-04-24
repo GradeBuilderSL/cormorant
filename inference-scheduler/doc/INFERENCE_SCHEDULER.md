@@ -70,9 +70,13 @@ to program the AXI-Lite control registers and poll for completion.
 
 ## 2. Supported ONNX Operators
 
-| ONNX op | Hardware op code | Arity | Notes |
-|---------|-----------------|-------|-------|
-| `MatMul` | MatmulKernel | binary | `C[n,m] = A[n,k] @ B[k,m]`; supports batched matmul and broadcast weight |
+The scheduler maps ONNX operators to one of four hardware kernels, or handles
+them as zero-cost CPU-side transformations:
+
+### VectorOPKernel (element-wise, 1-D)
+
+| ONNX op | Op code | Arity | Expression |
+|---------|---------|-------|------------|
 | `Add` | `VECTOROP_ADD` (0) | binary | `c[i] = saturate(a[i] + b[i])` |
 | `Sub` | `VECTOROP_SUB` (1) | binary | `c[i] = saturate(a[i] - b[i])` |
 | `Mul` | `VECTOROP_MUL` (2) | binary | `c[i] = saturate(a[i] * b[i])` |
@@ -80,13 +84,47 @@ to program the AXI-Lite control registers and poll for completion.
 | `Relu` | `VECTOROP_RELU` (4) | unary | `c[i] = max(a[i], 0)` |
 | `Clip(min=0, max=6)` | `VECTOROP_RELU6` (5) | unary | `c[i] = min(max(a[i], 0), 6)` |
 
-`MatMul` is dispatched to a separate hardware kernel (`MatmulKernel`) via the `XMatmulkernel` driver. All other ops use `VectorOPKernel`.
-
-Any other ONNX op causes the scheduler to exit with a `SchedulerError`.
-
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
 [Architecture: Broadcasting Algorithm](ARCHITECTURE.md#broadcasting-algorithm).
+
+### MatmulKernel (matrix multiply, tiled)
+
+| ONNX op | Notes |
+|---------|-------|
+| `MatMul` | `C[n,m] = A[n,k] @ B[k,m]`; supports batched matmul and broadcast weight |
+
+### ConvKernel (2-D convolution, NCHW)
+
+| ONNX op | Notes |
+|---------|-------|
+| `Conv` | NCHW layout; `groups=1`; configurable kernel, stride, pad, dilation |
+
+Bias (`Conv` with three inputs) is supported: the bias add is fused into the
+`run_conv()` dispatch call alongside the convolution.
+
+### PoolingKernel (2-D pooling, NCHW)
+
+| ONNX op | Pool type | Notes |
+|---------|-----------|-------|
+| `MaxPool` | `POOL_MAX` (0) | Sliding-window maximum |
+| `AveragePool` | `POOL_AVG` (1) | Sliding-window average; `count_include_pad` supported |
+| `LpPool` (p=1 or 2) | `POOL_LP` (2) | Lp-norm pooling |
+| `GlobalMaxPool` | `POOL_MAX` (0) | Equivalent to `MaxPool` with `kernel = input spatial dims` |
+| `GlobalAveragePool` | `POOL_AVG` (1) | Equivalent to `AveragePool` with `kernel = input spatial dims` |
+| `GlobalLpPool` (p=1 or 2) | `POOL_LP` (2) | Equivalent to `LpPool` with `kernel = input spatial dims` |
+
+All pool variants support configurable stride, padding, and dilation.
+`ceil_mode=1` is not supported.
+
+### Zero-Cost Transformations (CPU-side only)
+
+| ONNX op | Handling | Notes |
+|---------|----------|-------|
+| `Reshape` | Buffer alias | Output pointer is assigned `= source pointer`; no hardware call, no data copy |
+| `Gemm` | Decomposed at load time | `Gemm(A, B, C)` → `MatMul(A, B) → tmp` + `Add(tmp, C) → Y`; `Gemm(A, B)` → `MatMul(A, B) → Y`. Requires `alpha=1, beta=1, transA=0, transB=0`. |
+
+Any other ONNX op causes the scheduler to exit with a `SchedulerError`.
 
 **Data types**: The ONNX model's weights and activations may be any numeric type
 (float32, int8, etc.); the scheduler quantizes all values to the target element
@@ -103,12 +141,14 @@ cd inference-scheduler
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Generate the test ONNX models (needed for the test suite only)
-# VectorOPKernel models
-.venv/bin/python test/gen_test_models.py
-
-# Mixed-kernel models (MatMul + VectorOP)
-.venv/bin/python test/gen_mixed_kernel_models.py
+# Generate all test ONNX models (needed before running the test suite)
+.venv/bin/python test/gen_test_models.py              # VectorOPKernel models
+.venv/bin/python test/gen_mixed_kernel_models.py      # MatMul + VectorOP
+.venv/bin/python test/gen_matmul_models.py            # MatMul-only models
+.venv/bin/python test/gen_conv_models.py              # Conv models
+.venv/bin/python test/gen_pool_models.py              # Pooling models
+.venv/bin/python test/gen_reshape_gemm_models.py      # Reshape + Gemm models
+.venv/bin/python test/gen_mixed_all_kernels_models.py # All-kernel combination models
 ```
 
 Dependencies (from `requirements.txt`): `onnx`, `numpy`.
@@ -212,12 +252,12 @@ Generated project:
 │         libxrt_core.so, and /dev/dri/renderD* are accessible before a build.
 │
 ├── driver/
-│   │   XVectoropkernel driver sources (copied from --driver-dir, or stub README).
-│   ├── xvectoropkernel.h
-│   ├── xvectoropkernel_hw.h
-│   ├── xvectoropkernel.c
-│   ├── xvectoropkernel_sinit.c   (bare-metal target)
-│   └── xvectoropkernel_linux.c   (Linux target)
+│   │   Hardware kernel driver sources.  One sub-directory per active kernel
+│   │   (copied from --driver-dir, or stub README when omitted).
+│   ├── vectorop/        XVectoropkernel driver (xvectoropkernel.h / .c)
+│   ├── matmul/          XMatmulkernel driver   (xmatmulkernel.h / .c)
+│   ├── conv/            XConvkernel driver     (xconvkernel.h / .c)
+│   └── pool/            XPoolkernel driver     (xpoolkernel.h / .c)
 │
 ├── weights/                      (only when model has large weight tensors)
 │   └── <name>.dat                Raw little-endian binary weight data; loaded
@@ -296,7 +336,8 @@ void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n
  * internal weights and intermediate tensors, load weight data, and flush to DDR.
  *
  * One const char * parameter per hardware kernel active in the model, in
- * registry order (VectorOPKernel before MatmulKernel).
+ * registry order: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel.
+ * Only kernels actually used by the model appear in the signature.
  *
  * Each instance name:
  *   Linux:      UIO sysfs name, e.g. "VectorOPKernel_0"
@@ -306,12 +347,18 @@ void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n
  * On failure, inference_deinit() is called internally — do not call it again.
  */
 
-/* Single-kernel model (VectorOPKernel only): */
+/* VectorOP only (element-wise models): */
 int inference_init(const char *vectoropkernel_instance);
 
-/* Multi-kernel model (VectorOPKernel + MatmulKernel): */
+/* VectorOP + MatmulKernel (FC / dense layers with activations): */
 int inference_init(const char *vectoropkernel_instance,
                    const char *matmulkernel_instance);
+
+/* Full CNN — all four kernels (actual signature is model-specific): */
+int inference_init(const char *vectoropkernel_instance,
+                   const char *matmulkernel_instance,
+                   const char *convkernel_instance,
+                   const char *poolkernel_instance);
 
 /*
  * inference_run() — execute the full inference graph.
@@ -563,7 +610,8 @@ cd inference-scheduler
 .venv/bin/python -m pytest test/ -k "broadcast" -v
 ```
 
-Most test classes require the test models: run `test/gen_test_models.py` first.
+Most test classes require the test models. Run all model generators before running
+the test suite (see [Installation and Setup](#3-installation-and-setup)).
 
 ### On-Device Test (C)
 

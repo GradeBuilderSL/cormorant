@@ -36,7 +36,11 @@ from typing import Dict, List
 
 import numpy as np
 
-from ..nodes  import OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6, MatmulNode, ConvNode
+from ..nodes  import (
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
+    MatmulNode, ConvNode, PoolNode, ReshapeNode,
+    POOL_MAX, POOL_AVG, POOL_LP,
+)
 from ..tensor import TensorInfo
 
 # Expected GT arrays larger than this threshold are written to external
@@ -81,6 +85,68 @@ def _conv2d_ref(
         y += bias.reshape(1, M, 1, 1)
 
     return y
+def _pool2d_ref(
+    x: np.ndarray,       # float64, shape [N, C, H, W]
+    pool_h: int,
+    pool_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_top: int,
+    pad_left: int,
+    dil_h: int,
+    dil_w: int,
+    out_h: int,
+    out_w: int,
+    pool_type: int,
+    lp_order: int,
+    count_include_pad: int,
+) -> np.ndarray:
+    """Reference 2-D pooling in float64 matching PoolingKernel's NCHW output."""
+    N, C, H, W = x.shape
+    y = np.zeros((N, C, out_h, out_w), dtype=np.float64)
+
+    for oh in range(out_h):
+        for ow in range(out_w):
+            valid_count = 0
+            for khi in range(pool_h):
+                for kwi in range(pool_w):
+                    ih = oh * stride_h + khi * dil_h - pad_top
+                    iw = ow * stride_w + kwi * dil_w - pad_left
+                    if 0 <= ih < H and 0 <= iw < W:
+                        valid_count += 1
+            denom = (pool_h * pool_w) if count_include_pad else valid_count
+            denom = max(denom, 1)
+
+            acc = (
+                np.full((N, C), -np.inf, dtype=np.float64)
+                if pool_type == POOL_MAX
+                else np.zeros((N, C), dtype=np.float64)
+            )
+
+            for khi in range(pool_h):
+                for kwi in range(pool_w):
+                    ih = oh * stride_h + khi * dil_h - pad_top
+                    iw = ow * stride_w + kwi * dil_w - pad_left
+                    if ih < 0 or ih >= H or iw < 0 or iw >= W:
+                        continue
+                    v = x[:, :, ih, iw]
+                    if pool_type == POOL_MAX:
+                        acc = np.maximum(acc, v)
+                    elif pool_type == POOL_AVG:
+                        acc += v
+                    else:
+                        acc += np.abs(v) if lp_order == 1 else v * v
+
+            if pool_type == POOL_MAX:
+                y[:, :, oh, ow] = acc
+            elif pool_type == POOL_AVG:
+                y[:, :, oh, ow] = acc / denom
+            else:
+                y[:, :, oh, ow] = acc if lp_order == 1 else np.sqrt(np.maximum(acc, 0.0))
+
+    return y
+
+
 # expected/<c_name>.dat files and loaded at runtime by fread(), matching
 # the same approach used for large weight tensors.
 LARGE_EXPECTED_THRESHOLD = 4096
@@ -214,6 +280,32 @@ class _SimulateMixin:
                         dilation_w=sn.dilation_w,
                         out_h=sn.out_h,
                         out_w=sn.out_w,
+                    )
+                ).reshape(sn.output.shape)
+                continue
+
+            if isinstance(sn, ReshapeNode):
+                src = arrays[sn.inputs[0].onnx_name]
+                arrays[sn.output.onnx_name] = src.reshape(sn.output.shape)
+                continue
+
+            if isinstance(sn, PoolNode):
+                arrays[sn.output.onnx_name] = dtype.truncate(
+                    _pool2d_ref(
+                        x=arrays[sn.inputs[0].onnx_name],
+                        pool_h=sn.pool_h,
+                        pool_w=sn.pool_w,
+                        stride_h=sn.stride_h,
+                        stride_w=sn.stride_w,
+                        pad_top=sn.pad_top,
+                        pad_left=sn.pad_left,
+                        dil_h=sn.dil_h,
+                        dil_w=sn.dil_w,
+                        out_h=sn.out_h,
+                        out_w=sn.out_w,
+                        pool_type=sn.pool_type,
+                        lp_order=sn.lp_order,
+                        count_include_pad=sn.count_include_pad,
                     )
                 ).reshape(sn.output.shape)
                 continue

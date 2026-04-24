@@ -89,30 +89,43 @@ HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2
 
 ### Inference Scheduler
 
-**`inference-scheduler/`** — Python code-generator. Parses an ONNX model and emits a C file that calls `VectorOPKernel` once per node via the `XVectoropkernel` driver API.
+**`inference-scheduler/`** — Python code-generator. Parses an ONNX model and
+emits a complete C project that drives up to four hardware kernels:
 
-Supported ONNX ops: `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0, 6)`.
+| Kernel | ONNX ops |
+|--------|----------|
+| VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
+| MatmulKernel | `MatMul` |
+| ConvKernel | `Conv` |
+| PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
+| (zero-cost) | `Reshape` (buffer alias), `Gemm` (decomposed → MatMul + Add) |
 
 ```bash
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Generate test models
+# Generate test models (all generators required before running tests)
 .venv/bin/python test/gen_test_models.py
+.venv/bin/python test/gen_matmul_models.py
+.venv/bin/python test/gen_mixed_kernel_models.py
+.venv/bin/python test/gen_conv_models.py
+.venv/bin/python test/gen_pool_models.py
+.venv/bin/python test/gen_reshape_gemm_models.py
+.venv/bin/python test/gen_mixed_all_kernels_models.py
 
 # Run the scheduler on a model
-.venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx -o inference.c
+.venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run tests
-.venv/bin/python -m pytest test/test_scheduler.py -v
+# Run all tests (897 tests)
+.venv/bin/python -m pytest test/ -v
 ```
 
 Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
-- **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, tensor registry
-- **`inference-scheduler/src/nodes.py`** — Op mapping, `ScheduledNode`, call emission
+- **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
+- **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `PoolNode`, `ReshapeNode`
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations
-- **`inference-scheduler/src/codegen.py`** — Assembles the final `.c` file
+- **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake)
 
 See `doc/INFERENCE_SCHEDULER.md` for the full technical reference.
 

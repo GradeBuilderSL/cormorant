@@ -1,6 +1,7 @@
 """
 Supported ONNX operators and their mapping to VectorOPKernel op codes,
-plus MatmulNode for the separate MatmulKernel IP and ConvNode for ConvKernel.
+plus MatmulNode for the separate MatmulKernel IP, ConvNode for ConvKernel,
+and PoolNode for PoolingKernel.
 
 Each ScheduledNode wraps one onnx.NodeProto, holds resolved TensorInfo
 references for its inputs/outputs, and knows how to emit the corresponding
@@ -11,6 +12,11 @@ the XMatmulkernel driver API.
 
 ConvNode wraps a Conv ONNX op and emits run_conv() calls for
 the XConvkernel driver API.  Only 2-D convolution (4-D input) is supported.
+
+PoolNode wraps MaxPool / AveragePool / LpPool / GlobalMaxPool /
+GlobalAveragePool / GlobalLpPool ONNX ops and emits run_pool() calls for
+the XPoolkernel driver API.  Only 2-D pooling (4-D NCHW input) is supported.
+Global* variants are handled by the node itself (pool_h=in_h, pool_w=in_w).
 
 Supported ONNX ops (VectorOPKernel)
 ------------------------------------
@@ -28,6 +34,15 @@ Supported ONNX ops (MatmulKernel)
 Supported ONNX ops (ConvKernel)
 --------------------------------
   Conv (2-D, NCHW)    → run_conv()
+
+Supported ONNX ops (PoolingKernel)
+-----------------------------------
+  MaxPool             → run_pool()  (pool_type=0)
+  AveragePool         → run_pool()  (pool_type=1)
+  LpPool (p=1 or 2)  → run_pool()  (pool_type=2)
+  GlobalMaxPool       → run_pool()  (pool_type=0, pool_h/w = in_h/w)
+  GlobalAveragePool   → run_pool()  (pool_type=1, pool_h/w = in_h/w)
+  GlobalLpPool        → run_pool()  (pool_type=2, pool_h/w = in_h/w)
 
 All other ops raise SchedulerError.
 
@@ -1080,3 +1095,373 @@ class ConvNode:
             f"             {self.dilation_h}u, {self.dilation_w}u,"
             f" {self.pad_top}u, {self.pad_left}u, {hb});"
         )
+
+
+# ------------------------------------------------------------------ #
+# PoolNode                                                             #
+# ------------------------------------------------------------------ #
+
+# Pool-type codes — must match kPoolMax / kPoolAvg / kPoolLp in
+# pool/include/Config.h.in.
+POOL_MAX = 0
+POOL_AVG = 1
+POOL_LP  = 2
+
+_POOL_NAMES = {POOL_MAX: "MAX", POOL_AVG: "AVG", POOL_LP: "LP"}
+
+_GLOBAL_POOL_OP_TYPES = frozenset({
+    "GlobalMaxPool", "GlobalAveragePool", "GlobalLpPool",
+})
+
+POOL_OP_TYPES = frozenset({
+    "MaxPool", "AveragePool", "LpPool",
+}) | _GLOBAL_POOL_OP_TYPES
+
+
+@dataclass
+class PoolNode:
+    """One ONNX pooling operator mapped to one XPoolkernel invocation.
+
+    Supports 2-D pooling with NCHW layout:
+      x  [N, C, H, W]         — input feature map
+      y  [N, C, out_h, out_w] — output feature map
+
+    Pool types (runtime AXI-Lite register):
+      POOL_MAX (0) — MaxPool / GlobalMaxPool
+      POOL_AVG (1) — AveragePool / GlobalAveragePool
+      POOL_LP  (2) — LpPool / GlobalLpPool (p=1 or 2)
+
+    Global* variants are normalised at parse time: pool_h=in_h, pool_w=in_w,
+    stride=1, pad=0.  No special hardware path is needed.
+
+    Compatibility shims (init=False) satisfy the isinstance() exclusion guards
+    in _compute_tensor_layouts() so that no broadcast layout logic is applied
+    to PoolNode inputs or outputs.
+    """
+
+    kernel_name: ClassVar[str] = "PoolKernel"
+
+    onnx_node:   onnx.NodeProto
+    inputs:      List[TensorInfo]   # [x]
+    output:      TensorInfo
+    index:       int = 0
+    align_elems: int = 8
+
+    # Geometry (derived from ONNX attributes + shape inference)
+    batch:     int = 1
+    channels:  int = 0
+    in_h:      int = 0
+    in_w:      int = 0
+    out_h:     int = 0
+    out_w:     int = 0
+    pool_h:    int = 1
+    pool_w:    int = 1
+    stride_h:  int = 1
+    stride_w:  int = 1
+    pad_top:   int = 0
+    pad_left:  int = 0
+    dil_h:     int = 1
+    dil_w:     int = 1
+
+    pool_type:         int = POOL_MAX  # POOL_MAX / POOL_AVG / POOL_LP
+    lp_order:          int = 2         # 1 or 2 (LP only)
+    count_include_pad: int = 0         # 0 or 1 (AVG only)
+
+    # Compatibility shims — never set by callers.
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=1,    init=False)
+
+    # ------------------------------------------------------------------ #
+    # Factory                                                              #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def from_onnx_node(
+        cls,
+        node:        onnx.NodeProto,
+        tensors:     dict,
+        index:       int,
+        align_elems: int = 8,
+    ) -> "PoolNode":
+        op_type = node.op_type
+        if op_type not in POOL_OP_TYPES:
+            raise SchedulerError(
+                f"PoolNode.from_onnx_node() called with op_type='{op_type}'"
+            )
+
+        # Single required input: x
+        if not node.input or node.input[0] == "":
+            raise SchedulerError(
+                f"Pool node '{node.name or op_type}' has no input tensor."
+            )
+        x_name = node.input[0]
+        if x_name not in tensors:
+            raise SchedulerError(
+                f"Tensor '{x_name}' referenced by Pool node "
+                f"'{node.name or op_type}' not found in graph."
+            )
+        x_info = tensors[x_name]
+
+        if not node.output or node.output[0] == "":
+            raise SchedulerError(
+                f"Pool node '{node.name or op_type}' has no output tensor."
+            )
+        y_name = node.output[0]
+        if y_name not in tensors:
+            raise SchedulerError(
+                f"Output tensor '{y_name}' of Pool node "
+                f"'{node.name or op_type}' not found in graph."
+            )
+        y_info = tensors[y_name]
+
+        # Validate 4-D NCHW layout
+        if len(x_info.shape) != 4:
+            raise SchedulerError(
+                f"Pool node '{node.name or op_type}': input must be 4-D "
+                f"(NCHW), got shape {x_info.shape}."
+            )
+        if len(y_info.shape) != 4:
+            raise SchedulerError(
+                f"Pool node '{node.name or op_type}': output must be 4-D "
+                f"(NCHW), got shape {y_info.shape}."
+            )
+
+        n_val, c_val, h_in, w_in = x_info.shape
+        _, _, h_out, w_out = y_info.shape
+
+        # Pool type
+        if op_type in ("MaxPool", "GlobalMaxPool"):
+            pool_type_val = POOL_MAX
+        elif op_type in ("AveragePool", "GlobalAveragePool"):
+            pool_type_val = POOL_AVG
+        else:
+            pool_type_val = POOL_LP
+
+        attrs = {a.name: a for a in node.attribute}
+
+        def _ints(name: str, default: List[int]) -> List[int]:
+            return list(attrs[name].ints) if name in attrs else default
+
+        def _int(name: str, default: int) -> int:
+            return attrs[name].i if name in attrs else default
+
+        # Global* ops: pool window = full spatial extent, no stride/pad needed
+        is_global = op_type in _GLOBAL_POOL_OP_TYPES
+        if is_global:
+            pool_h_val   = h_in
+            pool_w_val   = w_in
+            stride_h_val = 1
+            stride_w_val = 1
+            pad_top_val  = 0
+            pad_left_val = 0
+            dil_h_val    = 1
+            dil_w_val    = 1
+        else:
+            ks = _ints("kernel_shape", [])
+            if len(ks) != 2:
+                raise SchedulerError(
+                    f"Pool node '{node.name or op_type}': kernel_shape must "
+                    f"have exactly 2 values (2-D pooling only), got {ks!r}."
+                )
+            pool_h_val, pool_w_val = int(ks[0]), int(ks[1])
+
+            strides = _ints("strides", [1, 1])
+            if len(strides) != 2:
+                raise SchedulerError(
+                    f"Pool node '{node.name or op_type}': only 2-D strides "
+                    f"supported, got {strides}."
+                )
+            stride_h_val, stride_w_val = int(strides[0]), int(strides[1])
+
+            dilations     = _ints("dilations", [1, 1])
+            dil_h_val     = int(dilations[0]) if len(dilations) >= 1 else 1
+            dil_w_val     = int(dilations[1]) if len(dilations) >= 2 else 1
+
+            auto_pad  = (attrs["auto_pad"].s.decode("utf-8")
+                         if "auto_pad" in attrs else "NOTSET")
+            pads_attr = _ints("pads", [0, 0, 0, 0])
+
+            if auto_pad == "NOTSET":
+                pad_top_val  = int(pads_attr[0]) if len(pads_attr) >= 1 else 0
+                pad_left_val = int(pads_attr[1]) if len(pads_attr) >= 2 else 0
+            elif auto_pad == "VALID":
+                pad_top_val  = 0
+                pad_left_val = 0
+            elif auto_pad in ("SAME_UPPER", "SAME_LOWER"):
+                eff_kh = dil_h_val * (pool_h_val - 1) + 1
+                eff_kw = dil_w_val * (pool_w_val - 1) + 1
+                pad_h  = max(0, (h_out - 1) * stride_h_val + eff_kh - h_in)
+                pad_w  = max(0, (w_out - 1) * stride_w_val + eff_kw - w_in)
+                if auto_pad == "SAME_UPPER":
+                    pad_top_val  = pad_h // 2
+                    pad_left_val = pad_w // 2
+                else:
+                    pad_top_val  = (pad_h + 1) // 2
+                    pad_left_val = (pad_w + 1) // 2
+            else:
+                raise SchedulerError(
+                    f"Pool node '{node.name or op_type}': "
+                    f"unsupported auto_pad='{auto_pad}'."
+                )
+
+            if _int("ceil_mode", 0) != 0:
+                raise SchedulerError(
+                    f"Pool node '{node.name or op_type}': ceil_mode=1 is not "
+                    f"supported; only floor output dimensions are implemented."
+                )
+
+        # LpPool / GlobalLpPool: parse p attribute (default 2)
+        lp_order_val = _int("p", 2) if pool_type_val == POOL_LP else 2
+        if pool_type_val == POOL_LP and lp_order_val not in (1, 2):
+            raise SchedulerError(
+                f"Pool node '{node.name or op_type}': p={lp_order_val} is not "
+                f"supported. PoolingKernel implements p=1 and p=2 only."
+            )
+
+        # AveragePool / GlobalAveragePool: count_include_pad (default 0)
+        cip_val = _int("count_include_pad", 0) if pool_type_val == POOL_AVG else 0
+
+        return cls(
+            onnx_node=node,
+            inputs=[x_info],
+            output=y_info,
+            index=index,
+            align_elems=align_elems,
+            batch=n_val,
+            channels=c_val,
+            in_h=h_in,
+            in_w=w_in,
+            out_h=h_out,
+            out_w=w_out,
+            pool_h=pool_h_val,
+            pool_w=pool_w_val,
+            stride_h=stride_h_val,
+            stride_w=stride_w_val,
+            pad_top=pad_top_val,
+            pad_left=pad_left_val,
+            dil_h=dil_h_val,
+            dil_w=dil_w_val,
+            pool_type=pool_type_val,
+            lp_order=lp_order_val,
+            count_include_pad=cip_val,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Code emission                                                        #
+    # ------------------------------------------------------------------ #
+
+    def emit_comment(self) -> str:
+        x_name  = self.inputs[0].onnx_name
+        op_type = self.onnx_node.op_type
+        is_global = op_type in _GLOBAL_POOL_OP_TYPES
+        if is_global:
+            geo = "  global"
+        else:
+            k_str = (
+                f"{self.pool_h}x{self.pool_w}"
+                if self.pool_h != self.pool_w else str(self.pool_h)
+            )
+            geo = (
+                f"  k={k_str} s={self.stride_h}x{self.stride_w}"
+                f" p={self.pad_top},{self.pad_left}"
+            )
+        if self.pool_type == POOL_LP:
+            geo += f" norm={self.lp_order}"
+        return (
+            f"    /* [{self.index}] {op_type}({x_name})"
+            f" -> {self.output.onnx_name}"
+            f"  [{self.batch},{self.channels},{self.in_h},{self.in_w}]"
+            f"→[{self.batch},{self.channels},{self.out_h},{self.out_w}]"
+            f"{geo} */"
+        )
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        x = self.inputs[0].c_name
+        y = self.output.c_name
+        return (
+            f"    run_pool({x}, {y},\n"
+            f"             {self.batch}u, {self.channels}u,\n"
+            f"             {self.in_h}u, {self.in_w}u,\n"
+            f"             {self.out_h}u, {self.out_w}u,\n"
+            f"             {self.pool_h}u, {self.pool_w}u,\n"
+            f"             {self.stride_h}u, {self.stride_w}u,\n"
+            f"             {self.pad_top}u, {self.pad_left}u,\n"
+            f"             {self.dil_h}u, {self.dil_w}u,\n"
+            f"             {self.pool_type}u, {self.lp_order}u,"
+            f" {self.count_include_pad}u);"
+        )
+
+
+# ------------------------------------------------------------------ #
+# ReshapeNode                                                          #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class ReshapeNode:
+    """ONNX Reshape operator — a pure memory view, no hardware call.
+
+    The output buffer is an alias for the input buffer (same physical
+    address, different shape metadata).  emit_call() returns an empty
+    string; the alias assignment is emitted once in inference_init().
+    """
+
+    kernel_name: ClassVar[str] = ""  # no hardware kernel
+
+    onnx_node:   onnx.NodeProto
+    inputs:      List[TensorInfo]   # [source]
+    output:      TensorInfo
+    index:       int = 0
+    align_elems: int = 8
+
+    # Compatibility shims
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=1,    init=False)
+
+    @classmethod
+    def from_onnx_node(
+        cls,
+        node:        onnx.NodeProto,
+        tensors:     dict,
+        index:       int,
+        align_elems: int = 8,
+    ) -> "ReshapeNode":
+        src_name = node.input[0]
+        out_name = node.output[0]
+        if src_name not in tensors:
+            raise SchedulerError(
+                f"Reshape node '{node.name}': source tensor '{src_name}' not found."
+            )
+        if out_name not in tensors:
+            raise SchedulerError(
+                f"Reshape node '{node.name}': output tensor '{out_name}' not found."
+            )
+        src = tensors[src_name]
+        out = tensors[out_name]
+        if src.numel != out.numel:
+            raise SchedulerError(
+                f"Reshape node '{node.name or 'Reshape'}': "
+                f"source numel={src.numel} (shape={src.shape}) != "
+                f"output numel={out.numel} (shape={out.shape}). "
+                f"Only view-reshapes (same number of elements) are supported."
+            )
+        return cls(onnx_node=node, inputs=[src], output=out,
+                   index=index, align_elems=align_elems)
+
+    def emit_comment(self) -> str:
+        return (
+            f"    /* [{self.index}] Reshape({self.inputs[0].onnx_name})"
+            f" -> {self.output.onnx_name}"
+            f"  {self.inputs[0].shape} → {self.output.shape}"
+            f"  (buffer alias, no hardware call) */"
+        )
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        return ""

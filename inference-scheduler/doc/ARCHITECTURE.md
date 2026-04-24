@@ -34,12 +34,15 @@ model.onnx
 │                                                                      │
 │  1. Load ONNX proto, validate with onnx.checker.check_model()        │
 │  2. Run shape inference (onnx.shape_inference.infer_shapes)          │
-│  3. Build tensor registry: weights, inputs, intermediates, outputs   │
-│  4. For each node: ScheduledNode.from_onnx_node()                    │
-│     - Map op_type → (op_code, arity)                                 │
-│     - MatMul nodes are wrapped as MatmulNode (separate class)        │
-│     - Validate broadcasting constraints                              │
-│     - Compute: outer_count, chunk_size, aligned_chunk_size           │
+│  3. _preprocess_model(): decompose Gemm → MatMul + optional Add      │
+│     (raises SchedulerError for unsupported alpha/beta/transA/transB) │
+│  4. Build tensor registry: weights, inputs, intermediates, outputs   │
+│  5. For each node, dispatch to the appropriate node class:           │
+│       MatMul   → MatmulNode  (MatmulKernel)                          │
+│       Conv     → ConvNode    (ConvKernel)                            │
+│       Pool ops → PoolNode    (PoolingKernel)                         │
+│       Reshape  → ReshapeNode (buffer alias, no hardware call)        │
+│       others   → ScheduledNode (VectorOPKernel)                      │
 └──────────────────────────────────────────────────────────────────────┘
     │
     ▼ OnnxGraph (nodes, tensors)
@@ -79,8 +82,13 @@ src/
   dtype.py               DataType ABC + ApFixed, Float32 implementations
   layout.py              TensorLayout frozen dataclass — DMA buffer geometry (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo dataclass — metadata + C code emitters
-  nodes.py               ScheduledNode dataclass — op mapping + C call emitters
-  graph.py               OnnxGraph — ONNX loading, shape inference, node scheduling
+  nodes.py               Node classes — op mapping, validation, C call emitters:
+                           ScheduledNode (VectorOPKernel: Add/Sub/Mul/Div/Relu/Clip)
+                           MatmulNode    (MatmulKernel: MatMul)
+                           ConvNode      (ConvKernel: Conv)
+                           PoolNode      (PoolingKernel: MaxPool/AveragePool/LpPool/Global*)
+                           ReshapeNode   (buffer alias — no hardware call)
+  graph.py               OnnxGraph — ONNX loading, shape inference, Gemm preprocessing, node dispatch
   codegen/
     __init__.py          CodeGenerator class (assembles all mixins via MRO)
     _core.py             _CoreMixin: __init__, tensor layouts, pool size, helpers
@@ -104,13 +112,30 @@ clean, typed view of the computation graph.
 
 ```python
 model = onnx.load(model_path)
-onnx.checker.check_model(model)          # validate structural correctness
+onnx.checker.check_model(model)              # validate structural correctness
 model = shape_inference.infer_shapes(model)  # fill in intermediate shapes
+model = OnnxGraph._preprocess_model(model)   # decompose Gemm → MatMul + Add
 ```
 
 The shape inference step is critical. Without it, intermediate tensors (the
 outputs of each ONNX node that feed into the next) have no shape information.
 After `infer_shapes`, every tensor's shape is available in `model.graph.value_info`.
+
+### Gemm Preprocessing (`_preprocess_model`)
+
+Before the tensor registry is built, `_preprocess_model()` rewrites every
+`Gemm` node into equivalent lower-level ops that the scheduler already handles:
+
+- `Gemm(A, B, C)` → `MatMul(A, B) → tmp` + `Add(tmp, C) → Y`
+- `Gemm(A, B)` (no bias) → `MatMul(A, B) → Y`
+
+Supported constraints: `alpha=1`, `beta=1`, `transA=0`, `transB=0`. Any
+deviation raises `SchedulerError`. The new intermediate tensor `tmp` (for the
+bias case) is inserted into `graph.value_info` so the subsequent tensor registry
+pass can assign it a proper shape.
+
+This design keeps `MatmulNode` and `ScheduledNode` unaware of `Gemm` — the
+decomposition is purely a graph-rewriting pass.
 
 ### Tensor Registry
 
@@ -238,10 +263,55 @@ both advance — they each hold 4 chunks strided by `CHUNK_STRIDE`.
 
 ### MatmulNode
 
-MatMul operations are handled by a separate `MatmulNode` class (also in `src/nodes.py`) that drives the `MatmulKernel` IP. Key fields: `n`, `k`, `m` (matrix dimensions), `outer_count`, `b_batch_stride`. `emit_call(layouts)` checks `TensorLayout.gap` on A and Y to choose between:
+MatMul operations are handled by a separate `MatmulNode` class (also in
+`src/nodes.py`) that drives the `MatmulKernel` IP. Key fields: `n`, `k`, `m`
+(matrix dimensions), `outer_count`, `b_batch_stride`. `emit_call(layouts)`
+checks `TensorLayout.gap` on A and Y to choose between:
 
 - Natural form: `run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride)`
-- Row-strided form: when A or Y has alignment gaps — decomposes into batch=N, n=1 to walk each row independently
+- Row-strided form: when A or Y has alignment gaps — decomposes into `batch=N, n=1` to walk each row independently
+
+### ConvNode
+
+`ConvNode` drives `ConvKernel` for 2-D NCHW convolution. Key fields: `batch`,
+`in_channels`, `out_channels`, `in_h/w`, `out_h/w`, `kernel_h/w`,
+`stride_h/w`, `pad_top/left`, `dil_h/w`, `has_bias`. `emit_call()` emits a
+`run_conv(x, w, bias_or_null, y, ...)` call with 17+ register-level parameters.
+`has_bias` is determined at `from_onnx_node()` time: a Conv node with three
+inputs has a bias tensor fused into the same kernel dispatch.
+
+ConvNode is excluded from Phase 2/3 layout propagation — it writes a flat
+NCHW output buffer with `n_chunks = 1`.
+
+### PoolNode
+
+`PoolNode` drives `PoolingKernel` for 2-D NCHW pooling. Supported ONNX op
+types: `MaxPool`, `AveragePool`, `LpPool` (p=1 or 2), and the `Global*`
+variants. Key fields: `pool_type` (0=MAX, 1=AVG, 2=LP), `lp_order`,
+`count_include_pad`, full spatial geometry (same fields as ConvNode).
+`emit_call()` emits a `run_pool(x, y, ...)` call with 19 register-level
+parameters.
+
+PoolNode is excluded from Phase 2/3 layout propagation — it writes a flat
+NCHW output buffer with `n_chunks = 1`.
+
+### ReshapeNode
+
+`ReshapeNode` is a zero-cost buffer alias. It has no `kernel_name` (empty
+string, not in `KERNEL_REGISTRY`), and `emit_call()` returns an empty string
+— no hardware call is emitted.
+
+Key mechanics:
+- `from_onnx_node()` validates that source and output `numel` match.
+- The compatibility shims (`outer_count=1`, `chunk_size=0`, `arity=1`) allow
+  ReshapeNode to coexist with code paths that iterate over all node types.
+- In `inference_init()`, reshape output buffers that are intermediate tensors
+  (not graph inputs/outputs) are pointer-assigned from the source buffer:
+  `Z = X;  /* reshape alias */`
+- In `inference_deinit()`, they are NULLed without `inference_buf_free()`:
+  `Z = NULL;  /* reshape alias — not owned */`
+- `_reshape_aliases` in `_CoreMixin` maps `{output_onnx_name → source_c_name}`
+  for use by `_SourceMixin` during init/deinit code generation.
 
 ---
 
@@ -379,17 +449,26 @@ Returns `{onnx_name: TensorLayout}`. Three phases:
 
 **Phase 1 — Seed all tensors as flat**: every tensor starts with `TensorLayout.flat(numel)`.
 
-**Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`, MatmulNode excluded):
+**Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`, MatmulNode /
+ConvNode / PoolNode / ReshapeNode excluded):
 - Output → `advancing(numel, outer_count, aligned_chunk_size)`
 - Advancing inputs (stride through the output) → same advancing layout
 - Repeating input (bias at offset 0 each iteration) → `repeating(numel, aligned_chunk_size)`
 
 A `_should_update_advancing()` guard ensures the flat→advancing transition fires even when `stride == chunk` (no gap), which would leave `alloc == numel` and fool a naive `alloc > cur.alloc` check.
 
-**Phase 3 — Non-broadcast, non-MatmulNode propagation** (topological order):
-For each such node, find the dominant input (highest alloc with n_chunks > 1). If any input alloc exceeds the output alloc, raise the output (inheriting dominant stride/n_chunks). Then raise every co-input below the output alloc to match.
+**Phase 3 — Non-broadcast, non-hardware-specific propagation** (topological order):
+For each ScheduledNode that is not a broadcast node, find the dominant input
+(highest alloc with n_chunks > 1). If any input alloc exceeds the output alloc,
+raise the output (inheriting dominant stride/n_chunks). Then raise every
+co-input below the output alloc to match.
 
-MatmulNode is excluded: it reads A and Y with per-row strides derived from `TensorLayout.gap` at emit time, not via alloc propagation.
+MatmulNode, ConvNode, PoolNode, and ReshapeNode are all excluded from Phase 3:
+- MatmulNode reads A and Y with per-row strides derived from `TensorLayout.gap`
+  at emit time, not via alloc propagation.
+- ConvNode and PoolNode always produce flat NCHW outputs (`n_chunks = 1`), so
+  there is nothing to propagate.
+- ReshapeNode aliases its input buffer — the input's layout is already correct.
 
 **Why propagate into non-broadcast nodes?** Gap slots in advancing buffers contain zeros (DMA memory is zeroed at allocation, ROM arrays pad gaps with zero). Passing `size = alloc` to run_op() processes data + gaps in one call; the gap slots produce correct zero outputs (Relu(0)=0, Add(x,0)=x, etc.) without needing per-chunk loops.
 
@@ -427,16 +506,23 @@ The source file is assembled from sections:
 
 ```
 _file_banner()                     ← auto-generated header with model info
-_source_includes()                 ← #include "inference.h", xvectoropkernel.h, string.h
+_source_includes()                 ← #include "inference.h", per-kernel driver headers, string.h
 _source_op_defines()               ← #define VECTOROP_ADD 0u …
 _weight_arrays()                   ← ROM arrays + DMA pointers for each weight
 _buffer_declarations()             ← comments for I/O, DMA pointers for intermediates
-_kernel_instance()                 ← static XVectoropkernel s_vectoropkernel; static XMatmulkernel s_matmulkernel;
-_run_op_helper()                   ← static void run_op(…) and/or run_op_at(…)
+_kernel_instance()                 ← static XVectoropkernel s_kernel; static XMatmulkernel s_matmulkernel; …
+_run_op_helper()                   ← static void run_op(…) and/or run_op_at(…)    [VectorOP nodes]
+_run_matmul_helper()               ← static void run_matmul(…)                     [MatMul nodes]
+_run_conv_helper()                 ← static void run_conv(…)                       [Conv nodes]
+_run_pool_helper()                 ← static void run_pool(…)                       [Pool nodes]
 [_load_weight_helper()]            ← only when large weights exist
 _init_function()                   ← inference_init() + inference_deinit()
 _inference_function()              ← inference_run()
 ```
+
+Each `run_*()` helper is only emitted when the model contains at least one node
+of the corresponding type; it encapsulates all AXI-Lite register writes and the
+poll loop for its kernel.
 
 ### _SourceMixin — run_op() and run_op_at()
 
@@ -588,11 +674,15 @@ hardware's element-wise saturate-and-round behavior.
 1. Seed weights: for each weight tensor, quantize(float_data) → simulated array
 2. Seed inputs:  ramp_to_float(positions) → simulated input array
    (positions account for broadcast stride layout)
-3. For each ScheduledNode in topological order:
-   a. Fetch input arrays by onnx_name
-   b. Apply numpy operation (a + b, a * b, np.maximum, etc.)
-   c. quantize(result) → output array (clips + rounds to representable grid)
-   d. Store as arrays[output.onnx_name]
+3. For each node in topological order:
+   ScheduledNode → numpy element-wise op (a + b, a * b, np.maximum, etc.),
+                   then quantize(result)
+   MatmulNode    → np.matmul(A, B), then quantize(result)
+   ConvNode      → _conv2d_ref() sliding-window reference, then quantize(result)
+   PoolNode      → _pool2d_ref() sliding-window reference (no quantization —
+                   pooling is a reduction, not a saturating arithmetic op)
+   ReshapeNode   → arrays[output] = arrays[source].reshape(output.shape)
+                   (zero cost; shares the numpy array)
 4. Return all arrays (inputs, weights, intermediates, outputs)
 ```
 
@@ -692,6 +782,54 @@ _ONNX_OP_MAP["Abs"] = (OP_ABS, 1)   # arity=1 (unary)
 
 No other files need to change for a unary op. For a binary op, the broadcasting
 logic in `_broadcast_info()` already handles the general case.
+
+### Adding a New Hardware Kernel
+
+Use ConvNode or PoolNode as a template. The pattern requires changes in exactly
+five places:
+
+1. **`src/nodes.py`** — add a new dataclass (e.g. `FooNode`) with:
+   - `kernel_name: ClassVar[str] = "FooKernel"` — must match an entry in `KERNEL_REGISTRY`
+   - `from_onnx_node(cls, node, tensors, index, align_elems)` — validates op type, extracts geometry
+   - `emit_call(self, layouts)` — emits `run_foo(...)` with all register parameters
+   - `emit_comment(self)` — human-readable comment for `inference_run()` body
+   - Compatibility shims: `outer_count=1`, `chunk_size=0`, `aligned_chunk_size=0`, `arity=1`
+
+2. **`src/kernels.py`** — add a `KernelDesc` entry to `KERNEL_REGISTRY`:
+   ```python
+   "FooKernel": KernelDesc(
+       name="FooKernel",
+       driver_prefix="xfookernel",
+       c_type="XFookernel",
+       uio_default="FooKernel_0",
+       axi_base=0xA004_0000,
+       ...
+   )
+   ```
+
+3. **`src/graph.py`** — add a dispatch branch in `OnnxGraph.__init__()`:
+   ```python
+   elif node.op_type in FOO_OP_TYPES:
+       sn = FooNode.from_onnx_node(node, self._tensors, idx, align_elems)
+   ```
+
+4. **`src/codegen/_core.py`** — add `FooNode` to **all five** `isinstance` guards:
+   - Phase 2 exclusion (`outer_count > 1` seeding)
+   - Phase 3 exclusion (alloc propagation)
+   - `_broadcast_io_map()` Pass 1 exclusion
+   - `_broadcast_io_map()` Pass 2 exclusion
+   - Post-validation check (if node has `outer_count > 1`, raise error)
+   - Also add `_has_foo_nodes` property and update `_active_kernels`
+
+5. **`src/codegen/_source.py`** — add a `_run_foo_helper()` method and call it
+   in `generate_source()`; add `FooNode` to `isinstance` guards in
+   `_init_function()` (intermediate buffer alloc section) if needed.
+
+6. **`src/codegen/_simulate.py`** — add a `FooNode` branch in `_forward_pass()`
+   using a numpy reference implementation.
+
+7. **`src/codegen/_banners.py`** — add `FooNode` to the `ops_used` comprehension
+   and the `has_foo` flag for the kernel line in the file banner.
 
 ### Adding a New Data Type
 

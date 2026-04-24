@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode
+from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode, PoolNode, ReshapeNode
 from ..tensor import LARGE_WEIGHT_THRESHOLD
 from ._banners import _banner, _file_banner
 
@@ -126,6 +126,7 @@ class _SourceMixin:
             for sn in nodes
         )
         need_run_conv = self._has_conv_nodes
+        need_run_pool = self._has_pool_nodes
 
         titles = []
         if need_run_op and need_run_op_at:
@@ -142,18 +143,22 @@ class _SourceMixin:
             titles.append("run_matmul() — MatmulKernel dispatch helper")
         if need_run_conv:
             titles.append("run_conv() — ConvKernel dispatch helper")
+        if need_run_pool:
+            titles.append("run_pool() — PoolingKernel dispatch helper")
         title = " / ".join(titles) if titles else "Kernel dispatch helpers"
 
         parts = [_banner(title)]
 
-        # Look up the VectorOP, Matmul, and Conv kernel descriptors (if active)
+        # Look up the VectorOP, Matmul, Conv, and Pool kernel descriptors (if active)
         from ..kernels import KERNEL_REGISTRY
         vop_kd  = KERNEL_REGISTRY.get("VectorOPKernel")
         mm_kd   = KERNEL_REGISTRY.get("MatmulKernel")
         conv_kd = KERNEL_REGISTRY.get("ConvKernel")
+        pool_kd = KERNEL_REGISTRY.get("PoolKernel")
         vop_var  = vop_kd.c_var  if vop_kd  else "s_vectoropkernel"
         mm_var   = mm_kd.c_var   if mm_kd   else "s_matmulkernel"
         conv_var = conv_kd.c_var if conv_kd else "s_convkernel"
+        pool_var = pool_kd.c_var if pool_kd else "s_poolkernel"
 
         if need_run_op:
             parts.append(
@@ -378,6 +383,64 @@ class _SourceMixin:
                 "}\n"
             )
 
+        if need_run_pool:
+            parts.append(
+                "/*\n"
+                " * run_pool() — program XPoolkernel AXI-Lite registers,\n"
+                " * start the kernel, and poll until done.\n"
+                " *\n"
+                " *   x / y       DMA buffer pointers (physical addresses via\n"
+                " *                inference_buf_phys())\n"
+                " *   batch       input batch size (N)\n"
+                " *   channels    input/output channels (C)\n"
+                " *   in_h/w      input spatial dimensions\n"
+                " *   out_h/w     output spatial dimensions\n"
+                " *   pool_h/w    pool window size\n"
+                " *   stride_h/w  pooling stride\n"
+                " *   pad_top/left  zero-padding (top row / left column)\n"
+                " *   dil_h/w     dilation (1 = no dilation)\n"
+                " *   pool_type   0=MaxPool  1=AveragePool  2=LpPool\n"
+                " *   lp_order    Lp norm order (1 or 2; ignored for Max/Avg)\n"
+                " *   count_include_pad  1 = include padding in AVG denominator\n"
+                " */\n"
+                "static void run_pool(\n"
+                "    inference_buf_t *x,\n"
+                "    inference_buf_t *y,\n"
+                "    unsigned batch,\n"
+                "    unsigned channels,\n"
+                "    unsigned in_h,     unsigned in_w,\n"
+                "    unsigned out_h,    unsigned out_w,\n"
+                "    unsigned pool_h,   unsigned pool_w,\n"
+                "    unsigned stride_h, unsigned stride_w,\n"
+                "    unsigned pad_top,  unsigned pad_left,\n"
+                "    unsigned dil_h,    unsigned dil_w,\n"
+                "    unsigned pool_type, unsigned lp_order,\n"
+                "    unsigned count_include_pad)\n"
+                "{\n"
+                f"    XPoolkernel_Set_x                 (&{pool_var}, inference_buf_phys(x));\n"
+                f"    XPoolkernel_Set_y                 (&{pool_var}, inference_buf_phys(y));\n"
+                f"    XPoolkernel_Set_batch             (&{pool_var}, batch);\n"
+                f"    XPoolkernel_Set_channels          (&{pool_var}, channels);\n"
+                f"    XPoolkernel_Set_in_h              (&{pool_var}, in_h);\n"
+                f"    XPoolkernel_Set_in_w              (&{pool_var}, in_w);\n"
+                f"    XPoolkernel_Set_out_h             (&{pool_var}, out_h);\n"
+                f"    XPoolkernel_Set_out_w             (&{pool_var}, out_w);\n"
+                f"    XPoolkernel_Set_pool_h            (&{pool_var}, pool_h);\n"
+                f"    XPoolkernel_Set_pool_w            (&{pool_var}, pool_w);\n"
+                f"    XPoolkernel_Set_stride_h          (&{pool_var}, stride_h);\n"
+                f"    XPoolkernel_Set_stride_w          (&{pool_var}, stride_w);\n"
+                f"    XPoolkernel_Set_pad_top           (&{pool_var}, pad_top);\n"
+                f"    XPoolkernel_Set_pad_left          (&{pool_var}, pad_left);\n"
+                f"    XPoolkernel_Set_dil_h             (&{pool_var}, dil_h);\n"
+                f"    XPoolkernel_Set_dil_w             (&{pool_var}, dil_w);\n"
+                f"    XPoolkernel_Set_pool_type         (&{pool_var}, pool_type);\n"
+                f"    XPoolkernel_Set_lp_order          (&{pool_var}, lp_order);\n"
+                f"    XPoolkernel_Set_count_include_pad (&{pool_var}, count_include_pad);\n"
+                f"    XPoolkernel_Start(&{pool_var});\n"
+                f"    while (!XPoolkernel_IsDone(&{pool_var})) {{}}\n"
+                "}\n"
+            )
+
         return "".join(parts)
 
     def _load_weight_helper(self) -> str:
@@ -470,15 +533,24 @@ class _SourceMixin:
             alloc_lines.append("")
 
         if intermediates:
+            reshape_aliases = self._reshape_aliases  # {out_name: src_c_name}
             alloc_lines.append("    /* Allocate intermediate buffers */")
             for t in intermediates:
-                alloc_size = self._alloc_sizes[t.onnx_name]
-                alloc_lines.append(
-                    f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
-                )
-                alloc_lines.append(
-                    f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
-                )
+                if t.onnx_name in reshape_aliases:
+                    # Buffer alias — same physical memory as the source tensor.
+                    src_c = reshape_aliases[t.onnx_name]
+                    alloc_lines.append(
+                        f"    {t.c_name} = {src_c};"
+                        f"  /* reshape alias */"
+                    )
+                else:
+                    alloc_size = self._alloc_sizes[t.onnx_name]
+                    alloc_lines.append(
+                        f"    {t.c_name} = inference_buf_alloc({alloc_size}u);"
+                    )
+                    alloc_lines.append(
+                        f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}"
+                    )
             alloc_lines.append("")
 
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
@@ -486,11 +558,18 @@ class _SourceMixin:
         # inference_deinit(): free owned buffers (safe on NULL), then close pool.
         # Buffers must be freed before inference_buf_pool_deinit() because the
         # Linux/XRT path needs the device handle open to call xclFreeBO().
+        # Reshape-alias buffers are NOT freed — they share memory with their source.
+        reshape_aliases = self._reshape_aliases
         deinit_free: List[str] = []
         for t in weights + intermediates:
-            deinit_free.append(
-                f"    inference_buf_free({t.c_name}); {t.c_name} = NULL;"
-            )
+            if t.onnx_name in reshape_aliases:
+                deinit_free.append(
+                    f"    {t.c_name} = NULL;  /* reshape alias — not owned */"
+                )
+            else:
+                deinit_free.append(
+                    f"    inference_buf_free({t.c_name}); {t.c_name} = NULL;"
+                )
         deinit_body = ("\n".join(deinit_free) + "\n") if deinit_free else ""
 
         load_helper = self._load_weight_helper() if self.large_weight_tensors else ""

@@ -20,12 +20,14 @@ from typing import Dict, List
 
 import numpy as np
 import onnx
+import onnx.helper as onnx_helper
 import onnx.numpy_helper as nph
 from onnx import shape_inference, TensorProto
 
 from typing import Union
 from .tensor import TensorInfo
-from .nodes  import ScheduledNode, MatmulNode, ConvNode, SchedulerError
+from .nodes  import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
+                     POOL_OP_TYPES, SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
 
 
@@ -73,6 +75,114 @@ def _shape_from_type_proto(tp: onnx.TypeProto) -> List[int]:
 class OnnxGraph:
     """Parsed, validated, and resolved ONNX computation graph."""
 
+    @staticmethod
+    def _preprocess_model(model: onnx.ModelProto) -> onnx.ModelProto:
+        """
+        Simplify the ONNX graph before scheduling:
+
+          1. Decompose Gemm (alpha=1, beta=1, transA=0, transB=0) into
+             MatMul + Add so existing MatmulNode / ScheduledNode handle it.
+
+        Requires that shape inference has already been run on the model
+        so that intermediate shapes are available for the new MatMul output.
+        """
+        graph = model.graph
+
+        # Build a shape map from all known tensors (inputs, outputs, value_info,
+        # and initializers — initializers don't appear in value_info).
+        shape_map: Dict[str, List[int]] = {}
+        for init in graph.initializer:
+            arr = nph.to_array(init)
+            shape_map[init.name] = list(arr.shape)
+        for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
+            dims = [
+                d.dim_value if d.HasField("dim_value") else 0
+                for d in vi.type.tensor_type.shape.dim
+            ]
+            shape_map[vi.name] = dims
+
+        gemm_counter = [0]
+        new_nodes: List[onnx.NodeProto] = []
+        new_value_info: List[onnx.ValueInfoProto] = []
+
+        for node in graph.node:
+            if node.op_type != "Gemm":
+                new_nodes.append(node)
+                continue
+
+            attrs = {a.name: a for a in node.attribute}
+            alpha  = attrs["alpha"].f  if "alpha"  in attrs else 1.0
+            beta   = attrs["beta"].f   if "beta"   in attrs else 1.0
+            transA = attrs["transA"].i if "transA" in attrs else 0
+            transB = attrs["transB"].i if "transB" in attrs else 0
+
+            if abs(alpha - 1.0) > 1e-6 or abs(beta - 1.0) > 1e-6:
+                raise SchedulerError(
+                    f"Gemm node '{node.name}': alpha={alpha}, beta={beta}. "
+                    f"Only alpha=1, beta=1 is supported."
+                )
+            if transA != 0 or transB != 0:
+                raise SchedulerError(
+                    f"Gemm node '{node.name}': transA={transA}, transB={transB}. "
+                    f"Only transA=0, transB=0 is supported."
+                )
+
+            A = node.input[0]
+            B = node.input[1]
+            C = node.input[2] if len(node.input) >= 3 and node.input[2] else None
+            Y = node.output[0]
+
+            gemm_counter[0] += 1
+            n = gemm_counter[0]
+
+            if C:
+                # Gemm → MatMul(A,B)→tmp  +  Add(tmp,C)→Y
+                tmp = f"_gemm_mm_out_{n}"
+                # Infer tmp shape: A[-2] × B[-1]
+                a_shape = shape_map.get(A, [])
+                b_shape = shape_map.get(B, [])
+                if len(a_shape) >= 2 and len(b_shape) >= 2:
+                    tmp_shape = a_shape[:-1] + [b_shape[-1]]
+                else:
+                    tmp_shape = []
+                if tmp_shape:
+                    new_value_info.append(
+                        onnx_helper.make_tensor_value_info(
+                            tmp, TensorProto.FLOAT, tmp_shape
+                        )
+                    )
+                new_nodes.append(
+                    onnx_helper.make_node("MatMul", inputs=[A, B], outputs=[tmp],
+                                          name=f"_gemm_matmul_{n}")
+                )
+                new_nodes.append(
+                    onnx_helper.make_node("Add", inputs=[tmp, C], outputs=[Y],
+                                          name=f"_gemm_add_{n}")
+                )
+            else:
+                # No bias: Gemm → MatMul(A,B)→Y
+                new_nodes.append(
+                    onnx_helper.make_node("MatMul", inputs=[A, B], outputs=[Y],
+                                          name=f"_gemm_matmul_{n}")
+                )
+
+        if gemm_counter[0] == 0:
+            return model  # nothing changed
+
+        new_graph = onnx_helper.make_graph(
+            new_nodes,
+            graph.name,
+            list(graph.input),
+            list(graph.output),
+            initializer=list(graph.initializer),
+            value_info=list(graph.value_info) + new_value_info,
+        )
+        new_model = onnx_helper.make_model(
+            new_graph, opset_imports=list(model.opset_import)
+        )
+        new_model.ir_version = model.ir_version
+        return new_model
+
     def __init__(self, model_path: str,
                  dtype: DataType = None) -> None:
         if not os.path.isfile(model_path):
@@ -86,6 +196,9 @@ class OnnxGraph:
 
         # Run shape inference so every intermediate tensor gets a shape
         model = shape_inference.infer_shapes(model)
+
+        # Simplify: decompose Gemm → MatMul + Add
+        model = OnnxGraph._preprocess_model(model)
 
         graph = model.graph
 
@@ -160,12 +273,16 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
-        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode]] = []
+        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode]] = []
         for idx, node in enumerate(graph.node):
             if node.op_type == "MatMul":
                 sn = MatmulNode.from_onnx_node(node, self._tensors, idx, align_elems)
             elif node.op_type == "Conv":
                 sn = ConvNode.from_onnx_node(node, self._tensors, idx, align_elems)
+            elif node.op_type in POOL_OP_TYPES:
+                sn = PoolNode.from_onnx_node(node, self._tensors, idx, align_elems)
+            elif node.op_type == "Reshape":
+                sn = ReshapeNode.from_onnx_node(node, self._tensors, idx, align_elems)
             else:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
@@ -175,7 +292,7 @@ class OnnxGraph:
     # ------------------------------------------------------------------ #
 
     @property
-    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode]]:
+    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode]]:
         return self._nodes
 
     @property
