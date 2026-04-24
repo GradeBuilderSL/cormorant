@@ -15,7 +15,7 @@ the XConvkernel driver API.  Only 2-D convolution (4-D input) is supported.
 
 PoolNode wraps MaxPool / AveragePool / LpPool / GlobalMaxPool /
 GlobalAveragePool / GlobalLpPool ONNX ops and emits run_pool() calls for
-the XPoolkernel driver API.  Only 2-D pooling (4-D NCHW input) is supported.
+the XPoolingkernel driver API.  Only 2-D pooling (4-D NCHW input) is supported.
 Global* variants are handled by the node itself (pool_h=in_h, pool_w=in_w).
 
 Supported ONNX ops (VectorOPKernel)
@@ -1120,7 +1120,7 @@ POOL_OP_TYPES = frozenset({
 
 @dataclass
 class PoolNode:
-    """One ONNX pooling operator mapped to one XPoolkernel invocation.
+    """One ONNX pooling operator mapped to one XPoolingkernel invocation.
 
     Supports 2-D pooling with NCHW layout:
       x  [N, C, H, W]         — input feature map

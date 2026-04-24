@@ -355,22 +355,38 @@ def _resolve_local_driver(cfg: dict, merge_dir: Path) -> Optional[Path]:
     With local.driver_dirs dict set: merges all source directories into *merge_dir*
       and returns that.  Useful for multi-kernel models where each kernel's HLS
       output lives in a separate directory.
+
+    Raises FileNotFoundError if any configured path does not exist on disk.
     """
     single = cfg["local"].get("driver_dir")
     per_kernel = cfg["local"].get("driver_dirs", {})
 
     if single:
-        return Path(single)
+        p = Path(single)
+        if not p.is_dir():
+            raise FileNotFoundError(
+                f"local.driver_dir not found: {p}\n"
+                f"Run HLS synthesis or update the path in your remote_config."
+            )
+        return p
+
     if not per_kernel:
         return None
+
+    for kernel_name, kdir in per_kernel.items():
+        src = Path(kdir)
+        if not src.is_dir():
+            raise FileNotFoundError(
+                f"local.driver_dirs[{kernel_name!r}] not found: {src}\n"
+                f"Run HLS synthesis or update the path in your remote_config."
+            )
 
     merge_dir.mkdir(parents=True, exist_ok=True)
     for kdir in per_kernel.values():
         src = Path(kdir)
-        if src.is_dir():
-            for f in src.iterdir():
-                if f.is_file():
-                    shutil.copy2(f, merge_dir / f.name)
+        for f in src.iterdir():
+            if f.is_file():
+                shutil.copy2(f, merge_dir / f.name)
     return merge_dir
 
 
@@ -511,7 +527,11 @@ def run_model_test(model_path: Path,
 
     local_project = tmp_root / name
     merge_dir     = tmp_root / f"{name}_drv_merge"
-    local_driver  = _resolve_local_driver(cfg, merge_dir)
+    try:
+        local_driver = _resolve_local_driver(cfg, merge_dir)
+    except FileNotFoundError as exc:
+        result.steps.append(StepResult("drivers", False, str(exc), 0.0))
+        return result
     uio_devices   = _uio_devices_from_cfg(cfg)
 
     work_dir        = cfg["remote"]["work_dir"].rstrip("/")

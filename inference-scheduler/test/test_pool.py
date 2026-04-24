@@ -199,11 +199,11 @@ class TestPoolSource(unittest.TestCase):
 
     def test_pool_header_included(self):
         s = self._src("pool_maxpool_simple.onnx")
-        self.assertIn('#include "xpoolkernel.h"', s)
+        self.assertIn('#include "xpoolingkernel.h"', s)
 
     def test_pool_instance_declared(self):
         s = self._src("pool_maxpool_simple.onnx")
-        self.assertIn("XPoolkernel s_poolkernel", s)
+        self.assertIn("XPoolingkernel s_poolkernel", s)
 
     def test_run_pool_helper_emitted(self):
         s = self._src("pool_maxpool_simple.onnx")
@@ -235,16 +235,16 @@ class TestPoolSource(unittest.TestCase):
     def test_pool_kernel_set_calls(self):
         s = self._src("pool_maxpool_simple.onnx")
         for setter in [
-            "XPoolkernel_Set_x", "XPoolkernel_Set_y",
-            "XPoolkernel_Set_batch", "XPoolkernel_Set_channels",
-            "XPoolkernel_Set_in_h", "XPoolkernel_Set_in_w",
-            "XPoolkernel_Set_out_h", "XPoolkernel_Set_out_w",
-            "XPoolkernel_Set_pool_h", "XPoolkernel_Set_pool_w",
-            "XPoolkernel_Set_stride_h", "XPoolkernel_Set_stride_w",
-            "XPoolkernel_Set_pad_top", "XPoolkernel_Set_pad_left",
-            "XPoolkernel_Set_dil_h", "XPoolkernel_Set_dil_w",
-            "XPoolkernel_Set_pool_type", "XPoolkernel_Set_lp_order",
-            "XPoolkernel_Set_count_include_pad",
+            "XPoolingkernel_Set_x", "XPoolingkernel_Set_y",
+            "XPoolingkernel_Set_batch", "XPoolingkernel_Set_channels",
+            "XPoolingkernel_Set_in_h", "XPoolingkernel_Set_in_w",
+            "XPoolingkernel_Set_out_h", "XPoolingkernel_Set_out_w",
+            "XPoolingkernel_Set_pool_h", "XPoolingkernel_Set_pool_w",
+            "XPoolingkernel_Set_stride_h", "XPoolingkernel_Set_stride_w",
+            "XPoolingkernel_Set_pad_top", "XPoolingkernel_Set_pad_left",
+            "XPoolingkernel_Set_dil_h", "XPoolingkernel_Set_dil_w",
+            "XPoolingkernel_Set_pool_type", "XPoolingkernel_Set_lp_order",
+            "XPoolingkernel_Set_count_include_pad",
         ]:
             self.assertIn(setter, s, f"missing {setter}")
 
