@@ -132,15 +132,9 @@ class _SourceMixin:
 
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
-        # Only VectorOP ScheduledNodes use run_op() / run_op_at()
-        need_run_op    = any(
-            isinstance(sn, ScheduledNode) and sn.outer_count == 1
-            for sn in nodes
-        )
-        need_run_op_at = any(
-            isinstance(sn, ScheduledNode) and sn.outer_count > 1
-            for sn in nodes
-        )
+        # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
+        need_run_op    = any(isinstance(sn, ScheduledNode) for sn in nodes)
+        need_run_op_at = False
         need_run_matmul = self._has_matmul_nodes
         need_run_matmul_at = any(
             isinstance(sn, MatmulNode) and sn.outer_count > 1
@@ -150,11 +144,7 @@ class _SourceMixin:
         need_run_pool = self._has_pool_nodes
 
         titles = []
-        if need_run_op and need_run_op_at:
-            titles.append("run_op() / run_op_at() — VectorOPKernel dispatch helpers")
-        elif need_run_op_at:
-            titles.append("run_op_at() — VectorOPKernel dispatch helper")
-        elif need_run_op:
+        if need_run_op:
             titles.append("run_op() — VectorOPKernel dispatch helper")
         if need_run_matmul and need_run_matmul_at:
             titles.append("run_matmul() / run_matmul_at() — MatmulKernel dispatch helpers")
@@ -196,66 +186,33 @@ class _SourceMixin:
                 " *     inference_run() for graph outputs only.  Internal buffers that\n"
                 " *     flow kernel-to-kernel never touch the CPU, so they need no sync.\n"
                 " *\n"
-                " *   a     input buffer A  (always required)\n"
-                " *   b     input buffer B  (NULL for unary ops: RELU, RELU6)\n"
-                " *   c     output buffer C (must not alias a or b)\n"
-                " *   size  number of elements\n"
-                " *   op    VECTOROP_* constant\n"
+                " *   a      input buffer A  (always required)\n"
+                " *   b      input buffer B  (NULL for unary ops: RELU, RELU6)\n"
+                " *   c      output buffer C (must not alias a or b)\n"
+                " *   size   elements per inner chunk\n"
+                " *   op     VECTOROP_* constant\n"
+                " *   outer  number of outer broadcasting iterations (1 = no broadcast)\n"
+                " *   a_inc  element stride for a per outer step (0 = a repeats)\n"
+                " *   b_inc  element stride for b per outer step (0 = b repeats)\n"
                 " */\n"
                 "static void run_op(\n"
                 "    inference_buf_t *a,\n"
                 "    inference_buf_t *b,\n"
                 "    inference_buf_t *c,\n"
                 "    unsigned         size,\n"
-                "    unsigned         op)\n"
+                "    unsigned         op,\n"
+                "    unsigned         outer,\n"
+                "    unsigned         a_inc,\n"
+                "    unsigned         b_inc)\n"
                 "{\n"
                 f"    XVectoropkernel_Set_a(&{vop_var}, inference_buf_phys(a));\n"
                 f"    XVectoropkernel_Set_b(&{vop_var}, b ? inference_buf_phys(b) : (u64)0);\n"
                 f"    XVectoropkernel_Set_c(&{vop_var}, inference_buf_phys(c));\n"
                 f"    XVectoropkernel_Set_size(&{vop_var}, size);\n"
                 f"    XVectoropkernel_Set_op(&{vop_var}, op);\n"
-                f"    XVectoropkernel_Start(&{vop_var});\n"
-                f"    while (!XVectoropkernel_IsDone(&{vop_var})) {{}}\n"
-                "}\n"
-            )
-
-        if need_run_op_at:
-            parts.append(
-                "/*\n"
-                " * run_op_at() — offset-based dispatch for broadcasting loops.\n"
-                " *\n"
-                " * Same as run_op() but adds element offsets to the physical addresses\n"
-                " * so each loop iteration targets a different chunk of the buffers.\n"
-                " * Cache sync is the CALLER'S responsibility (done once per loop, not\n"
-                " * per iteration).\n"
-                " *\n"
-                " * Offsets are in elements; converted to bytes using\n"
-                " * INFERENCE_BYTES_PER_ELEM so the arithmetic is correct regardless\n"
-                " * of the element data type.\n"
-                " *\n"
-                " *   a / b / c   buffer pointers (b may be NULL for unary ops)\n"
-                " *   a_off / b_off / c_off   element offset into each buffer\n"
-                " *   size        elements to process in this invocation\n"
-                " *   op          VECTOROP_* constant\n"
-                " */\n"
-                "static void run_op_at(\n"
-                "    inference_buf_t *a, unsigned a_off,\n"
-                "    inference_buf_t *b, unsigned b_off,\n"
-                "    inference_buf_t *c, unsigned c_off,\n"
-                "    unsigned size, unsigned op)\n"
-                "{\n"
-                f"    XVectoropkernel_Set_a(&{vop_var},\n"
-                "        inference_buf_phys(a)"
-                " + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM);\n"
-                f"    XVectoropkernel_Set_b(&{vop_var},\n"
-                "        b ? inference_buf_phys(b)"
-                " + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM\n"
-                "          : (uint64_t)0);\n"
-                f"    XVectoropkernel_Set_c(&{vop_var},\n"
-                "        inference_buf_phys(c)"
-                " + (uint64_t)c_off * INFERENCE_BYTES_PER_ELEM);\n"
-                f"    XVectoropkernel_Set_size(&{vop_var}, size);\n"
-                f"    XVectoropkernel_Set_op(&{vop_var}, op);\n"
+                f"    XVectoropkernel_Set_outer(&{vop_var}, outer);\n"
+                f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
+                f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
                 f"    XVectoropkernel_Start(&{vop_var});\n"
                 f"    while (!XVectoropkernel_IsDone(&{vop_var})) {{}}\n"
                 "}\n"

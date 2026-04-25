@@ -83,7 +83,7 @@ static bool RunTest(Op op, const char* opName, unsigned size, unsigned seed) {
                                static_cast<double>(b[i]));
     }
 
-    VectorOPKernel(a.data(), b.data(), c.data(), size, static_cast<unsigned>(op));
+    VectorOPKernel(a.data(), b.data(), c.data(), size, static_cast<unsigned>(op), 1u, 0u, 0u);
 
     const bool isFloat = std::is_floating_point<Data_t>::value;
     const double absTol = 1.0 / 256.0;
@@ -137,7 +137,7 @@ static bool RunSatTest(Op op, double a_val, double b_val, const char* desc) {
     std::vector<Data_t> b(kSize, Data_t(b_val));
     std::vector<Data_t> c(kSize, Data_t(0));
 
-    VectorOPKernel(a.data(), b.data(), c.data(), kSize, static_cast<unsigned>(op));
+    VectorOPKernel(a.data(), b.data(), c.data(), kSize, static_cast<unsigned>(op), 1u, 0u, 0u);
 
     // Reference uses the same saturate-cast semantics as the kernel.
     const double expected = ref_op(op,
@@ -264,6 +264,81 @@ static bool RunSatTests() {
 }
 
 // ---------------------------------------------------------------------------
+// RunBroadcastTests — verify the outer/a_inc/b_inc broadcasting path.
+//
+// Two cases are tested:
+//   a_advances: a strides through the output by a_inc per outer step;
+//               b repeats at offset 0 each step (b_inc=0).
+//   b_advances: b strides through the output; a repeats (a_inc=0).
+// ---------------------------------------------------------------------------
+static bool RunBroadcastTests() {
+    bool allPassed = true;
+    std::cout << "\n--- Broadcast tests (2) ---\n";
+
+    // Case 1: a advances (a_inc=size), b repeats (b_inc=0)
+    // outer=2, size=4 → c[8]; a[8] strides, b[4] repeats, OP_ADD
+    {
+        const unsigned outer = 2, size = 4;
+        std::vector<Data_t> a = {
+            Data_t(1), Data_t(2), Data_t(3), Data_t(4),
+            Data_t(5), Data_t(6), Data_t(7), Data_t(8)
+        };
+        std::vector<Data_t> b = { Data_t(1), Data_t(1), Data_t(1), Data_t(1) };
+        std::vector<Data_t> c(8, Data_t(0));
+        VectorOPKernel(a.data(), b.data(), c.data(), size, OP_ADD, outer, size, 0u);
+
+        bool ok = true;
+        for (unsigned o = 0; o < outer; ++o) {
+            for (unsigned i = 0; i < size; ++i) {
+                const double got = static_cast<double>(c[o * size + i]);
+                const double exp = ref_op(OP_ADD,
+                                          static_cast<double>(a[o * size + i]),
+                                          static_cast<double>(b[i]));
+                if (std::abs(got - exp) > 1.0 / 256.0) {
+                    std::cerr << "  a_advances FAIL c[" << o*size+i << "]: "
+                              << "got=" << got << " exp=" << exp << "\n";
+                    ok = false;
+                }
+            }
+        }
+        std::cout << "[1/2] a_advances outer=2 size=4 OP_ADD ... "
+                  << (ok ? "PASS" : "FAIL") << "\n";
+        allPassed &= ok;
+    }
+
+    // Case 2: b advances (b_inc=size), a repeats (a_inc=0)
+    // outer=3, size=4 → c[12]; a[4] repeats, b[12] strides, OP_MUL
+    {
+        const unsigned outer = 3, size = 4;
+        std::vector<Data_t> a = { Data_t(2), Data_t(2), Data_t(2), Data_t(2) };
+        std::vector<Data_t> b;
+        for (int i = 0; i < 12; ++i) b.push_back(Data_t(i + 1));
+        std::vector<Data_t> c(12, Data_t(0));
+        VectorOPKernel(a.data(), b.data(), c.data(), size, OP_MUL, outer, 0u, size);
+
+        bool ok = true;
+        for (unsigned o = 0; o < outer; ++o) {
+            for (unsigned i = 0; i < size; ++i) {
+                const double got = static_cast<double>(c[o * size + i]);
+                const double exp = ref_op(OP_MUL,
+                                          static_cast<double>(a[i]),
+                                          static_cast<double>(b[o * size + i]));
+                if (std::abs(got - exp) > 1.0 / 256.0) {
+                    std::cerr << "  b_advances FAIL c[" << o*size+i << "]: "
+                              << "got=" << got << " exp=" << exp << "\n";
+                    ok = false;
+                }
+            }
+        }
+        std::cout << "[2/2] b_advances outer=3 size=4 OP_MUL ... "
+                  << (ok ? "PASS" : "FAIL") << "\n";
+        allPassed &= ok;
+    }
+
+    return allPassed;
+}
+
+// ---------------------------------------------------------------------------
 // Ops table (used by RunAllTests and single-run mode)
 // ---------------------------------------------------------------------------
 struct OpEntry { Op op; const char* name; };
@@ -304,8 +379,9 @@ static bool RunAllTests() {
     }
 
     allPassed &= RunSatTests();
+    allPassed &= RunBroadcastTests();
 
-    const unsigned nTotal = nRandom + sizeof(kSatTests) / sizeof(kSatTests[0]);
+    const unsigned nTotal = nRandom + sizeof(kSatTests) / sizeof(kSatTests[0]) + 2u;
     std::cout << "\n"
               << (allPassed ? "All " : "FAILED — ")
               << nTotal << " tests"

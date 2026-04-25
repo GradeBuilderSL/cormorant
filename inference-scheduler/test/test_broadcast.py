@@ -71,15 +71,16 @@ class TestBroadcast(unittest.TestCase):
         h = cg.generate_header()
         self.assertIn("8u * INFERENCE_Y_CHUNK_STRIDE", h)
 
-    def test_aligned_run_op_at_in_source(self):
+    def test_aligned_broadcast_uses_run_op(self):
         _, cg = self._gen("broadcast_aligned.onnx")
         s = cg.generate_source()
-        self.assertIn("run_op_at(", s)
+        self.assertIn("run_op(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD, 8u,", s)
 
-    def test_aligned_for_loop_in_source(self):
+    def test_aligned_no_for_loop_in_source(self):
+        # Broadcasting is now handled by the kernel; no CPU for-loop is emitted.
         _, cg = self._gen("broadcast_aligned.onnx")
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 8u; _i++)", s)
+        self.assertNotIn("for (unsigned _i", s)
 
     def test_aligned_loop_uses_chunk_macro(self):
         _, cg = self._gen("broadcast_aligned.onnx")
@@ -91,17 +92,17 @@ class TestBroadcast(unittest.TestCase):
         s = cg.generate_source()
         self.assertIn("INFERENCE_Y_CHUNK_STRIDE", s)
 
-    def test_aligned_advancing_uses_stride_offset(self):
-        # X (advancing) offset must be _i * CHUNK_STRIDE
+    def test_aligned_advancing_uses_stride_inc(self):
+        # X (advancing) a_inc must be CHUNK_STRIDE; b_inc must be 0u
         _, cg = self._gen("broadcast_aligned.onnx")
         s = cg.generate_source()
-        self.assertIn("_i * INFERENCE_Y_CHUNK_STRIDE", s)
+        self.assertIn("INFERENCE_Y_CHUNK_STRIDE, 0u);", s)
 
-    def test_aligned_repeating_offset_zero(self):
-        # bias (repeating) offset must be 0u
+    def test_aligned_repeating_zero_inc(self):
+        # bias (repeating) b_inc must be 0u (last argument)
         _, cg = self._gen("broadcast_aligned.onnx")
         s = cg.generate_source()
-        self.assertIn("bias, 0u", s)
+        self.assertIn(", 0u);", s)
 
     def test_aligned_explicit_syncs_in_source(self):
         _, cg = self._gen("broadcast_aligned.onnx")
@@ -109,13 +110,14 @@ class TestBroadcast(unittest.TestCase):
         self.assertIn("inference_buf_sync_to_device(X)", s)
         self.assertIn("inference_buf_sync_from_device(Y)", s)
 
-    def test_aligned_no_plain_run_op_for_broadcast_node(self):
-        # The broadcast node must NOT emit the no-offset run_op()
-        import re
+    def test_aligned_broadcast_run_op_has_outer(self):
+        # Broadcast node uses run_op() with outer=8u (not the non-broadcast 1u)
         _, cg = self._gen("broadcast_aligned.onnx")
         s = cg.generate_source()
-        plain_calls = re.findall(r'\brun_op\(X,', s)
-        self.assertEqual(len(plain_calls), 0)
+        self.assertIn("run_op(X, bias, Y,", s)
+        self.assertNotIn("run_op_at(", s)
+        # The non-broadcast form (outer=1) must NOT be used for this node
+        self.assertNotIn("run_op(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD, 1u,", s)
 
     def test_aligned_bias_alloc_uses_aligned_chunk(self):
         # bias (repeating) is allocated with aligned_chunk_size elements
@@ -179,10 +181,11 @@ class TestBroadcast(unittest.TestCase):
         self.assertGreater(alloc, x.numel)      # 32 > 24
         self.assertEqual(alloc, sn.outer_count * sn.aligned_chunk_size)  # 4*8=32
 
-    def test_unaligned_for_loop_in_source(self):
+    def test_unaligned_no_for_loop_in_source(self):
         _, cg = self._gen("broadcast_unaligned.onnx")
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 4u; _i++)", s)
+        self.assertNotIn("for (unsigned _i", s)
+        self.assertIn("run_op(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD, 4u,", s)
 
     def test_unaligned_run_op_size_is_chunk_not_stride(self):
         # The 'size' argument to run_op_at must be INFERENCE_Y_CHUNK (the raw
@@ -406,19 +409,20 @@ class TestBroadcastMixed(unittest.TestCase):
 
     # ---- source: both helpers present ------------------------------ #
 
-    def test_both_run_op_helpers_defined(self):
-        """Both run_op() and run_op_at() must be defined when the model
-        has a mix of broadcast and non-broadcast nodes."""
+    def test_only_run_op_helper_defined(self):
+        """All nodes use run_op() — no run_op_at() emitted."""
         _, cg = self._gen()
         s = cg.generate_source()
         self.assertIn("static void run_op(", s)
-        self.assertIn("static void run_op_at(", s)
+        self.assertNotIn("static void run_op_at(", s)
 
-    def test_add_emits_run_op_at(self):
+    def test_add_emits_broadcast_run_op(self):
         _, cg = self._gen()
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 4u; _i++)", s)
-        self.assertIn("run_op_at(", s)
+        self.assertIn(
+            "run_op(X, bias, add_Y, INFERENCE_ADD_Y_CHUNK, VECTOROP_ADD, 4u,", s
+        )
+        self.assertNotIn("run_op_at(", s)
 
     def test_relu_emits_plain_run_op(self):
         _, cg = self._gen()

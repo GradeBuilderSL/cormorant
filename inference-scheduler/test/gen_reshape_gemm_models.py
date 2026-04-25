@@ -185,6 +185,23 @@ def gen_unsqueeze_then_relu() -> None:
 
 
 # ---------------------------------------------------------------------------
+# relu_dropout_relu: Relu → Dropout → Relu  (inference passthrough)
+# X[1,8] → Relu → D[1,8] → Dropout(ratio=0.5) → Z[1,8] → Relu → Y[1,8]
+# In inference mode Dropout is identity; Y == Relu(X).
+# ---------------------------------------------------------------------------
+def gen_relu_dropout_relu() -> None:
+    relu1   = oh.make_node("Relu",    inputs=["X"],  outputs=["R"])
+    dropout = oh.make_node("Dropout", inputs=["R"],  outputs=["D"], ratio=0.5)
+    relu2   = oh.make_node("Relu",    inputs=["D"],  outputs=["Y"])
+    graph = oh.make_graph(
+        [relu1, dropout, relu2], "relu_dropout_relu",
+        inputs=[_vi("X", [1, 8])],
+        outputs=[_vi("Y", [1, 8])],
+    )
+    _save(oh.make_model(graph, opset_imports=_opset(11)), "relu_dropout_relu.onnx")
+
+
+# ---------------------------------------------------------------------------
 # gemm_transA_unsupported: transA=1 → must raise SchedulerError
 # ---------------------------------------------------------------------------
 def gen_gemm_transA_unsupported() -> None:
@@ -214,6 +231,7 @@ ALL_GENERATORS = [
     gen_reshape_gemm_pipeline,
     gen_squeeze_then_matmul,
     gen_unsqueeze_then_relu,
+    gen_relu_dropout_relu,
     gen_gemm_transA_unsupported,
 ]
 

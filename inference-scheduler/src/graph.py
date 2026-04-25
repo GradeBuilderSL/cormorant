@@ -281,7 +281,7 @@ class OnnxGraph:
                 sn = ConvNode.from_onnx_node(node, self._tensors, idx, align_elems)
             elif node.op_type in POOL_OP_TYPES:
                 sn = PoolNode.from_onnx_node(node, self._tensors, idx, align_elems)
-            elif node.op_type in ("Reshape", "Squeeze", "Unsqueeze"):
+            elif node.op_type in ("Reshape", "Squeeze", "Unsqueeze", "Dropout"):
                 sn = ReshapeNode.from_onnx_node(node, self._tensors, idx, align_elems)
             else:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)

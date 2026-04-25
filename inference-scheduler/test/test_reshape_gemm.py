@@ -28,7 +28,8 @@ def _m(name: str) -> str:
 
 def _models_exist() -> bool:
     return (os.path.isfile(_m("reshape_flatten.onnx"))
-            and os.path.isfile(_m("squeeze_then_matmul.onnx")))
+            and os.path.isfile(_m("squeeze_then_matmul.onnx"))
+            and os.path.isfile(_m("relu_dropout_relu.onnx")))
 
 
 def _gen(name: str) -> CodeGenerator:
@@ -655,3 +656,119 @@ class TestSqueezeSimulate(unittest.TestCase):
         x_q = gen._dtype.quantize(np.ones((1, 4), dtype=np.float64))
         y   = gen.simulate({"X": x_q})["Y"]
         np.testing.assert_allclose(y.flatten(), 1.0, atol=0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Dropout: inference passthrough (zero-cost buffer alias)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDropoutNodeUnit(unittest.TestCase):
+    """Dropout is handled as ReshapeNode (buffer alias) in inference mode."""
+
+    def _make_dropout(self, shape) -> ReshapeNode:
+        src = _tensor("src", shape)
+        out = _tensor("out", shape)
+        tensors = {"src": src, "out": out}
+        node = oh.make_node("Dropout", inputs=["src"], outputs=["out"], ratio=0.5)
+        return ReshapeNode.from_onnx_node(node, tensors, index=0, align_elems=8)
+
+    def test_dropout_creates_reshape_node(self):
+        sn = self._make_dropout([1, 8])
+        self.assertIsInstance(sn, ReshapeNode)
+
+    def test_dropout_kernel_name_empty(self):
+        sn = self._make_dropout([1, 8])
+        self.assertEqual(sn.kernel_name, "")
+
+    def test_dropout_emit_call_empty(self):
+        sn = self._make_dropout([1, 8])
+        self.assertEqual(sn.emit_call({}), "")
+
+    def test_dropout_emit_comment_says_dropout(self):
+        sn = self._make_dropout([1, 8])
+        self.assertIn("Dropout", sn.emit_comment())
+
+    def test_dropout_emit_comment_contains_alias(self):
+        sn = self._make_dropout([1, 8])
+        self.assertIn("alias", sn.emit_comment())
+
+    def test_dropout_output_shape_preserved(self):
+        sn = self._make_dropout([2, 16, 4, 4])
+        self.assertEqual(sn.inputs[0].shape, sn.output.shape)
+
+    def test_dropout_compatibility_shims(self):
+        sn = self._make_dropout([1, 8])
+        self.assertEqual(sn.outer_count,        1)
+        self.assertEqual(sn.chunk_size,         0)
+        self.assertEqual(sn.aligned_chunk_size, 0)
+        self.assertTrue(sn.a_advances)
+        self.assertTrue(sn.b_advances)
+        self.assertEqual(sn.arity, 1)
+
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_reshape_gemm_models.py first")
+class TestDropoutGraphDispatch(unittest.TestCase):
+    """OnnxGraph dispatches Dropout → ReshapeNode."""
+
+    def test_relu_dropout_relu_node_count(self):
+        g = OnnxGraph(_m("relu_dropout_relu.onnx"))
+        # Relu, Dropout (as ReshapeNode), Relu → 3 nodes
+        self.assertEqual(len(g.nodes), 3)
+
+    def test_relu_dropout_relu_node_types(self):
+        g     = OnnxGraph(_m("relu_dropout_relu.onnx"))
+        types = [type(sn) for sn in g.nodes]
+        self.assertIn(ScheduledNode, types)   # Relu ×2
+        self.assertIn(ReshapeNode,   types)   # Dropout
+
+    def test_dropout_node_is_reshape_node(self):
+        g  = OnnxGraph(_m("relu_dropout_relu.onnx"))
+        sn = next(n for n in g.nodes if isinstance(n, ReshapeNode))
+        self.assertEqual(sn.onnx_node.op_type, "Dropout")
+
+    def test_dropout_preserves_shape(self):
+        g  = OnnxGraph(_m("relu_dropout_relu.onnx"))
+        sn = next(n for n in g.nodes if isinstance(n, ReshapeNode))
+        self.assertEqual(sn.inputs[0].shape, sn.output.shape)
+
+    def test_dropout_alias_in_source(self):
+        gen = _gen("relu_dropout_relu.onnx")
+        s   = gen.generate_source()
+        self.assertIn("reshape alias", s)
+
+    def test_dropout_comment_says_dropout_in_source(self):
+        gen = _gen("relu_dropout_relu.onnx")
+        s   = gen.generate_source()
+        self.assertIn("Dropout(", s)
+
+    def test_dropout_no_hardware_kernel(self):
+        """Dropout-only alias → no hardware kernel instantiation."""
+        gen   = _gen("relu_dropout_relu.onnx")
+        names = [kd.name for kd in gen._active_kernels]
+        # Only VectorOPKernel (for the two Relu nodes); no extra kernel for Dropout
+        self.assertIn("VectorOPKernel", names)
+        self.assertEqual(len(names), 1)
+
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_reshape_gemm_models.py first")
+class TestDropoutSimulate(unittest.TestCase):
+    """Dropout passthrough simulation: output equals input (identity)."""
+
+    def test_dropout_output_shape(self):
+        gen    = _gen("relu_dropout_relu.onnx")
+        arrays = gen._simulate()
+        self.assertEqual(arrays["Y"].shape, (1, 8))
+
+    def test_dropout_is_identity_positive_input(self):
+        """X>0: Relu(Dropout(Relu(X))) = X since dropout passes through and relus are no-ops."""
+        gen = _gen("relu_dropout_relu.onnx")
+        x_q = gen._dtype.quantize(np.ones((1, 8), dtype=np.float64))
+        y   = gen.simulate({"X": x_q})["Y"]
+        np.testing.assert_array_equal(y, x_q)
+
+    def test_dropout_passes_negative_through_relu(self):
+        """Negative input: first Relu clamps to 0, Dropout(0)=0, second Relu(0)=0."""
+        gen = _gen("relu_dropout_relu.onnx")
+        x_q = gen._dtype.quantize(-np.ones((1, 8), dtype=np.float64))
+        y   = gen.simulate({"X": x_q})["Y"]
+        np.testing.assert_array_equal(y, np.zeros((1, 8)))

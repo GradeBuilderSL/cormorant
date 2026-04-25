@@ -101,25 +101,27 @@ class TestChunkOne(unittest.TestCase):
 
     # ---- source: broadcast loop with 16 iterations ----------------- #
 
-    def test_for_loop_count(self):
+    def test_broadcast_run_op_no_for_loop(self):
+        """Single run_op() call with outer=16 — no CPU for-loop."""
         _, cg = self._gen()
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 16u; _i++)", s)
+        self.assertNotIn("for (unsigned _i", s)
+        self.assertIn("16u, INFERENCE_Y_CHUNK_STRIDE, 0u);", s)
 
-    def test_run_op_at_uses_chunk_macro(self):
+    def test_run_op_size_is_chunk_not_stride(self):
         """size argument must be INFERENCE_Y_CHUNK (=1), not CHUNK_STRIDE (=8)."""
         _, cg = self._gen()
         s = cg.generate_source()
         self.assertIn("INFERENCE_Y_CHUNK, VECTOROP_ADD", s)
         self.assertNotIn("INFERENCE_Y_CHUNK_STRIDE, VECTOROP_ADD", s)
 
-    def test_only_run_op_at_in_source(self):
-        """Single broadcast node: run_op_at defined, plain run_op helper absent."""
+    def test_only_run_op_in_source(self):
+        """Single broadcast node: only run_op() defined, no run_op_at()."""
         _, cg = self._gen()
         s = cg.generate_source()
-        self.assertIn("run_op_at(", s)
-        # Broadcast-only model must not emit the non-offset run_op() helper.
-        self.assertNotIn("static void run_op(", s)
+        self.assertIn("static void run_op(", s)
+        self.assertNotIn("static void run_op_at(", s)
+        self.assertNotIn("run_op_at(", s)
 
     # ---- test_inference.c: fill iterates chunk-by-chunk ------------ #
 

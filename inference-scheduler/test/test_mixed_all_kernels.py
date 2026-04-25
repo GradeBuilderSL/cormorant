@@ -318,31 +318,31 @@ class TestMixedAllKernelsSource(unittest.TestCase):
     def test_skip_connection_add_uses_x_and_a(self):
         """Add(X, A) → B uses both original input and conv output."""
         s = self._src("mixed_all_skip_conv_matmul.onnx")
-        self.assertIn("run_op(X, A, B, 128u, VECTOROP_ADD)", s)
+        self.assertIn("run_op(X, A, B, 128u, VECTOROP_ADD, 1u, 0u, 0u);", s)
 
     # ---- norm (Sub + Mul) ---- #
 
     def test_norm_sub_call(self):
         s = self._src("mixed_all_norm_conv_project.onnx")
-        self.assertIn("run_op(X, offset, Z1, 256u, VECTOROP_SUB)", s)
+        self.assertIn("run_op(X, offset, Z1, 256u, VECTOROP_SUB, 1u, 0u, 0u);", s)
 
     def test_norm_mul_call(self):
         s = self._src("mixed_all_norm_conv_project.onnx")
-        self.assertIn("run_op(Z1, scale, Z2, 256u, VECTOROP_MUL)", s)
+        self.assertIn("run_op(Z1, scale, Z2, 256u, VECTOROP_MUL, 1u, 0u, 0u);", s)
 
     # ---- Relu6 path ---- #
 
     def test_matmul_relu_conv_final_relu6(self):
         s = self._src("mixed_all_matmul_relu_conv.onnx")
-        self.assertIn("run_op(B, NULL, Y, 512u, VECTOROP_RELU6)", s)
+        self.assertIn("run_op(B, NULL, Y, 512u, VECTOROP_RELU6, 1u, 0u, 0u);", s)
 
     def test_two_conv_final_relu6(self):
         s = self._src("mixed_all_two_conv_matmul_relu6.onnx")
-        self.assertIn("run_op(B, NULL, Y, 256u, VECTOROP_RELU6)", s)
+        self.assertIn("run_op(B, NULL, Y, 256u, VECTOROP_RELU6, 1u, 0u, 0u);", s)
 
     def test_sub_matmul_conv_final_relu6(self):
         s = self._src("mixed_all_sub_matmul_conv.onnx")
-        self.assertIn("run_op(B, NULL, Y, 256u, VECTOROP_RELU6)", s)
+        self.assertIn("run_op(B, NULL, Y, 256u, VECTOROP_RELU6, 1u, 0u, 0u);", s)
 
 
 # ---------------------------------------------------------------------------

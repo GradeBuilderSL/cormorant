@@ -16,8 +16,28 @@ set(VA_PLATFORM "xilinx_u250_gen3x16_xdma_3_1_202020_1" CACHE STRING
 set(VA_TARGET_CLOCK "" CACHE STRING
     "Target clock in MHz for the Vitis flow (empty = platform default).")
 
+# ---------------------------------------------------------------------------
+# Auto-detect Vitis HLS headers (ap_fixed.h) — same logic as pool/CMakeLists.txt
+# ---------------------------------------------------------------------------
+find_path(VA_HLS_INCLUDE_DIR NAMES ap_fixed.h
+    HINTS
+        $ENV{XILINX_HLS}/include
+        $ENV{XILINX_VITIS}/include
+        /mnt/data/xilinx/2025.2/Vitis/include
+    NO_DEFAULT_PATH
+    DOC "Vitis HLS include directory containing ap_fixed.h"
+)
+
+if(VA_HLS_INCLUDE_DIR)
+    message(STATUS "VectorOP: Vitis HLS headers found at ${VA_HLS_INCLUDE_DIR}")
+    set(_VA_DATA_TYPE_DEFAULT "ap_fixed<16,8>")
+else()
+    message(STATUS "VectorOP: Vitis HLS headers not found — defaulting to float")
+    set(_VA_DATA_TYPE_DEFAULT "float")
+endif()
+
 # Domain parameters
-set(VA_DATA_TYPE "float" CACHE STRING
+set(VA_DATA_TYPE "${_VA_DATA_TYPE_DEFAULT}" CACHE STRING
     "Element data type: float, double, half, uint8_t, or ap_fixed<W,I>.")
 set(VA_VECTOR_SIZE 1024 CACHE STRING
     "Default vector length shown in generated Config.h (informational).")
@@ -88,6 +108,10 @@ include_directories(
     include
     ${CMAKE_BINARY_DIR}
     SYSTEM ${VA_HLSLIB_DIR}/include ${Vitis_INCLUDE_DIRS})
+
+if(VA_HLS_INCLUDE_DIR)
+    include_directories(SYSTEM ${VA_HLS_INCLUDE_DIR})
+endif()
 
 set(VA_KERNEL_SRC ${CMAKE_SOURCE_DIR}/kernel/VectorOP.cpp)
 

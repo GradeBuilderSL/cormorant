@@ -5,7 +5,7 @@ and PoolNode for PoolingKernel.
 
 Each ScheduledNode wraps one onnx.NodeProto, holds resolved TensorInfo
 references for its inputs/outputs, and knows how to emit the corresponding
-run_op() / run_op_at() call in the generated C file.
+run_op() call in the generated C file.
 
 MatmulNode wraps a MatMul ONNX op and emits run_matmul() calls for
 the XMatmulkernel driver API.
@@ -53,10 +53,10 @@ may be smaller than the output, provided its shape right-aligns to the
 output and any broadcasted (size-1 or absent) dimensions form a contiguous
 leading block (no interleaved matching and broadcast dims).
 
-When broadcasting is detected the node emits a C for-loop calling
-run_op_at() (offset-based, no internal sync) instead of a single run_op()
-call.  The chunk stride is rounded up to INFERENCE_ALIGN_BYTES so every
-iteration starts at a 16-byte-aligned physical address.
+When broadcasting is detected the node emits a single run_op() call with
+outer, a_inc, and b_inc arguments so the hardware kernel handles the outer
+loop internally.  The chunk stride is rounded up to INFERENCE_ALIGN_BYTES
+so every inner burst starts at a 16-byte-aligned physical address.
 """
 
 from __future__ import annotations
@@ -429,29 +429,24 @@ class ScheduledNode:
         if self.outer_count == 1:
             y_lay = layouts.get(self.output.onnx_name)
             size  = y_lay.alloc if y_lay is not None else self.chunk_size
-            return f"    run_op({a}, {b}, {c}, {size}u, {op});"
+            return f"    run_op({a}, {b}, {c}, {size}u, {op}, 1u, 0u, 0u);"
 
-        # Broadcasting: loop over outer_count chunks with run_op_at().
-        # The chunk stride uses the CHUNK_STRIDE macro (INFERENCE_ALIGN_UP of
-        # CHUNK) so every iteration starts at an INFERENCE_ALIGN_BYTES-aligned
-        # physical address.  Gap elements between data blocks are never touched
-        # by VectorOPKernel (it receives the exact chunk_size as 'size').
+        # Broadcasting: single run_op() call with outer, a_inc, b_inc.
+        # VectorOPKernel handles the outer loop internally, advancing a/b/c
+        # by a_inc/b_inc/c_inc (c_inc = a_inc+b_inc) per outer iteration.
+        # The chunk stride is INFERENCE_ALIGN_UP(CHUNK) so every inner burst
+        # starts at an INFERENCE_ALIGN_BYTES-aligned physical address.
         chunk_macro  = f"INFERENCE_{c.upper()}_CHUNK"
         stride_macro = f"INFERENCE_{c.upper()}_CHUNK_STRIDE"
         n     = self.outer_count
-        a_off = f"_i * {stride_macro}" if self.a_advances else "0u"
-        b_off = (f"_i * {stride_macro}" if self.b_advances else "0u") \
+        a_inc = stride_macro if self.a_advances else "0u"
+        b_inc = (stride_macro if self.b_advances else "0u") \
                 if self.arity == 2 else "0u"
-        c_off = f"_i * {stride_macro}"
-
-        return "\n".join([
-            f"    for (unsigned _i = 0u; _i < {n}u; _i++) {{",
-            f"        run_op_at({a}, {a_off},"
-            f" {b}, {b_off},"
-            f" {c}, {c_off},"
-            f" {chunk_macro}, {op});",
-            "    }",
-        ])
+        return (
+            f"    run_op({a}, {b}, {c},"
+            f" {chunk_macro}, {op},"
+            f" {n}u, {a_inc}, {b_inc});"
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -1425,11 +1420,14 @@ class PoolNode:
 
 @dataclass
 class ReshapeNode:
-    """ONNX Reshape / Squeeze / Unsqueeze — a pure memory view, no hardware call.
+    """ONNX Reshape / Squeeze / Unsqueeze / Dropout — a pure memory view, no hardware call.
 
     The output buffer is an alias for the input buffer (same physical
     address, different shape metadata).  emit_call() returns an empty
     string; the alias assignment is emitted once in inference_init().
+
+    Dropout is the identity in inference mode (training_mode=False), so it
+    costs nothing at runtime.  The ratio and mask outputs are ignored.
     """
 
     kernel_name: ClassVar[str] = ""  # no hardware kernel

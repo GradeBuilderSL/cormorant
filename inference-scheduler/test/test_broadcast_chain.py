@@ -78,18 +78,20 @@ class TestBroadcastChain(unittest.TestCase):
 
     # ---- source: all three op calls correct ------------------------ #
 
-    def test_both_run_op_helpers_defined(self):
-        """Mix of broadcast and non-broadcast → both helpers must be emitted."""
+    def test_only_run_op_helper_defined(self):
+        """All nodes use run_op() — no run_op_at() emitted."""
         _, cg = self._gen()
         s = cg.generate_source()
         self.assertIn("static void run_op(", s)
-        self.assertIn("static void run_op_at(", s)
+        self.assertNotIn("static void run_op_at(", s)
 
-    def test_node0_emits_run_op_at_loop(self):
+    def test_node0_emits_broadcast_run_op(self):
         _, cg = self._gen()
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 4u; _i++)", s)
-        self.assertIn("run_op_at(", s)
+        self.assertIn(
+            "run_op(X, bias, add_Y, INFERENCE_ADD_Y_CHUNK, VECTOROP_ADD, 4u,", s
+        )
+        self.assertNotIn("run_op_at(", s)
 
     def test_node1_relu_uses_padded_size(self):
         """Relu must use size=32, not 24, to cover the full strided buffer."""

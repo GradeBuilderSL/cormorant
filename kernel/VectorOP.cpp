@@ -56,7 +56,10 @@ void VectorOPKernel(
     const Data_t* b,
     Data_t*       c,
     unsigned      size,
-    unsigned      op
+    unsigned      op,
+    unsigned      outer,
+    unsigned      a_inc,
+    unsigned      b_inc
 ) {
     #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0
     #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1
@@ -66,24 +69,34 @@ void VectorOPKernel(
     #pragma HLS INTERFACE s_axilite port=c      bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=size   bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=op     bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=outer  bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=a_inc  bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=b_inc  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return bundle=ctrl
 
-    for (unsigned i = 0; i < size; ++i) {
-        #pragma HLS PIPELINE II=1
-        Data_t ai = a[i];
-        Data_t ci;
-        // b[i] is read only for binary operations.  OP_RELU and OP_RELU6 are
-        // unary; keeping the read out of those cases avoids unnecessary AXI
-        // transactions on the gmem1 port when a unary op is selected.
-        switch (op) {
-            case OP_ADD:   ci = sub_add (ai, b[i]); break;
-            case OP_SUB:   ci = sub_sub (ai, b[i]); break;
-            case OP_MUL:   ci = sub_mul (ai, b[i]); break;
-            case OP_DIV:   ci = sub_div (ai, b[i]); break;
-            case OP_RELU:  ci = sub_relu (ai);       break;
-            case OP_RELU6: ci = sub_relu6(ai);       break;
-            default:       ci = ai;                  break;
+    // c_inc = a_inc + b_inc: valid because at most one is non-zero per call
+    // (the broadcasting input repeats at 0; the advancing input strides).
+    // When outer==1, a_inc==b_inc==0, so c_inc==0 and c[0+i]=c[i] as before.
+    const unsigned c_inc = a_inc + b_inc;
+
+    for (unsigned o = 0; o < outer; ++o) {
+        for (unsigned i = 0; i < size; ++i) {
+            #pragma HLS PIPELINE II=1
+            Data_t ai = a[o * a_inc + i];
+            Data_t ci;
+            // b[] is read only for binary operations.  OP_RELU and OP_RELU6
+            // are unary; keeping the read out of those cases avoids unnecessary
+            // AXI transactions on the gmem1 port when a unary op is selected.
+            switch (op) {
+                case OP_ADD:   ci = sub_add (ai, b[o * b_inc + i]); break;
+                case OP_SUB:   ci = sub_sub (ai, b[o * b_inc + i]); break;
+                case OP_MUL:   ci = sub_mul (ai, b[o * b_inc + i]); break;
+                case OP_DIV:   ci = sub_div (ai, b[o * b_inc + i]); break;
+                case OP_RELU:  ci = sub_relu (ai);                   break;
+                case OP_RELU6: ci = sub_relu6(ai);                   break;
+                default:       ci = ai;                              break;
+            }
+            c[o * c_inc + i] = ci;
         }
-        c[i] = ci;
     }
 }

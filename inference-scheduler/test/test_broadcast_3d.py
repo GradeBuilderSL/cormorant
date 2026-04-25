@@ -107,11 +107,12 @@ class TestBroadcast3D(unittest.TestCase):
 
     # ---- source: broadcast loop ------------------------------------ #
 
-    def test_for_loop_count(self):
-        """Outer broadcast loop must iterate 6 times."""
+    def test_broadcast_run_op_with_outer_six(self):
+        """Single run_op() call with outer=6 — no CPU for-loop."""
         _, cg = self._gen()
         s = cg.generate_source()
-        self.assertIn("for (unsigned _i = 0u; _i < 6u; _i++)", s)
+        self.assertIn("6u, INFERENCE_Y_CHUNK_STRIDE, 0u);", s)
+        self.assertNotIn("for (unsigned _i", s)
 
     def test_run_op_at_uses_chunk_macro(self):
         _, cg = self._gen()

@@ -62,9 +62,23 @@ enum Op : unsigned {
 // Interface:
 //   a, b    — AXI4 master (m_axi) read ports; base addresses via AXI-Lite
 //   c       — AXI4 master (m_axi) write port;  base address  via AXI-Lite
-//   size    — AXI-Lite register: number of elements to process
+//   size    — AXI-Lite register: elements per inner chunk
 //   op      — AXI-Lite register: operation selector (Op enum)
+//   outer   — AXI-Lite register: number of outer broadcasting iterations
+//             (1 = normal non-broadcast operation)
+//   a_inc   — AXI-Lite register: element stride for a per outer iteration
+//             (0 = a repeats every outer iteration; size = a advances)
+//   b_inc   — AXI-Lite register: element stride for b per outer iteration
+//             (0 = b repeats every outer iteration; size = b advances)
 //   return  — AXI-Lite control: ap_ctrl_hs (start/done/idle/ready)
+//
+// The kernel processes outer × size elements:
+//   c[o * (a_inc+b_inc) + i] = op(a[o*a_inc + i], b[o*b_inc + i])
+//   for o in 0..outer-1, i in 0..size-1
+//
+// For non-broadcast use set outer=1, a_inc=0, b_inc=0.
+// For broadcast with a advancing: outer=N, a_inc=aligned_chunk, b_inc=0.
+// For broadcast with b advancing: outer=N, a_inc=0, b_inc=aligned_chunk.
 //
 // For unary operations (OP_RELU, OP_RELU6) only a[] is read; no AXI
 // transactions are issued on the gmem1 port and b_addr is ignored.
@@ -74,5 +88,8 @@ void VectorOPKernel(
     const Data_t* b,
     Data_t*       c,
     unsigned      size,
-    unsigned      op
+    unsigned      op,
+    unsigned      outer,
+    unsigned      a_inc,
+    unsigned      b_inc
 );
