@@ -3,34 +3,21 @@
 //
 // Each test computes the same convolution with two independent implementations:
 //
-//   ref_conv()    — naive 7-nested-loop ground-truth oracle.
-//                   Uses AccData_t for accumulation and saturate_cast<Data_t>
-//                   for output, matching the kernel's arithmetic policy exactly.
-//
-//   ConvKernel()  — tiled reference that mirrors the HLS kernel structure.
+//   ref_conv()          — naive 7-nested-loop ground-truth oracle.
+//   ref_depthwise_conv()— ground truth for depthwise (group=in_ch).
+//   ConvKernel()        — tiled reference that mirrors the HLS kernel structure.
 //
 // Outputs are compared element-by-element with zero tolerance for fixed-point
 // types (both share the same accumulator type and saturation policy), and
 // relative 1e-5 tolerance for float.
 //
-// Test matrix:
-//   Shape tests:
-//     1×1 kernel (no spatial reduction)
-//     3×3, no padding
-//     3×3, pad=1 (same-size output)
-//     3×3, stride=2
-//     5×5 kernel
-//     Large spatial: 14×14 with multiple m_tile and ic_tile iterations
-//   Optional bias:
-//     Without bias
-//     With bias
-//   Batch > 1
-//   Partial TILE_IC:  in_ch = TILE_IC + 5
-//   Partial TILE_M:   out_ch = TILE_M + 3
-//   Dilation = 2
-//   Saturation:
-//     Positive overflow → AP_MAX
-//     Negative overflow → AP_MIN
+// Test matrix (standard conv):
+//   1×1 kernel, 3×3 various pads/strides, 5×5 kernel, large spatial,
+//   partial TILE_IC, partial TILE_M, dilation=2, batch>1, bias,
+//   saturation (ap_fixed only).
+//
+// Test matrix (depthwise conv, is_depthwise=1):
+//   3×3 depthwise, 3×3 depthwise+bias, partial TILE_M, dilation=2.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -50,7 +37,7 @@ static const double kSatMax = static_cast<double>(saturate_cast<Data_t>( 1e30));
 static const double kSatMin = static_cast<double>(saturate_cast<Data_t>(-1e30));
 
 // ---------------------------------------------------------------------------
-// Naive reference — 7-nested-loop ground truth.
+// Naive reference — standard conv ground truth (group=1).
 // ---------------------------------------------------------------------------
 static void ref_conv(
     const Data_t* x,
@@ -103,6 +90,59 @@ static void ref_conv(
 }
 
 // ---------------------------------------------------------------------------
+// Naive reference — depthwise conv ground truth (group=in_ch).
+//
+// Weight layout: [ch][1][kh][kw] → offset m*kh*kw + khi*kw + kwi
+// out_ch == in_ch == ch.
+// ---------------------------------------------------------------------------
+static void ref_depthwise_conv(
+    const Data_t* x,
+    const Data_t* weight,
+    const Data_t* bias,
+    Data_t*       y,
+    unsigned      batch,
+    unsigned      ch,      // in_ch == out_ch
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      out_h,
+    unsigned      out_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left,
+    unsigned      has_bias)
+{
+    for (unsigned n = 0; n < batch; n++) {
+        for (unsigned m = 0; m < ch; m++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned ow = 0; ow < out_w; ow++) {
+                    AccData_t sum = has_bias ? AccData_t(bias[m]) : AccData_t(0);
+                    for (unsigned khi = 0; khi < kh; khi++) {
+                        const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                     - (int)pad_top;
+                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                            const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                         - (int)pad_left;
+                            if (ih >= 0 && (unsigned)ih < in_h &&
+                                iw >= 0 && (unsigned)iw < in_w)
+                            {
+                                sum += AccData_t(x[(n*ch+m)*in_h*in_w + ih*in_w + iw])
+                                     * AccData_t(weight[m*kh*kw + khi*kw + kwi]);
+                            }
+                        }
+                    }
+                    y[(n*ch+m)*out_h*out_w + oh*out_w + ow] = saturate_cast<Data_t>(sum);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Output spatial size helper.
 // ---------------------------------------------------------------------------
 static unsigned out_size(unsigned in_sz, unsigned k, unsigned stride,
@@ -137,6 +177,7 @@ struct ConvParams {
     unsigned dilation_h, dilation_w;
     unsigned pad_top, pad_left, pad_bottom, pad_right;
     bool     has_bias;
+    bool     is_depthwise;
 };
 
 static int run_test(const char* name, const ConvParams& p,
@@ -153,19 +194,32 @@ static int run_test(const char* name, const ConvParams& p,
     std::vector<Data_t> y_ref(y_size, Data_t(0));
     std::vector<Data_t> y_got(y_size, Data_t(0));
 
-    ref_conv(x_data.data(), w_data.data(),
-             p.has_bias ? b_data.data() : nullptr,
-             y_ref.data(),
-             p.batch, p.in_ch, p.in_h, p.in_w,
-             p.out_ch, out_h, out_w,
-             p.kh, p.kw,
-             p.stride_h, p.stride_w,
-             p.dilation_h, p.dilation_w,
-             p.pad_top, p.pad_left,
-             p.has_bias ? 1u : 0u);
+    if (p.is_depthwise) {
+        ref_depthwise_conv(x_data.data(), w_data.data(),
+                           p.has_bias ? b_data.data() : nullptr,
+                           y_ref.data(),
+                           p.batch, p.in_ch, p.in_h, p.in_w,
+                           out_h, out_w,
+                           p.kh, p.kw,
+                           p.stride_h, p.stride_w,
+                           p.dilation_h, p.dilation_w,
+                           p.pad_top, p.pad_left,
+                           p.has_bias ? 1u : 0u);
+    } else {
+        ref_conv(x_data.data(), w_data.data(),
+                 p.has_bias ? b_data.data() : nullptr,
+                 y_ref.data(),
+                 p.batch, p.in_ch, p.in_h, p.in_w,
+                 p.out_ch, out_h, out_w,
+                 p.kh, p.kw,
+                 p.stride_h, p.stride_w,
+                 p.dilation_h, p.dilation_w,
+                 p.pad_top, p.pad_left,
+                 p.has_bias ? 1u : 0u);
+    }
 
     ConvKernel(x_data.data(), w_data.data(),
-               p.has_bias ? b_data.data() : b_data.data(),  // always valid ptr
+               b_data.data(),  // always a valid pointer (kernel guards by has_bias)
                y_got.data(),
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
@@ -173,7 +227,8 @@ static int run_test(const char* name, const ConvParams& p,
                p.stride_h, p.stride_w,
                p.dilation_h, p.dilation_w,
                p.pad_top, p.pad_left,
-               p.has_bias ? 1u : 0u);
+               p.has_bias ? 1u : 0u,
+               p.is_depthwise ? 1u : 0u);
 
     int mismatches = 0;
     for (unsigned i = 0; i < y_size; i++) {
@@ -190,7 +245,8 @@ static int run_test(const char* name, const ConvParams& p,
     const char* status = (mismatches == 0) ? "PASS" : "FAIL";
     printf("%-55s %s", name, status);
     if (mismatches > 0) printf("  (%d mismatches)", mismatches);
-    printf("  [batch=%u C=%u H=%u W=%u M=%u kH=%u kW=%u s=%u,%u d=%u,%u p=%u,%u out=%ux%u]\n",
+    printf("  [%s batch=%u C=%u H=%u W=%u M=%u kH=%u kW=%u s=%u,%u d=%u,%u p=%u,%u out=%ux%u]\n",
+           p.is_depthwise ? "DW" : "STD",
            p.batch, p.in_ch, p.in_h, p.in_w, p.out_ch,
            p.kh, p.kw, p.stride_h, p.stride_w,
            p.dilation_h, p.dilation_w, p.pad_top, p.pad_left,
@@ -233,7 +289,23 @@ int main()
         p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 2.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    2.0f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
+        total_failures += run_test("1x1 kernel, 1ch, no bias", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: 1×1 kernel, single channel, no bias
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=1; p.in_h=5; p.in_w=5; p.out_ch=1;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 2.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    2.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -249,7 +321,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -265,7 +337,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -281,7 +353,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -297,7 +369,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=true;
+        p.has_bias=true; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
@@ -313,7 +385,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -329,7 +401,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -345,7 +417,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=true;
+        p.has_bias=true; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
@@ -361,7 +433,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=2; p.dilation_w=2;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    1.0f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -377,7 +449,7 @@ int main()
         p.kh=5; p.kw=5; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -393,7 +465,7 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
-        p.has_bias=true;
+        p.has_bias=true; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.25f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.25f, rng);
@@ -409,7 +481,7 @@ int main()
         p.kh=3; p.kw=5; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
@@ -425,16 +497,101 @@ int main()
         p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=1; p.pad_left=1; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=false;
+        p.has_bias=false; p.is_depthwise=false;
         auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
         total_failures += run_test("7x7, stride=2, asymmetric pad [1,1,0,0]", p, x, w, b);
     }
 
+    // -----------------------------------------------------------------------
+    // Depthwise tests (is_depthwise=1).
+    // Weight layout: [ch][1][kh][kw]  (no in_ch dimension in weight)
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Test 14 (DW): 3×3 depthwise, 4 channels, no bias
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=4; p.in_h=8; p.in_w=8; p.out_ch=4;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           1.0f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW 3x3, 4ch, no pad, no bias", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 15 (DW): 3×3 depthwise + bias, same padding
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=4; p.in_h=8; p.in_w=8; p.out_ch=4;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW 3x3, 4ch, pad=1, has_bias", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 16 (DW): Partial TILE_M — channels = TILE_M + 3
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileM+3; p.in_h=6; p.in_w=6; p.out_ch=kTileM+3;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW partial M tile (ch=TILE_M+3)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 17 (DW): Depthwise with dilation=2
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=4; p.in_h=9; p.in_w=9; p.out_ch=4;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=2; p.dilation_w=2;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW 3x3 dilation=2, 4ch", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 18 (DW): Stride=2 depthwise
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=8; p.in_w=8; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW stride=2, 8ch, pad=1", p, x, w, b);
+    }
+
 #ifdef CONV_HAVE_APFIXED
     // -----------------------------------------------------------------------
-    // Test 14: Saturation — positive overflow
+    // Test 19: Saturation — positive overflow
     // All weights = +1, all inputs = kSatMax; kernel_size=1, C=1
     // Bias = kSatMax; output must saturate at kSatMax.
     // -----------------------------------------------------------------------
@@ -444,7 +601,7 @@ int main()
         p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=true;
+        p.has_bias=true; p.is_depthwise=false;
         const unsigned n_x = p.batch*p.in_ch*p.in_h*p.in_w;
         const unsigned n_w = p.out_ch*p.in_ch*p.kh*p.kw;
         std::vector<Data_t> x(n_x, Data_t(kSatMax));
@@ -454,7 +611,7 @@ int main()
     }
 
     // -----------------------------------------------------------------------
-    // Test 15: Saturation — negative overflow
+    // Test 20: Saturation — negative overflow
     // -----------------------------------------------------------------------
     {
         ConvParams p{};
@@ -462,7 +619,7 @@ int main()
         p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
         p.dilation_h=1; p.dilation_w=1;
         p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
-        p.has_bias=true;
+        p.has_bias=true; p.is_depthwise=false;
         const unsigned n_x = p.batch*p.in_ch*p.in_h*p.in_w;
         const unsigned n_w = p.out_ch*p.in_ch*p.kh*p.kw;
         std::vector<Data_t> x(n_x, Data_t(kSatMax));

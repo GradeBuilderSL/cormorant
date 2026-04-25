@@ -71,4 +71,17 @@
 			};
 		};
 	};
+
+	/*uio*/
+	fragment@6 {
+		target = <&amba>;
+		overlay6: __overlay__ {
+			fabric_pool: fabric_pool@a0030000 {
+				interrupts = <0x00 0x62 0x04>;
+				interrupt-parent = <&gic>;
+				compatible = "generic-uio";
+				reg = <0x00 0xa0030000 0x00 0x10000>;
+			};
+		};
+	};
 };

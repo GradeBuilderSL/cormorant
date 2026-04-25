@@ -268,10 +268,8 @@ def gen_conv_relu_chain() -> None:
 
 
 # ---------------------------------------------------------------------------
-# conv_depthwise: depthwise convolution (groups == in_channels)
-# Not supported by ConvKernel (groups > 1) — must raise SchedulerError
-# This model is intentionally invalid for the scheduler and is used only in
-# test_conv.py::TestConvNodeValidation to verify the error is raised.
+# conv_depthwise: depthwise convolution (group == in_channels == 4)
+# Supported by ConvKernel (is_depthwise=1 path).
 # X[1,4,8,8] * W[4,1,3,3] → Y[1,4,6,6]  groups=4
 # ---------------------------------------------------------------------------
 def gen_conv_depthwise() -> None:
@@ -293,6 +291,59 @@ def gen_conv_depthwise() -> None:
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     _save(model, "conv_depthwise.onnx")
+
+
+# ---------------------------------------------------------------------------
+# conv_depthwise_bias: depthwise convolution with bias
+# X[1,8,8,8] * W[8,1,3,3] + B[8] → Y[1,8,6,6]  groups=8
+# ---------------------------------------------------------------------------
+def gen_conv_depthwise_bias() -> None:
+    w_data = (np.random.randn(8, 1, 3, 3) * 0.25).astype(np.float32)
+    b_data = np.zeros(8, dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    b_init = numpy_helper.from_array(b_data, name="B")
+
+    conv = helper.make_node(
+        "Conv",
+        inputs=["X", "W", "B"],
+        outputs=["Y"],
+        kernel_shape=[3, 3],
+        group=8,
+    )
+    graph = helper.make_graph(
+        [conv], "conv_depthwise_bias",
+        inputs=[_vi("X", [1, 8, 8, 8])],
+        outputs=[_vi("Y", [1, 8, 6, 6])],
+        initializer=[w_init, b_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_depthwise_bias.onnx")
+
+
+# ---------------------------------------------------------------------------
+# conv_grouped_invalid: grouped conv with group != 1 and group != in_ch
+# Not supported by ConvKernel — must raise SchedulerError.
+# X[1,4,8,8] * W[4,2,3,3] → Y[1,4,6,6]  groups=2 (partial grouping)
+# ---------------------------------------------------------------------------
+def gen_conv_grouped_invalid() -> None:
+    w_data = (np.random.randn(4, 2, 3, 3) * 0.25).astype(np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+
+    conv = helper.make_node(
+        "Conv",
+        inputs=["X", "W"],
+        outputs=["Y"],
+        kernel_shape=[3, 3],
+        group=2,
+    )
+    graph = helper.make_graph(
+        [conv], "conv_grouped_invalid",
+        inputs=[_vi("X", [1, 4, 8, 8])],
+        outputs=[_vi("Y", [1, 4, 6, 6])],
+        initializer=[w_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_grouped_invalid.onnx")
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +465,8 @@ if __name__ == "__main__":
     gen_conv_then_add_flat()
     gen_conv_relu_chain()
     gen_conv_depthwise()
+    gen_conv_depthwise_bias()
+    gen_conv_grouped_invalid()
     gen_conv_dilation()
     gen_conv_auto_pad_valid()
     gen_conv_two_layer_vgg()

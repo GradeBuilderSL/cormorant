@@ -405,9 +405,9 @@ class TestMixedAllKernelsConvParams(unittest.TestCase):
         self.assertIn("8u, 4u, 8u,", s)        # OC, OH, OW
 
     def test_conv_with_bias_flag_one(self):
-        """Conv with bias: has_bias=1u."""
+        """Conv with bias: has_bias=1u, is_depthwise=0u → call ends with '1u, 0u);'."""
         s = self._src("mixed_all_conv_matmul_relu.onnx")
-        self.assertIn("1u);", s)
+        self.assertIn("1u, 0u);", s)
 
     def test_conv_without_bias_flag_zero(self):
         """Conv without bias: has_bias=0u."""

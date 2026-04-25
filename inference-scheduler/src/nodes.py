@@ -879,6 +879,7 @@ class ConvNode:
     pad_top:     int = 0
     pad_left:    int = 0
     has_bias:    bool = False
+    is_depthwise: bool = False
 
     # Compatibility shims — never set by callers.
     outer_count:        int  = field(default=1,    init=False)
@@ -944,7 +945,7 @@ class ConvNode:
             )
         if len(w_info.shape) != 4:
             raise SchedulerError(
-                f"Conv node '{node.name}': weight must be 4-D (M,C,kH,kW), "
+                f"Conv node '{node.name}': weight must be 4-D (M,C/g,kH,kW), "
                 f"got shape {w_info.shape}."
             )
         if len(y_info.shape) != 4:
@@ -959,25 +960,44 @@ class ConvNode:
         def _int_list(name: str, default: List[int]) -> List[int]:
             return (list(attrs[name].ints) if name in attrs else default)
 
-        # ConvKernel does not support grouped (depthwise) convolutions.
-        # Check this before channel validation to give a clearer error.
-        group = attrs["group"].i if "group" in attrs else 1
-        if group != 1:
-            raise SchedulerError(
-                f"Conv node '{node.name}': grouped convolution (group={group}) "
-                f"is not supported by ConvKernel. "
-                f"Only standard convolution (group=1) is supported."
-            )
-
         n_val, c_in, h_in, w_in = x_info.shape
         m_val, c_w, kh_val, kw_val = w_info.shape
         _, _, h_out, w_out = y_info.shape
 
-        if c_w != c_in:
+        group = attrs["group"].i if "group" in attrs else 1
+
+        # Validate group and determine mode.
+        # group=1      → standard conv: weight[M, C, kH, kW], c_w == c_in.
+        # group=in_ch  → depthwise conv: weight[C, 1, kH, kW], c_w == 1, M == C.
+        # other values → not supported.
+        if group == 1:
+            is_dw = False
+            if c_w != c_in:
+                raise SchedulerError(
+                    f"Conv node '{node.name}': weight in_channels={c_w} "
+                    f"!= input in_channels={c_in}."
+                )
+        elif group == c_in:
+            is_dw = True
+            if c_w != 1:
+                raise SchedulerError(
+                    f"Conv node '{node.name}': depthwise conv (group={group}) "
+                    f"weight must have 1 channel per filter (C/group=1), "
+                    f"got {c_w}."
+                )
+            if m_val != c_in:
+                raise SchedulerError(
+                    f"Conv node '{node.name}': depthwise conv (group={group}) "
+                    f"requires out_ch ({m_val}) == in_ch ({c_in})."
+                )
+        else:
             raise SchedulerError(
-                f"Conv node '{node.name}': weight in_channels={c_w} "
-                f"!= input in_channels={c_in}."
+                f"Conv node '{node.name}': grouped convolution (group={group}) "
+                f"is not supported by ConvKernel. "
+                f"Only standard (group=1) and depthwise (group=in_ch) "
+                f"convolutions are supported."
             )
+
         if m_val != y_info.shape[1]:
             raise SchedulerError(
                 f"Conv node '{node.name}': weight out_channels={m_val} "
@@ -1053,6 +1073,7 @@ class ConvNode:
             pad_top=pad_top_val,
             pad_left=pad_left_val,
             has_bias=has_b,
+            is_depthwise=is_dw,
         )
 
     # ------------------------------------------------------------------ #
@@ -1069,6 +1090,7 @@ class ConvNode:
             f"{self.kh}x{self.kw}"
             if self.kh != self.kw else f"{self.kh}"
         )
+        dw_str = " dw" if self.is_depthwise else ""
         return (
             f"    /* [{self.index}] Conv({x_name}, {w_name}{bias_str})"
             f" -> {self.output.onnx_name}"
@@ -1076,7 +1098,7 @@ class ConvNode:
             f"→[{self.batch},{self.out_ch},{self.out_h},{self.out_w}]"
             f"  k={k_str}"
             f" s={self.stride_h}x{self.stride_w}"
-            f" p={self.pad_top},{self.pad_left} */"
+            f" p={self.pad_top},{self.pad_left}{dw_str} */"
         )
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
@@ -1085,6 +1107,7 @@ class ConvNode:
         bias   = self.inputs[2].c_name if self.has_bias else "NULL"
         y      = self.output.c_name
         hb     = "1u" if self.has_bias else "0u"
+        idw    = "1u" if self.is_depthwise else "0u"
         return (
             f"    run_conv({x}, {weight}, {bias}, {y},\n"
             f"             {self.batch}u, {self.in_ch}u,"
@@ -1093,7 +1116,7 @@ class ConvNode:
             f"             {self.kh}u, {self.kw}u,"
             f" {self.stride_h}u, {self.stride_w}u,\n"
             f"             {self.dilation_h}u, {self.dilation_w}u,"
-            f" {self.pad_top}u, {self.pad_left}u, {hb});"
+            f" {self.pad_top}u, {self.pad_left}u, {hb}, {idw});"
         )
 
 
@@ -1402,7 +1425,7 @@ class PoolNode:
 
 @dataclass
 class ReshapeNode:
-    """ONNX Reshape operator — a pure memory view, no hardware call.
+    """ONNX Reshape / Squeeze / Unsqueeze — a pure memory view, no hardware call.
 
     The output buffer is an alias for the input buffer (same physical
     address, different shape metadata).  emit_call() returns an empty
@@ -1433,21 +1456,22 @@ class ReshapeNode:
         index:       int,
         align_elems: int = 8,
     ) -> "ReshapeNode":
+        op_type  = node.op_type
         src_name = node.input[0]
         out_name = node.output[0]
         if src_name not in tensors:
             raise SchedulerError(
-                f"Reshape node '{node.name}': source tensor '{src_name}' not found."
+                f"{op_type} node '{node.name}': source tensor '{src_name}' not found."
             )
         if out_name not in tensors:
             raise SchedulerError(
-                f"Reshape node '{node.name}': output tensor '{out_name}' not found."
+                f"{op_type} node '{node.name}': output tensor '{out_name}' not found."
             )
         src = tensors[src_name]
         out = tensors[out_name]
         if src.numel != out.numel:
             raise SchedulerError(
-                f"Reshape node '{node.name or 'Reshape'}': "
+                f"{op_type} node '{node.name or op_type}': "
                 f"source numel={src.numel} (shape={src.shape}) != "
                 f"output numel={out.numel} (shape={out.shape}). "
                 f"Only view-reshapes (same number of elements) are supported."
@@ -1457,7 +1481,7 @@ class ReshapeNode:
 
     def emit_comment(self) -> str:
         return (
-            f"    /* [{self.index}] Reshape({self.inputs[0].onnx_name})"
+            f"    /* [{self.index}] {self.onnx_node.op_type}({self.inputs[0].onnx_name})"
             f" -> {self.output.onnx_name}"
             f"  {self.inputs[0].shape} → {self.output.shape}"
             f"  (buffer alias, no hardware call) */"

@@ -149,6 +149,42 @@ def gen_reshape_gemm_pipeline() -> None:
 
 
 # ---------------------------------------------------------------------------
+# squeeze_then_matmul: GlobalAveragePool → Squeeze → MatMul (MobileNet head)
+# X[1,4,4,4] → Pool → P[1,4,1,1] → Squeeze(axes=[2,3]) → F[1,4] → Y[1,8]
+# ---------------------------------------------------------------------------
+def gen_squeeze_then_matmul() -> None:
+    w_data = np.full((4, 8), 0.25, dtype=np.float32)
+    w_init = _init("W", w_data)
+
+    pool    = oh.make_node("GlobalAveragePool", inputs=["X"],       outputs=["P"])
+    squeeze = oh.make_node("Squeeze",           inputs=["P"],       outputs=["F"],
+                           axes=[2, 3])
+    matmul  = oh.make_node("MatMul",            inputs=["F", "W"],  outputs=["Y"])
+    graph = oh.make_graph(
+        [pool, squeeze, matmul], "squeeze_then_matmul",
+        inputs=[_vi("X", [1, 4, 4, 4])],
+        outputs=[_vi("Y", [1, 8])],
+        initializer=[w_init],
+    )
+    _save(oh.make_model(graph, opset_imports=_opset(7)), "squeeze_then_matmul.onnx")
+
+
+# ---------------------------------------------------------------------------
+# unsqueeze_then_relu: Unsqueeze → Relu  (adds size-1 dims, then activates)
+# X[1,4] → Unsqueeze(axes=[2,3]) → E[1,4,1,1] → Relu → Y[1,4,1,1]
+# ---------------------------------------------------------------------------
+def gen_unsqueeze_then_relu() -> None:
+    unsqueeze = oh.make_node("Unsqueeze", inputs=["X"],  outputs=["E"], axes=[2, 3])
+    relu      = oh.make_node("Relu",      inputs=["E"],  outputs=["Y"])
+    graph = oh.make_graph(
+        [unsqueeze, relu], "unsqueeze_then_relu",
+        inputs=[_vi("X", [1, 4])],
+        outputs=[_vi("Y", [1, 4, 1, 1])],
+    )
+    _save(oh.make_model(graph, opset_imports=_opset(7)), "unsqueeze_then_relu.onnx")
+
+
+# ---------------------------------------------------------------------------
 # gemm_transA_unsupported: transA=1 → must raise SchedulerError
 # ---------------------------------------------------------------------------
 def gen_gemm_transA_unsupported() -> None:
@@ -176,6 +212,8 @@ ALL_GENERATORS = [
     gen_gemm_with_bias,
     gen_gemm_chain,
     gen_reshape_gemm_pipeline,
+    gen_squeeze_then_matmul,
+    gen_unsqueeze_then_relu,
     gen_gemm_transA_unsupported,
 ]
 

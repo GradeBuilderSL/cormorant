@@ -21,7 +21,9 @@ def _conv_model(name: str) -> str:
 
 
 def _conv_models_exist() -> bool:
-    return os.path.isfile(_conv_model("conv_simple.onnx"))
+    return (os.path.isfile(_conv_model("conv_simple.onnx")) and
+            os.path.isfile(_conv_model("conv_depthwise.onnx")) and
+            os.path.isfile(_conv_model("conv_grouped_invalid.onnx")))
 
 
 def _gen(name: str) -> CodeGenerator:
@@ -61,11 +63,20 @@ class TestConvNodeValidation(unittest.TestCase):
         self.assertFalse(sn.has_bias)
         self.assertEqual(len(sn.inputs), 2)
 
-    def test_depthwise_raises(self):
+    def test_depthwise_parses(self):
+        """conv_depthwise.onnx (group=4, in_ch=4) must parse without error."""
         path = _conv_model("conv_depthwise.onnx")
+        g = OnnxGraph(path)
+        sn = g.nodes[0]
+        self.assertIsInstance(sn, ConvNode)
+        self.assertTrue(sn.is_depthwise)
+
+    def test_grouped_not_depthwise_raises(self):
+        """group=2 with in_ch=4 is unsupported grouped conv; must raise."""
+        path = _conv_model("conv_grouped_invalid.onnx")
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(path)
-        self.assertIn("group=4", str(cm.exception))
+        self.assertIn("group=2", str(cm.exception))
         self.assertIn("not supported", str(cm.exception))
 
     def test_stride_parsed(self):
@@ -241,15 +252,13 @@ class TestConvSource(unittest.TestCase):
 
     def test_conv_args_with_bias(self):
         s = self._src("conv_with_bias.onnx")
-        # has_bias=1 → last param is 1u; bias arg is the buffer name (not NULL)
-        self.assertIn("1u);", s)
+        # has_bias=1u, is_depthwise=0u → call ends with "1u, 0u);"
+        self.assertIn("1u, 0u);", s)
         # The run_conv call should use the bias buffer name, not NULL
-        # (NULL still appears in the run_conv helper comment — that's fine)
         self.assertNotIn(", NULL, ", s)
 
     def test_kernel_instance_registers(self):
         s = self._src("conv_simple.onnx")
-        # Use prefix matching (driver uses padded spaces before '(')
         for fn in [
             "XConvkernel_Set_x",
             "XConvkernel_Set_weight",
@@ -263,6 +272,7 @@ class TestConvSource(unittest.TestCase):
             "XConvkernel_Set_dilation_h",
             "XConvkernel_Set_pad_top",
             "XConvkernel_Set_has_bias",
+            "XConvkernel_Set_is_depthwise",
             "XConvkernel_Start",
             "XConvkernel_IsDone",
         ]:
@@ -442,7 +452,7 @@ class TestConvEmit(unittest.TestCase):
         gen = CodeGenerator(g, model_path=_conv_model("conv_with_bias.onnx"))
         call = sn.emit_call(gen._layouts)
         self.assertIn("run_conv(", call)
-        self.assertIn("1u);", call)   # has_bias = 1u
+        self.assertIn("1u, 0u);", call)   # has_bias=1u, is_depthwise=0u
 
     def test_emit_call_correct_dims(self):
         g = OnnxGraph(_conv_model("conv_stride2.onnx"))
@@ -597,6 +607,100 @@ class TestConvTwoLayerVGG(unittest.TestCase):
         # Second call uses in_ch=64 and in_h/in_w=222
         self.assertIn("222u,", s)
         self.assertIn("64u,",  s)
+
+
+# ---------------------------------------------------------------------------
+# Depthwise convolution
+# ---------------------------------------------------------------------------
+
+def _dw_models_exist() -> bool:
+    return (os.path.isfile(_conv_model("conv_depthwise.onnx")) and
+            os.path.isfile(_conv_model("conv_depthwise_bias.onnx")))
+
+
+@unittest.skipUnless(_dw_models_exist(),
+                     "Run test/gen_conv_models.py first")
+class TestConvDepthwise(unittest.TestCase):
+    """ConvNode correctly handles depthwise convolution (group=in_ch)."""
+
+    def _node(self, name: str) -> ConvNode:
+        g = OnnxGraph(_conv_model(name))
+        return g.nodes[0]
+
+    def test_depthwise_is_depthwise_flag(self):
+        sn = self._node("conv_depthwise.onnx")
+        self.assertTrue(sn.is_depthwise)
+
+    def test_standard_not_depthwise(self):
+        sn = self._node("conv_simple.onnx")
+        self.assertFalse(sn.is_depthwise)
+
+    def test_depthwise_geometry(self):
+        sn = self._node("conv_depthwise.onnx")
+        # X[1,4,8,8], W[4,1,3,3], Y[1,4,6,6]
+        self.assertEqual(sn.in_ch,  4)
+        self.assertEqual(sn.out_ch, 4)
+        self.assertEqual(sn.out_h,  6)
+        self.assertEqual(sn.out_w,  6)
+        self.assertEqual(sn.kh, 3)
+        self.assertEqual(sn.kw, 3)
+
+    def test_depthwise_no_bias(self):
+        sn = self._node("conv_depthwise.onnx")
+        self.assertFalse(sn.has_bias)
+
+    def test_depthwise_with_bias_flag(self):
+        sn = self._node("conv_depthwise_bias.onnx")
+        self.assertTrue(sn.is_depthwise)
+        self.assertTrue(sn.has_bias)
+
+    def test_depthwise_emit_comment_has_dw(self):
+        sn = self._node("conv_depthwise.onnx")
+        comment = sn.emit_comment()
+        self.assertIn(" dw", comment)
+
+    def test_standard_emit_comment_no_dw(self):
+        sn = self._node("conv_simple.onnx")
+        comment = sn.emit_comment()
+        self.assertNotIn(" dw", comment)
+
+    def test_depthwise_emit_call_has_is_depthwise_1(self):
+        g   = OnnxGraph(_conv_model("conv_depthwise.onnx"))
+        sn  = g.nodes[0]
+        gen = CodeGenerator(g, model_path=_conv_model("conv_depthwise.onnx"))
+        call = sn.emit_call(gen._layouts)
+        # has_bias=0u, is_depthwise=1u → ends with "0u, 1u);"
+        self.assertIn("0u, 1u);", call)
+
+    def test_standard_emit_call_is_depthwise_0(self):
+        g   = OnnxGraph(_conv_model("conv_simple.onnx"))
+        sn  = g.nodes[0]
+        gen = CodeGenerator(g, model_path=_conv_model("conv_simple.onnx"))
+        call = sn.emit_call(gen._layouts)
+        # has_bias=0u, is_depthwise=0u → ends with "0u, 0u);"
+        self.assertIn("0u, 0u);", call)
+
+    def test_depthwise_source_has_is_depthwise_register(self):
+        s = _gen("conv_depthwise.onnx").generate_source()
+        self.assertIn("XConvkernel_Set_is_depthwise", s)
+
+    def test_depthwise_output_shape(self):
+        gen = _gen("conv_depthwise.onnx")
+        arrays = gen._simulate()
+        y = arrays["Y"]
+        self.assertEqual(list(y.shape), [1, 4, 6, 6])
+
+    def test_depthwise_bias_output_shape(self):
+        gen = _gen("conv_depthwise_bias.onnx")
+        arrays = gen._simulate()
+        y = arrays["Y"]
+        self.assertEqual(list(y.shape), [1, 8, 6, 6])
+
+    def test_depthwise_output_finite(self):
+        gen = _gen("conv_depthwise.onnx")
+        arrays = gen._simulate()
+        y = arrays["Y"]
+        self.assertTrue(np.all(np.isfinite(y)))
 
 
 if __name__ == "__main__":

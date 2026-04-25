@@ -27,7 +27,8 @@ def _m(name: str) -> str:
 
 
 def _models_exist() -> bool:
-    return os.path.isfile(_m("reshape_flatten.onnx"))
+    return (os.path.isfile(_m("reshape_flatten.onnx"))
+            and os.path.isfile(_m("squeeze_then_matmul.onnx")))
 
 
 def _gen(name: str) -> CodeGenerator:
@@ -511,3 +512,146 @@ class TestReshapeGemmSimulate(unittest.TestCase):
         x_q  = gen._dtype.quantize(np.ones((1, 8, 4, 4), dtype=np.float64))
         y    = gen.simulate({"X": x_q})["Y"]
         np.testing.assert_allclose(y, 1.0, atol=0.02)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Squeeze / Unsqueeze: unit construction
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSqueezeNodeUnit(unittest.TestCase):
+    """Squeeze and Unsqueeze nodes are constructed as ReshapeNode (buffer alias)."""
+
+    def _make_squeeze(self, src_shape, out_shape) -> ReshapeNode:
+        src = _tensor("src", src_shape)
+        out = _tensor("out", out_shape)
+        tensors = {"src": src, "out": out}
+        node = oh.make_node("Squeeze", inputs=["src"], outputs=["out"], axes=[2, 3])
+        return ReshapeNode.from_onnx_node(node, tensors, index=0, align_elems=8)
+
+    def _make_unsqueeze(self, src_shape, out_shape) -> ReshapeNode:
+        src = _tensor("src", src_shape)
+        out = _tensor("out", out_shape)
+        tensors = {"src": src, "out": out}
+        node = oh.make_node("Unsqueeze", inputs=["src"], outputs=["out"], axes=[2, 3])
+        return ReshapeNode.from_onnx_node(node, tensors, index=0, align_elems=8)
+
+    def test_squeeze_creates_reshape_node(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        self.assertIsInstance(sn, ReshapeNode)
+
+    def test_unsqueeze_creates_reshape_node(self):
+        sn = self._make_unsqueeze([1, 4], [1, 4, 1, 1])
+        self.assertIsInstance(sn, ReshapeNode)
+
+    def test_squeeze_kernel_name_empty(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        self.assertEqual(sn.kernel_name, "")
+
+    def test_squeeze_emit_call_empty(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        self.assertEqual(sn.emit_call({}), "")
+
+    def test_squeeze_emit_comment_says_squeeze(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        self.assertIn("Squeeze", sn.emit_comment())
+
+    def test_unsqueeze_emit_comment_says_unsqueeze(self):
+        sn = self._make_unsqueeze([1, 4], [1, 4, 1, 1])
+        self.assertIn("Unsqueeze", sn.emit_comment())
+
+    def test_squeeze_emit_comment_contains_alias(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        self.assertIn("alias", sn.emit_comment())
+
+    def test_squeeze_emit_comment_contains_shapes(self):
+        sn = self._make_squeeze([1, 4, 1, 1], [1, 4])
+        comment = sn.emit_comment()
+        self.assertIn("[1, 4, 1, 1]", comment)
+        self.assertIn("[1, 4]", comment)
+
+    def test_squeeze_numel_mismatch_raises(self):
+        with self.assertRaises(SchedulerError) as cm:
+            self._make_squeeze([1, 4, 1, 1], [1, 8])   # 4 ≠ 8
+        self.assertIn("numel", str(cm.exception).lower())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Squeeze / Unsqueeze: graph dispatch and generated code
+# ═══════════════════════════════════════════════════════════════════
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_reshape_gemm_models.py first")
+class TestSqueezeGraphDispatch(unittest.TestCase):
+    """OnnxGraph dispatches Squeeze/Unsqueeze → ReshapeNode."""
+
+    def test_squeeze_then_matmul_node_types(self):
+        g = OnnxGraph(_m("squeeze_then_matmul.onnx"))
+        types = [type(sn) for sn in g.nodes]
+        self.assertIn(PoolNode,    types)   # GlobalAveragePool
+        self.assertIn(ReshapeNode, types)   # Squeeze
+        self.assertIn(MatmulNode,  types)
+
+    def test_squeeze_node_is_reshape_node(self):
+        g  = OnnxGraph(_m("squeeze_then_matmul.onnx"))
+        sn = next(n for n in g.nodes if isinstance(n, ReshapeNode))
+        self.assertEqual(sn.onnx_node.op_type, "Squeeze")
+
+    def test_squeeze_input_output_shapes(self):
+        g  = OnnxGraph(_m("squeeze_then_matmul.onnx"))
+        sn = next(n for n in g.nodes if isinstance(n, ReshapeNode))
+        self.assertEqual(sn.inputs[0].shape, [1, 4, 1, 1])
+        self.assertEqual(sn.output.shape,    [1, 4])
+
+    def test_unsqueeze_then_relu_node_types(self):
+        g = OnnxGraph(_m("unsqueeze_then_relu.onnx"))
+        types = [type(sn) for sn in g.nodes]
+        self.assertIn(ReshapeNode,   types)   # Unsqueeze
+        self.assertIn(ScheduledNode, types)   # Relu
+
+    def test_unsqueeze_node_is_reshape_node(self):
+        g  = OnnxGraph(_m("unsqueeze_then_relu.onnx"))
+        sn = next(n for n in g.nodes if isinstance(n, ReshapeNode))
+        self.assertEqual(sn.onnx_node.op_type, "Unsqueeze")
+
+    def test_squeeze_then_matmul_alias_present(self):
+        gen = _gen("squeeze_then_matmul.onnx")
+        s   = gen.generate_source()
+        self.assertIn("reshape alias", s)
+
+    def test_squeeze_comment_says_squeeze_in_source(self):
+        gen = _gen("squeeze_then_matmul.onnx")
+        s   = gen.generate_source()
+        self.assertIn("Squeeze(", s)
+
+    def test_unsqueeze_comment_says_unsqueeze_in_source(self):
+        gen = _gen("unsqueeze_then_relu.onnx")
+        s   = gen.generate_source()
+        self.assertIn("Unsqueeze(", s)
+
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_reshape_gemm_models.py first")
+class TestSqueezeSimulate(unittest.TestCase):
+    """Squeeze/Unsqueeze simulation preserves values."""
+
+    def test_squeeze_then_matmul_output_shape(self):
+        gen    = _gen("squeeze_then_matmul.onnx")
+        arrays = gen._simulate()
+        self.assertEqual(arrays["Y"].shape, (1, 8))
+
+    def test_squeeze_then_matmul_correct(self):
+        """X[1,4,4,4]=1.0 → GAP → [1,4,1,1]=1.0 → Squeeze → [1,4] → MatMul(W=0.25) → Y=1.0."""
+        gen = _gen("squeeze_then_matmul.onnx")
+        x_q = gen._dtype.quantize(np.ones((1, 4, 4, 4), dtype=np.float64))
+        y   = gen.simulate({"X": x_q})["Y"]
+        np.testing.assert_allclose(y, 1.0, atol=0.02)
+
+    def test_unsqueeze_then_relu_output_shape(self):
+        gen    = _gen("unsqueeze_then_relu.onnx")
+        arrays = gen._simulate()
+        self.assertEqual(arrays["Y"].shape, (1, 4, 1, 1))
+
+    def test_unsqueeze_preserves_values(self):
+        """Unsqueeze just reinterprets memory — values are identical after Relu(positive)."""
+        gen = _gen("unsqueeze_then_relu.onnx")
+        x_q = gen._dtype.quantize(np.ones((1, 4), dtype=np.float64))
+        y   = gen.simulate({"X": x_q})["Y"]
+        np.testing.assert_allclose(y.flatten(), 1.0, atol=0.01)

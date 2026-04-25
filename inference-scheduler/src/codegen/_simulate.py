@@ -59,7 +59,7 @@ def _conv2d_ref(
     out_h: int,
     out_w: int,
 ) -> np.ndarray:
-    """Reference 2-D convolution in float64 matching ConvKernel's NCHW output."""
+    """Reference 2-D standard convolution (group=1) in float64."""
     N, C, H, W = x.shape
     M, _, kH, kW = w.shape
     y = np.zeros((N, M, out_h, out_w), dtype=np.float64)
@@ -83,6 +83,44 @@ def _conv2d_ref(
 
     if bias is not None:
         y += bias.reshape(1, M, 1, 1)
+
+    return y
+
+
+def _depthwise_conv2d_ref(
+    x: np.ndarray,        # float64, shape [N, C, H, W]
+    w: np.ndarray,        # float64, shape [C, 1, kH, kW]  (depthwise layout)
+    bias,                 # float64 shape [C] or None
+    stride_h: int,
+    stride_w: int,
+    pad_top: int,
+    pad_left: int,
+    dilation_h: int,
+    dilation_w: int,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray:
+    """Reference depthwise 2-D convolution (group=in_ch) in float64."""
+    N, C, H, W = x.shape
+    kH, kW = w.shape[2], w.shape[3]
+    y = np.zeros((N, C, out_h, out_w), dtype=np.float64)
+
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for khi in range(kH):
+                ih = oh * stride_h + khi * dilation_h - pad_top
+                if ih < 0 or ih >= H:
+                    continue
+                for kwi in range(kW):
+                    iw = ow * stride_w + kwi * dilation_w - pad_left
+                    if iw < 0 or iw >= W:
+                        continue
+                    # x[:, :, ih, iw]  shape [N, C]
+                    # w[:, 0, khi, kwi] shape [C]  — one filter per channel
+                    y[:, :, oh, ow] += x[:, :, ih, iw] * w[:, 0, khi, kwi].reshape(1, C)
+
+    if bias is not None:
+        y += bias.reshape(1, C, 1, 1)
 
     return y
 def _pool2d_ref(
@@ -266,8 +304,9 @@ class _SimulateMixin:
                 continue
 
             if isinstance(sn, ConvNode):
+                conv_fn = _depthwise_conv2d_ref if sn.is_depthwise else _conv2d_ref
                 arrays[sn.output.onnx_name] = dtype.truncate(
-                    _conv2d_ref(
+                    conv_fn(
                         x=arrays[sn.inputs[0].onnx_name],
                         w=arrays[sn.inputs[1].onnx_name],
                         bias=(arrays[sn.inputs[2].onnx_name]

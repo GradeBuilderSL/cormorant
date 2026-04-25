@@ -34,7 +34,10 @@ inline T saturate_cast(From v) {
 }
 
 // ---------------------------------------------------------------------------
-// ConvKernel — 2-D convolution following ONNX Conv semantics (group=1).
+// ConvKernel — 2-D convolution following ONNX Conv semantics.
+//
+// Supports standard convolution (group=1) and depthwise convolution
+// (group=in_ch, i.e. is_depthwise=1).
 //
 // Computes Y = conv(X, weight) + bias for a batch of 2-D feature maps in
 // NCHW layout.  Padding is applied implicitly: any input index outside
@@ -55,21 +58,18 @@ inline T saturate_cast(From v) {
 //                        pad_bottom and pad_right are implicit: out-of-bounds
 //                        input accesses are zero-padded by the bounds check.
 //   has_bias             0 = do not read bias pointer; 1 = add bias[m] to y.
+//   is_depthwise         0 = standard conv (group=1);
+//                        1 = depthwise conv (group=in_ch).
+//                            weight layout changes to [out_ch][1][kh][kw].
 //
 // Memory layout (row-major, NCHW):
 //   x     [batch][in_ch][in_h ][in_w ]
-//   weight[out_ch][in_ch][kh   ][kw   ]
+//   Standard (is_depthwise=0):
+//     weight[out_ch][in_ch][kh][kw]  → (m*in_ch + c)*kh*kw + khi*kw + kwi
+//   Depthwise (is_depthwise=1):
+//     weight[out_ch][1][kh][kw]      → m*kh*kw + khi*kw + kwi
 //   bias  [out_ch]
 //   y     [batch][out_ch][out_h][out_w]
-//
-// Index formulas:
-//   x      : (n*in_ch + c) * in_h*in_w + ih*in_w + iw
-//   weight : (m*in_ch + c) * kh*kw + khi*kw + kwi
-//   bias   : m
-//   y      : (n*out_ch + m) * out_h*out_w + oh*out_w + ow
-//
-//   ih = oh*stride_h + khi*dilation_h - pad_top
-//   iw = ow*stride_w + kwi*dilation_w - pad_left
 //
 // AXI interface (in ConvKernel.cpp):
 //   x, weight, bias → m_axi gmem0/1/2  (read ports)
@@ -96,5 +96,6 @@ void ConvKernel(
     unsigned      dilation_w,
     unsigned      pad_top,
     unsigned      pad_left,
-    unsigned      has_bias
+    unsigned      has_bias,
+    unsigned      is_depthwise
 );
