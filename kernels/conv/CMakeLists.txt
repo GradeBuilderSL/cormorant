@@ -224,7 +224,7 @@ if(CONV_VITIS_HLS)
             @ONLY)
 
         add_custom_target(
-            "synthesize_${_pname}"
+            "synthesize_conv_${_pname}"
             COMMAND ${CONV_VITIS_HLS} ${CONV_HLS_TCL_FLAG}
                     "${_p_build_dir}/synthesize_${_pname}.tcl"
             WORKING_DIRECTORY "${_p_build_dir}"

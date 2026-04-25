@@ -28,18 +28,20 @@ CMake) and share the same `saturate_cast` / AP_TRN+AP_SAT saturation pattern.
 
 ```
 axi_demo/
-├── kernel/          VectorOPKernel — element-wise vector ops
-│   └── VectorOP.cpp
-├── matmul/          MatmulKernel — tiled matrix multiply
-│   └── kernel/MatmulKernel.cpp
-├── conv/            ConvKernel — 2-D NCHW convolution
-│   └── kernel/ConvKernel.cpp
-├── pool/            PoolingKernel — 2-D NCHW pooling
-│   └── kernel/PoolingKernel.cpp
+├── kernels/
+│   ├── vectorop/    VectorOPKernel — element-wise vector ops
+│   │   ├── kernel/VectorOP.cpp
+│   │   ├── include/  VectorOP.h, Config.h.in
+│   │   ├── test/     TestSimulation.cpp
+│   │   ├── scripts/  Synthesis.tcl.in
+│   │   └── platforms/  kv260.json, …
+│   ├── conv/        ConvKernel — 2-D NCHW convolution
+│   │   └── kernel/ConvKernel.cpp
+│   ├── matmul/      MatmulKernel — tiled matrix multiply
+│   │   └── kernel/MatmulKernel.cpp
+│   └── pool/        PoolingKernel — 2-D NCHW pooling
+│       └── kernel/PoolingKernel.cpp
 │
-├── include/         VectorOPKernel headers
-├── platforms/       Per-board JSON configs (kv260.json, …)
-├── scripts/         Synthesis.tcl.in — HLS + IP-export template
 ├── doc/             Technical reference documents
 │
 └── inference-scheduler/   ONNX → C code-generator
@@ -76,25 +78,39 @@ axi_demo/
 
 ---
 
-## Building a Kernel
+## Building the Kernels
 
-Each kernel is a self-contained CMake project. The workflow is identical for
-all four:
+All four kernels share a single top-level CMake project.
 
 ```bash
-# VectorOPKernel example — same steps apply to matmul/, conv/, pool/
-cd axi_demo          # (or cd matmul / conv / pool)
-
+cd axi_demo
 mkdir build && cd build
 cmake ../
 
-# C simulation test (no hardware needed)
-make TestSimulation
-./TestSimulation
+# C simulation tests (no hardware needed)
+make TestSimulation    # VectorOPKernel
+make TestConvRef       # ConvKernel
+make TestMatmulRef     # MatmulKernel
+make TestPoolingSim    # PoolingKernel
 
-# HLS synthesis + Vivado IP export
-make synthesize_kv260
-# → build/kv260/ip_catalog.zip
+# Run all simulation tests
+ctest
+
+# HLS synthesis + Vivado IP export (requires Vitis)
+make synthesize_vectorop_kv260
+make synthesize_conv_kv260
+make synthesize_matmul_kv260
+make synthesize_pool_kv260
+```
+
+Each kernel can also be built standalone:
+
+```bash
+cd axi_demo/kernels/vectorop
+mkdir build && cd build
+cmake ../
+make TestSimulation
+make synthesize_vectorop_kv260
 ```
 
 ### Key CMake parameters (VectorOPKernel)
@@ -102,18 +118,18 @@ make synthesize_kv260
 | Parameter | Default | Description |
 |---|---|---|
 | `VA_DATA_TYPE` | `ap_fixed<16,8>` | Element type |
-| `VA_HLSLIB_DIR` | `../gemm_hls/hlslib` | Path to hlslib |
+| `VA_HLSLIB_DIR` | `../../../gemm_hls/hlslib` | Path to hlslib |
 | `VA_TARGET_CLOCK` | *(empty)* | Target MHz; empty = platform default (300 MHz) |
 
 ### Adding a new platform
 
-Create `platforms/<name>.json` (required: `part`; optional: `board`, `clock`):
+Create `kernels/<name>/platforms/<platform>.json` (required: `part`; optional: `board`, `clock`):
 
 ```json
 { "part": "xczu9eg-ffvb1156-2-e", "board": "xilinx.com:zcu102:part0:3.4", "clock": 250 }
 ```
 
-Re-run cmake, then `make synthesize_<name>`.
+Re-run cmake, then `make synthesize_<kernel>_<platform>`.
 
 ---
 

@@ -263,7 +263,7 @@ if(MM_VITIS_HLS)
             @ONLY)
 
         add_custom_target(
-            "synthesize_${_pname}"
+            "synthesize_matmul_${_pname}"
             COMMAND ${MM_VITIS_HLS} ${MM_HLS_TCL_FLAG}
                     "${_p_build_dir}/synthesize_${_pname}.tcl"
             WORKING_DIRECTORY "${_p_build_dir}"

@@ -461,6 +461,5 @@ The `sw_clk` driving the DDRC is produced by `zynq_ultra_ps_e_vip_v1_0_22_gen_cl
 |------|---------|
 | `/mnt/data/xilinx/2025.2/data/ip/xilinx/zynq_ultra_ps_e_vip_v1_0/hdl/zynq_ultra_ps_e_vip_v1_0_vl_rfs.sv` | PS VIP source — contains `arb_wr_6` |
 | `/home/ivan/vivado_projects/fix_arb_wr6_prt_req.py` | Python patch script for Fix Option A |
-| `/home/ivan/vivado_projects/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` | Testbench with `ddrc_wr_fix` workaround and chunk-safe fill tasks |
-| `/home/ivan/vivado_projects/vector_op_test/vector_op_test.sim/sim_1/behav/xsim/compile.sh` | xsim compile script |
-| `/home/ivan/vivado_projects/vector_op_test/vector_op_test.sim/sim_1/behav/xsim/vectorop_tb_vlog.prj` | xvlog project file listing all sources |
+| `/home/ivan/vivado_projects/cormorant_hw/cormorant_hw.srcs/sim_1/new/cormorant_tb.sv` | VectorOPKernel testbench with `ddrc_wr_fix`, chunk-safe fill tasks, per-test scoreboard |
+| `/home/ivan/vivado_projects/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` | ConvKernel testbench — reference implementation of `ddrc_wr_fix` and per-test scoreboard pattern |

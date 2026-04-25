@@ -232,7 +232,7 @@ if(POOL_VITIS_HLS)
             @ONLY)
 
         add_custom_target(
-            "synthesize_${_pname}"
+            "synthesize_pool_${_pname}"
             COMMAND ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}
                     "${_p_build_dir}/synthesize_${_pname}.tcl"
             WORKING_DIRECTORY "${_p_build_dir}"

@@ -10,45 +10,50 @@ The repository also contains **`inference-scheduler/`**, a Python code-generator
 
 ## Build System
 
-All configuration is done through CMake parameters. `hlslib` is not bundled — it is read from the sibling `gemm_hls` project by default.
+All four kernels live under `kernels/` and are built from a single top-level CMake project. `hlslib` is not bundled — it is read from the sibling `gemm_hls` project by default.
 
 ```bash
 mkdir build && cd build
 
-# Minimum — uses float, borrows hlslib from ../gemm_hls
+# Configure all four kernels at once
 cmake ../
 
-# Custom data type, explicit hlslib path
-cmake ../ \
-  -DVA_DATA_TYPE=double \
-  -DVA_HLSLIB_DIR=/path/to/hlslib
-
-# Build and run the C simulation test
-make TestSimulation
-./TestSimulation              # full suite (8 sizes)
-./TestSimulation 2048         # single size
+# C simulation tests (no hardware needed)
+make TestSimulation    # VectorOPKernel
+make TestConvRef       # ConvKernel
+make TestMatmulRef     # MatmulKernel
+make TestPoolingSim    # PoolingKernel
+ctest                  # run all
 
 # HLS synthesis + Vivado IP export for the KV260
-make synthesize_kv260
-# → build/kv260/ip_catalog.zip
-
-# Run CTest
-ctest
+make synthesize_vectorop_kv260
+make synthesize_conv_kv260
+make synthesize_matmul_kv260
+make synthesize_pool_kv260
 ```
 
-### Key CMake Parameters
+Each kernel can also be built standalone:
+
+```bash
+cd kernels/vectorop && mkdir build && cd build
+cmake ../ -DVA_DATA_TYPE=ap_fixed\<16,8\>
+make TestSimulation
+make synthesize_vectorop_kv260
+```
+
+### Key CMake Parameters (VectorOPKernel)
 
 | Parameter | Default | Description |
 |---|---|---|
-| `VA_DATA_TYPE` | `float` | Element type: `float`, `double`, `half`, `uint8_t`, `ap_fixed<W,I>` |
-| `VA_HLSLIB_DIR` | `../gemm_hls/hlslib` | Path to hlslib (must contain `cmake/` and `include/`) |
+| `VA_DATA_TYPE` | `ap_fixed<16,8>` | Element type: `float`, `double`, `half`, `uint8_t`, `ap_fixed<W,I>` |
+| `VA_HLSLIB_DIR` | `../../../gemm_hls/hlslib` | Path to hlslib (must contain `cmake/` and `include/`) |
 | `VA_PLATFORM` | `xilinx_u250_…` | Vitis platform for the `hw` / `hw_emu` xclbin flow |
 | `VA_TARGET_CLOCK` | *(empty)* | Target MHz for Vitis flow; empty = platform default |
 | `VA_VECTOR_SIZE` | 1024 | Informational default written to `Config.h` |
 
 ### Per-platform HLS synthesis
 
-Each `platforms/<name>.json` file defines a `synthesize_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.
+Each `kernels/<kernel>/platforms/<name>.json` file defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.
 
 **Required JSON fields:** `part`
 **Optional JSON fields:** `board`, `clock` (default 300 MHz)
@@ -80,12 +85,12 @@ HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2
 
 ### Key Files
 
-- **`kernel/VectorOP.cpp`** — HLS kernel. Single pipelined loop over `a[]`, `b[]`, `c[]` with a switch on `op`. Three `m_axi` ports (`gmem0/1/2`) with `offset=slave`; all registers (addresses, `size`, `op`, return) are in `s_axi_ctrl`.
-- **`include/VectorOP.h`** — Kernel declaration, `Op` enum (OP_ADD … OP_RELU6), and `saturate_cast<T>` template.
-- **`include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
-- **`test/TestSimulation.cpp`** — Tests all 6 operations across multiple sizes plus saturation boundary cases. Tolerance: relative 1e-5 for FP, exact for integers.
-- **`scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
-- **`platforms/kv260.json`** — KV260 Starter Kit platform config.
+- **`kernels/vectorop/kernel/VectorOP.cpp`** — HLS kernel. Single pipelined loop over `a[]`, `b[]`, `c[]` with a switch on `op`. Three `m_axi` ports (`gmem0/1/2`) with `offset=slave`; all registers (addresses, `size`, `op`, return) are in `s_axi_ctrl`.
+- **`kernels/vectorop/include/VectorOP.h`** — Kernel declaration, `Op` enum (OP_ADD … OP_RELU6), and `saturate_cast<T>` template.
+- **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
+- **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across multiple sizes plus saturation boundary cases. Tolerance: relative 1e-5 for FP, exact for integers.
+- **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
+- **`kernels/vectorop/platforms/kv260.json`** — KV260 Starter Kit platform config.
 
 ### Inference Scheduler
 
