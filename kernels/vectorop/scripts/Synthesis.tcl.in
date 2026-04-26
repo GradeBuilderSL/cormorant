@@ -20,8 +20,8 @@ set_top VectorOPKernel
 
 create_clock -period ${VA_TARGET_CLOCK_TCL}MHz -name default
 
-# Standard AXI interface configuration
 config_interface -m_axi_addr64
+config_interface -m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}
 config_rtl -reset_level low
 
 csynth_design

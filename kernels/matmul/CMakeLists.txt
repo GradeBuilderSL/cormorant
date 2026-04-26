@@ -78,7 +78,7 @@ target_include_directories(matmul_kernel
         ${CMAKE_CURRENT_BINARY_DIR}          # Config.h
 )
 if(_MM_HAVE_HLS)
-    target_include_directories(matmul_kernel PUBLIC ${HLS_INCLUDE_DIR})
+    target_include_directories(matmul_kernel SYSTEM PUBLIC ${HLS_INCLUDE_DIR})
     # MATMUL_HAVE_APFIXED is already defined in Config.h via MM_HAVE_APFIXED_DEFINE;
     # no need to pass it again via -D (that would cause a redefinition warning).
 endif()
@@ -208,7 +208,7 @@ endif()
 if(MM_VITIS_HLS)
     set(MM_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel/MatmulKernel.cpp")
 
-    file(GLOB _MM_PLATFORM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platforms/*.json")
+    set(_MM_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
     foreach(_MM_PLATFORM_FILE IN LISTS _MM_PLATFORM_FILES)
         get_filename_component(_pname "${_MM_PLATFORM_FILE}" NAME_WE)
         file(READ "${_MM_PLATFORM_FILE}" _pjson)

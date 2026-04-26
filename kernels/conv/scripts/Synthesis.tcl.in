@@ -21,9 +21,8 @@ create_clock -period @CONV_TARGET_CLOCK_TCL@MHz -name default
 
 # 64-bit AXI addresses for systems with >4 GB address space (e.g. KV260 PS DDR).
 config_interface -m_axi_addr64
-# Widen m_axi data bus to 32-bit to match the 32-bit AXI Interconnect crossbar
-# in the block design (avoids needing a data-width converter on each gmem port).
-config_interface -m_axi_max_widen_bitwidth 32
+# Set m_axi bus width (controlled by CMake AXI_BUS_WIDTH).
+config_interface -m_axi_max_widen_bitwidth @AXI_BUS_WIDTH@
 config_rtl -reset_level low
 
 csynth_design

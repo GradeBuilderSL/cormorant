@@ -82,7 +82,7 @@ target_include_directories(pool_kernel
         ${CMAKE_CURRENT_BINARY_DIR}          # Config.h
 )
 if(_POOL_HAVE_HLS)
-    target_include_directories(pool_kernel PUBLIC ${HLS_INCLUDE_DIR})
+    target_include_directories(pool_kernel SYSTEM PUBLIC ${HLS_INCLUDE_DIR})
 endif()
 target_compile_options(pool_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
@@ -179,7 +179,7 @@ endif()
 if(POOL_VITIS_HLS)
     set(POOL_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel/PoolingKernel.cpp")
 
-    file(GLOB _POOL_PLATFORM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platforms/*.json")
+    set(_POOL_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
     foreach(_POOL_PLATFORM_FILE IN LISTS _POOL_PLATFORM_FILES)
         get_filename_component(_pname "${_POOL_PLATFORM_FILE}" NAME_WE)
         file(READ "${_POOL_PLATFORM_FILE}" _pjson)

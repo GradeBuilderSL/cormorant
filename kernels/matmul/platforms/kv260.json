@@ -1,6 +1,0 @@
-{
-  "description": "Xilinx KV260 Starter Kit",
-  "part": "xck26-sfvc784-2LV-c",
-  "board": "xilinx.com:kv260_som:part0:1.4",
-  "clock": 300
-}

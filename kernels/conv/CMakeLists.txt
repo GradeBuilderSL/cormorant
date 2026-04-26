@@ -77,7 +77,7 @@ target_include_directories(conv_kernel
         ${CMAKE_CURRENT_BINARY_DIR}          # Config.h
 )
 if(_CONV_HAVE_HLS)
-    target_include_directories(conv_kernel PUBLIC ${HLS_INCLUDE_DIR})
+    target_include_directories(conv_kernel SYSTEM PUBLIC ${HLS_INCLUDE_DIR})
 endif()
 target_compile_options(conv_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
@@ -171,7 +171,7 @@ endif()
 if(CONV_VITIS_HLS)
     set(CONV_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel/ConvKernel.cpp")
 
-    file(GLOB _CONV_PLATFORM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platforms/*.json")
+    set(_CONV_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
     foreach(_CONV_PLATFORM_FILE IN LISTS _CONV_PLATFORM_FILES)
         get_filename_component(_pname "${_CONV_PLATFORM_FILE}" NAME_WE)
         file(READ "${_CONV_PLATFORM_FILE}" _pjson)

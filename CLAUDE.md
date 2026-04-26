@@ -10,7 +10,7 @@ The repository also contains **`inference-scheduler/`**, a Python code-generator
 
 ## Build System
 
-All four kernels live under `kernels/` and are built from a single top-level CMake project. `hlslib` is not bundled — it is read from the sibling `gemm_hls` project by default.
+All four kernels live under `kernels/` and are built from a single top-level CMake project.
 
 ```bash
 mkdir build && cd build
@@ -46,8 +46,7 @@ make synthesize_vectorop_kv260
 | Parameter | Default | Description |
 |---|---|---|
 | `VA_DATA_TYPE` | `ap_fixed<16,8>` | Element type: `float`, `double`, `half`, `uint8_t`, `ap_fixed<W,I>` |
-| `VA_HLSLIB_DIR` | `../../../gemm_hls/hlslib` | Path to hlslib (must contain `cmake/` and `include/`) |
-| `VA_PLATFORM` | `xilinx_u250_…` | Vitis platform for the `hw` / `hw_emu` xclbin flow |
+| `VA_PLATFORM` | `xilinx_u250_…` | Vitis platform for the `hw` / `hw_emu` xclbin flow (requires `VA_ENABLE_VITIS_FLOW=ON`) |
 | `VA_TARGET_CLOCK` | *(empty)* | Target MHz for Vitis flow; empty = platform default |
 | `VA_VECTOR_SIZE` | 1024 | Informational default written to `Config.h` |
 
@@ -140,5 +139,5 @@ See `doc/INFERENCE_SCHEDULER.md` for the full technical reference.
 
 ## Dependencies
 
-- **`hlslib/`** (from sibling `gemm_hls`) — Provides `FindVitis.cmake`, `add_vitis_kernel`, `add_vitis_program`, and `hls_stream.h` simulation support.
+- **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.

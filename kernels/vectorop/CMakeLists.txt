@@ -5,11 +5,6 @@ project(VectorOPKernel)
 # User-facing parameters
 # ---------------------------------------------------------------------------
 
-# Path to hlslib (cmake/ and include/ must exist there).
-# Defaults to the sibling gemm_hls project which already has it checked out.
-set(VA_HLSLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../gemm_hls/hlslib" CACHE PATH
-    "Path to the hlslib directory (contains cmake/ and include/).")
-
 # Vitis platform and clock — only needed for the Vitis hw/hw_emu flow.
 set(VA_PLATFORM "xilinx_u250_gen3x16_xdma_3_1_202020_1" CACHE STRING
     "Vitis platform string.")
@@ -77,24 +72,11 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Find packages via hlslib
+# Locate Vitis HLS (synthesis targets only; not required for C-sim).
+# FindVitis.cmake is bundled in <repo-root>/cmake/.
 # ---------------------------------------------------------------------------
-set(CMAKE_MODULE_PATH ${VA_HLSLIB_DIR}/cmake ${CMAKE_MODULE_PATH})
-find_package(Vitis REQUIRED)
-find_package(Threads REQUIRED)
-
-# ---------------------------------------------------------------------------
-# Global compiler flags
-# ---------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
-add_definitions("-DHLSLIB_STREAM_TIMEOUT=16")
-
-if(((${Vitis_MAJOR_VERSION} LESS 2018) AND (${Vitis_MINOR_VERSION} LESS 3))
-   OR ${Vitis_MAJOR_VERSION} LESS 2017)
-  add_definitions(-DHLSLIB_LEGACY_SDX=1)
-else()
-  add_definitions(-DHLSLIB_LEGACY_SDX=0)
-endif()
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+find_package(Vitis)
 
 # ---------------------------------------------------------------------------
 # Generate configuration header
@@ -104,28 +86,29 @@ configure_file(include/Config.h.in Config.h)
 # ---------------------------------------------------------------------------
 # Simulation (C++ test) build
 # ---------------------------------------------------------------------------
-include_directories(
-    include
-    ${CMAKE_CURRENT_BINARY_DIR}
-    SYSTEM ${VA_HLSLIB_DIR}/include ${Vitis_INCLUDE_DIRS})
-
-if(VA_HLS_INCLUDE_DIR)
-    include_directories(SYSTEM ${VA_HLS_INCLUDE_DIR})
-endif()
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(VA_KERNEL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/kernel/VectorOP.cpp)
 
 add_library(vadd_kernel ${VA_KERNEL_SRC})
-target_link_libraries(vadd_kernel ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(vadd_kernel
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR})
+if(VA_HLS_INCLUDE_DIR)
+    target_include_directories(vadd_kernel SYSTEM PUBLIC ${VA_HLS_INCLUDE_DIR})
+endif()
+target_compile_options(vadd_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
 add_executable(TestSimulation test/TestSimulation.cpp)
-target_link_libraries(TestSimulation vadd_kernel ${Vitis_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
-if(VA_DATA_TYPE STREQUAL "half")
-  target_link_libraries(TestSimulation ${Vitis_FLOATING_POINT_LIBRARY})
-endif()
+target_link_libraries(TestSimulation PRIVATE vadd_kernel)
+target_compile_options(TestSimulation PRIVATE -Wall -Wextra -O2)
 
 enable_testing()
 add_test(NAME TestSimulation COMMAND TestSimulation)
+
+message(STATUS "VectorOPKernel: Data_t=${VA_DATA_TYPE}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis flags (used for both Vitis and standalone HLS flows)
@@ -148,11 +131,10 @@ if(VA_ENABLE_VITIS_FLOW)
                      FILES  ${VA_KERNEL_SRC}
                      HLS_FLAGS ${VA_SYNTHESIS_FLAGS}
                      INCLUDE_DIRS
-                         include
-                         ${VA_HLSLIB_DIR}/include
+                         ${CMAKE_CURRENT_SOURCE_DIR}/include
                          ${CMAKE_CURRENT_BINARY_DIR}
                      DEPENDS
-                         include/VectorOP.h
+                         ${CMAKE_CURRENT_SOURCE_DIR}/include/VectorOP.h
                          ${CMAKE_CURRENT_BINARY_DIR}/Config.h)
 
     add_vitis_program(VectorOP ${VA_PLATFORM}
@@ -169,62 +151,72 @@ endif()
 # Generated targets:
 #   make synthesize_vectorop_<name>   — HLS synthesis + ip_catalog export
 # ---------------------------------------------------------------------------
-string(REPLACE ";" " " _VA_KERNEL_SRC_STR "${VA_KERNEL_SRC}")
+if(Vitis_HLS)
+    message(STATUS "VectorOPKernel: HLS synthesis enabled via ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG}")
 
-file(GLOB _VA_PLATFORM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platforms/*.json")
-foreach(_VA_PLATFORM_FILE IN LISTS _VA_PLATFORM_FILES)
-  get_filename_component(_pname "${_VA_PLATFORM_FILE}" NAME_WE)
-  file(READ "${_VA_PLATFORM_FILE}" _pjson)
+    string(REPLACE ";" " " _VA_KERNEL_SRC_STR "${VA_KERNEL_SRC}")
 
-  # Required: FPGA part string
-  string(JSON _p_part ERROR_VARIABLE _e1 GET "${_pjson}" part)
-  if(_e1)
-    message(WARNING "Platform '${_pname}': missing 'part' field — skipping.")
-    continue()
-  endif()
+    set(_VA_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
+    foreach(_VA_PLATFORM_FILE IN LISTS _VA_PLATFORM_FILES)
+      get_filename_component(_pname "${_VA_PLATFORM_FILE}" NAME_WE)
+      file(READ "${_VA_PLATFORM_FILE}" _pjson)
 
-  # Optional: board identifier
-  string(JSON _p_board ERROR_VARIABLE _e GET "${_pjson}" board)
-  if(_e)
-    set(_p_board "")
-  endif()
+      # Required: FPGA part string
+      string(JSON _p_part ERROR_VARIABLE _e1 GET "${_pjson}" part)
+      if(_e1)
+        message(WARNING "VectorOPKernel platform '${_pname}': missing 'part' — skipping.")
+        continue()
+      endif()
 
-  # Optional: target clock in MHz (default 300)
-  string(JSON _p_clock ERROR_VARIABLE _e GET "${_pjson}" clock)
-  if(_e)
-    set(_p_clock "300")
-  endif()
+      # Optional: board identifier
+      string(JSON _p_board ERROR_VARIABLE _e GET "${_pjson}" board)
+      if(_e)
+        set(_p_board "")
+      endif()
 
-  # Per-platform build directory and Config.h
-  set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
-  file(MAKE_DIRECTORY "${_p_build_dir}")
-  configure_file(include/Config.h.in "${_p_build_dir}/Config.h")
+      # Optional: target clock in MHz (default 300)
+      string(JSON _p_clock ERROR_VARIABLE _e GET "${_pjson}" clock)
+      if(_e)
+        set(_p_clock "300")
+      endif()
 
-  # Build the set_part TCL command (with or without -board)
-  if(_p_board)
-    set(VA_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
-  else()
-    set(VA_BOARD_OPTION "set_part {${_p_part}}")
-  endif()
+      # Per-platform build directory and Config.h
+      set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
+      file(MAKE_DIRECTORY "${_p_build_dir}")
+      configure_file(include/Config.h.in "${_p_build_dir}/Config.h")
 
-  # Variables consumed by Synthesis.tcl.in
-  set(VA_HLS_PROJECT_NAME       "vadd_${_pname}")
-  set(VA_PART_NAME              "${_p_part}")
-  set(VA_SRC_SYNTHESIS          "${_VA_KERNEL_SRC_STR}")
-  set(VA_SYNTHESIS_FLAGS_PLATFORM
-      "${VA_SYNTHESIS_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${VA_HLSLIB_DIR}/include -I${_p_build_dir}")
-  set(VA_TARGET_CLOCK_TCL       "${_p_clock}")
-  set(VA_IP_OUTPUT_DIR          "${_p_build_dir}/ip_catalog")
+      # Build the set_part TCL command (with or without -board)
+      if(_p_board)
+        set(VA_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
+      else()
+        set(VA_BOARD_OPTION "set_part {${_p_part}}")
+      endif()
 
-  configure_file(scripts/Synthesis.tcl.in
-                 "${_p_build_dir}/synthesize_${_pname}.tcl")
+      # Variables consumed by Synthesis.tcl.in
+      set(VA_HLS_PROJECT_NAME       "vadd_${_pname}")
+      set(VA_PART_NAME              "${_p_part}")
+      set(VA_SRC_SYNTHESIS          "${_VA_KERNEL_SRC_STR}")
+      set(VA_SYNTHESIS_FLAGS_PLATFORM
+          "${VA_SYNTHESIS_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${_p_build_dir}")
+      set(VA_TARGET_CLOCK_TCL       "${_p_clock}")
+      set(VA_IP_OUTPUT_DIR          "${_p_build_dir}/ip_catalog")
 
-  add_custom_target(
-      "synthesize_vectorop_${_pname}"
-      COMMAND ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG} "${_p_build_dir}/synthesize_${_pname}.tcl"
-      WORKING_DIRECTORY "${_p_build_dir}"
-      COMMENT "HLS synthesis for VectorOP platform '${_pname}' (${_p_part} @ ${_p_clock} MHz) → ${_p_build_dir}/ip_catalog"
-      DEPENDS ${VA_KERNEL_SRC}
-              include/VectorOP.h
+      configure_file(scripts/Synthesis.tcl.in
+                     "${_p_build_dir}/synthesize_${_pname}.tcl")
+
+      add_custom_target(
+          "synthesize_vectorop_${_pname}"
+          COMMAND ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG} "${_p_build_dir}/synthesize_${_pname}.tcl"
+          WORKING_DIRECTORY "${_p_build_dir}"
+          COMMENT "HLS synthesis: VectorOPKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
+          DEPENDS
+              ${VA_KERNEL_SRC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/VectorOP.h
               "${_p_build_dir}/Config.h")
-endforeach()
+
+      message(STATUS "VectorOPKernel: synthesis target 'synthesize_vectorop_${_pname}' "
+                     "(${_p_part} @ ${_p_clock} MHz)")
+    endforeach()
+else()
+    message(STATUS "VectorOPKernel: vitis_hls / vitis-run not found — synthesis targets disabled")
+endif()

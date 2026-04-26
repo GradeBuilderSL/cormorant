@@ -70,9 +70,6 @@ axi_demo/
 
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2` — HLS synthesis and IP export.
   Source `settings64.sh` before building.
-- **[hlslib](https://github.com/definelicht/hlslib)** — provides `FindVitis.cmake`
-  and HLS simulation support.  Reads from sibling `gemm_hls/` by default;
-  override with `-DVA_HLSLIB_DIR=…`.
 - **CMake ≥ 3.19**
 - **Python ≥ 3.10** (inference-scheduler only)
 
@@ -118,8 +115,8 @@ make synthesize_vectorop_kv260
 | Parameter | Default | Description |
 |---|---|---|
 | `VA_DATA_TYPE` | `ap_fixed<16,8>` | Element type |
-| `VA_HLSLIB_DIR` | `../../../gemm_hls/hlslib` | Path to hlslib |
 | `VA_TARGET_CLOCK` | *(empty)* | Target MHz; empty = platform default (300 MHz) |
+| `VA_ENABLE_VITIS_FLOW` | `OFF` | Enable Vitis hw/hw_emu xclbin targets (requires installed platform) |
 
 ### Adding a new platform
 
