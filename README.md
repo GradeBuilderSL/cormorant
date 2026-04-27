@@ -98,7 +98,23 @@ make synthesize_vectorop_kv260
 make synthesize_conv_kv260
 make synthesize_matmul_kv260
 make synthesize_pool_kv260
+
+# Device tree overlay (requires dtc)
+make dtbo_kv260_cormorant
+# output: build/dts/kv260/design_cormorant.dtbo
 ```
+
+#### Device tree overlay — requires `dtc`
+
+Each `.dts` file under `dts/<platform>/` gets a corresponding build target:
+
+| Target | Input | Output |
+|--------|-------|--------|
+| `dtbo_<platform>_<stem>` | `dts/<platform>/<stem>.dts` | `build/dts/<platform>/design_<stem>.dtbo` |
+
+`dtc` is located automatically at configure time. If it is absent, cmake prints
+an install hint (`sudo apt install device-tree-compiler`) and the target fails
+at build time with a clear error message.
 
 Each kernel can also be built standalone:
 
@@ -120,13 +136,27 @@ make synthesize_vectorop_kv260
 
 ### Adding a new platform
 
-Create `kernels/<name>/platforms/<platform>.json` (required: `part`; optional: `board`, `clock`):
+Create `platforms/<platform>.json`:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `part` | yes | — | Xilinx device part string |
+| `board` | no | *(none)* | Board identifier passed to `set_part -board` |
+| `clock` | no | `300` | Target clock in MHz |
+| `axi_bus_width` | no | `AXI_BUS_WIDTH` CMake variable (default 32) | AXI master bus width in bits; valid values: 32, 64, 128, 256, 512 |
 
 ```json
-{ "part": "xczu9eg-ffvb1156-2-e", "board": "xilinx.com:zcu102:part0:3.4", "clock": 250 }
+{
+  "part": "xczu9eg-ffvb1156-2-e",
+  "board": "xilinx.com:zcu102:part0:3.4",
+  "clock": 250,
+  "axi_bus_width": 64
+}
 ```
 
-Re-run cmake, then `make synthesize_<kernel>_<platform>`.
+Re-run cmake. The new platform gets synthesis targets for all four kernels
+(`synthesize_<kernel>_<platform>`, `synthesize_<platform>`) and a device tree
+overlay target for any `.dts` file placed under `dts/<platform>/`.
 
 ---
 
