@@ -39,7 +39,6 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import sys
 import tempfile
 import textwrap
@@ -48,99 +47,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-try:
-    import paramiko
-    import paramiko.sftp_client
-except ImportError:
-    print("error: paramiko is required.", file=sys.stderr)
-    print("  .venv/bin/pip install paramiko", file=sys.stderr)
-    sys.exit(1)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from src.remote import (  # noqa: E402
+    _green, _red, _yellow, _bold, _dim,
+    load_config, uio_devices_from_cfg,
+    RemoteSession, check_prerequisites,
+)
 try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from src.kernels import KERNEL_REGISTRY as _KERNEL_REGISTRY
 except ImportError:
     _KERNEL_REGISTRY = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Terminal colours (disabled when stdout is not a TTY)
+# Configuration — tests-specific additions on top of SHARED_DEFAULTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-_USE_COLOR = sys.stdout.isatty()
-
-
-def _c(code: str, s: str) -> str:
-    return f"\033[{code}m{s}\033[0m" if _USE_COLOR else s
-
-
-def _green(s: str)  -> str: return _c("32", s)
-def _red(s: str)    -> str: return _c("31", s)
-def _yellow(s: str) -> str: return _c("33", s)
-def _bold(s: str)   -> str: return _c("1",  s)
-def _dim(s: str)    -> str: return _c("2",  s)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────────────────
-
-_DEFAULTS: dict = {
-    "ssh": {
-        "host":            "",
-        "user":            "root",
-        "port":            22,
-        "key_file":        None,   # path to private key, e.g. "~/.ssh/id_rsa"
-        "password":        None,   # plain-text password (prefer key auth)
-        "connect_timeout": 15,
-    },
-    "remote": {
-        "work_dir":    "/tmp/inference_hw_tests",
-        "driver_dir":  None,       # remote path with ALL kernel driver files
-        "driver_dirs": {},         # per-kernel: {"VectorOPKernel": "/path", ...}
-        # Per-kernel UIO sysfs names (cat /sys/class/uio/uio*/name).
-        # Keys are kernel names from KERNEL_REGISTRY (e.g. "VectorOPKernel").
-        # Empty dict means use the defaults compiled into the test binary.
-        "uio_devices": {},
-        "uio_device":  None,       # DEPRECATED — use uio_devices instead
-        "cmake_args":  [],         # extra -D flags forwarded to cmake
-    },
-    "local": {
-        "driver_dir":  None,       # single local path; scheduler bundles into project
-        "driver_dirs": {},         # per-kernel: {"VectorOPKernel": "/path", ...}
-    },
-    "build": {
-        "jobs":    4,
-        "timeout": 180,            # seconds; cmake + make combined
-    },
-    "run": {
-        "timeout":  120,           # seconds for test_inference execution
-        "use_sudo": True,          # prefix test binary with "sudo"
-    },
-    "cleanup": True,               # remove remote build dirs after run
-    "models":  [],
+_EXTRA_DEFAULTS: dict = {
+    "models": [],
 }
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into a deep copy of *base*."""
-    result = dict(base)
-    for key, val in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
-            result[key] = _deep_merge(result[key], val)
-        else:
-            result[key] = val
-    return result
-
-
-def load_config(path: str) -> dict:
-    """Load JSON config and fill in defaults for missing keys."""
-    with open(path) as fh:
-        raw = json.load(fh)
-    cfg = _deep_merge(_DEFAULTS, raw)
-    if not cfg["ssh"]["host"]:
-        raise ValueError("config: ssh.host is required")
-    return cfg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -185,158 +111,10 @@ class TestResult:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SSH / SFTP session
-# ──────────────────────────────────────────────────────────────────────────────
-
-class RemoteSession:
-    """
-    Persistent SSH+SFTP connection to the remote board.
-
-    All remote commands run via exec(); directory uploads via upload_dir().
-    The session re-uses a single transport for the entire test run to avoid
-    repeated TCP handshakes.
-    """
-
-    def __init__(self, ssh_cfg: dict) -> None:
-        self._cfg    = ssh_cfg
-        self._client: Optional[paramiko.SSHClient] = None
-
-    # ── connection ──────────────────────────────────────────────────────────
-
-    def connect(self) -> None:
-        cfg    = self._cfg
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        kwargs: dict = {
-            "hostname":      cfg["host"],
-            "username":      cfg["user"],
-            "port":          int(cfg["port"]),
-            "timeout":       float(cfg["connect_timeout"]),
-            "allow_agent":   True,
-            "look_for_keys": True,
-            "banner_timeout": 30,
-        }
-        key_file = cfg.get("key_file")
-        if key_file:
-            kwargs["key_filename"]  = os.path.expanduser(key_file)
-            kwargs["look_for_keys"] = False
-        password = cfg.get("password")
-        if password:
-            kwargs["password"] = password
-
-        client.connect(**kwargs)
-        self._client = client
-
-    def close(self) -> None:
-        if self._client:
-            self._client.close()
-            self._client = None
-
-    # ── remote command execution ─────────────────────────────────────────────
-
-    def exec(self, command: str,
-             timeout: int = 120) -> Tuple[str, str, int]:
-        """
-        Run *command* on the remote host.
-
-        Returns (stdout, stderr, exit_code).
-        Raises TimeoutError if the command does not finish within *timeout* s.
-        Raises RuntimeError if the session is not connected.
-        """
-        if self._client is None:
-            raise RuntimeError("RemoteSession: not connected")
-
-        try:
-            _, stdout_ch, stderr_ch = self._client.exec_command(
-                command, timeout=float(timeout),
-                get_pty=False,
-            )
-            stdout = stdout_ch.read().decode("utf-8", errors="replace")
-            stderr = stderr_ch.read().decode("utf-8", errors="replace")
-            rc     = stdout_ch.channel.recv_exit_status()
-        except socket.timeout:
-            raise TimeoutError(
-                f"Remote command timed out after {timeout}s:\n  {command}"
-            )
-        return stdout, stderr, rc
-
-    def exec_checked(self, command: str,
-                     timeout: int = 120) -> Tuple[str, str]:
-        """Like exec() but raises RuntimeError on non-zero exit."""
-        out, err, rc = self.exec(command, timeout=timeout)
-        if rc != 0:
-            raise RuntimeError(
-                f"Remote command failed (rc={rc}):\n  {command}\n"
-                f"stdout:\n{out}\nstderr:\n{err}"
-            )
-        return out, err
-
-    # ── file transfer ────────────────────────────────────────────────────────
-
-    def upload_dir(self, local_dir: Path, remote_dir: str,
-                   on_file: Optional[Callable[[str], None]] = None) -> int:
-        """
-        Recursively upload *local_dir* to *remote_dir* via SFTP.
-
-        *on_file* is called with the relative file path before each upload
-        (useful for progress reporting).  Returns the number of files uploaded.
-        """
-        sftp = self._client.open_sftp()
-        n    = 0
-        try:
-            self._mkdir_p(sftp, remote_dir)
-            for local_path in sorted(local_dir.rglob("*")):
-                rel    = local_path.relative_to(local_dir)
-                remote = f"{remote_dir}/{rel.as_posix()}"
-                if local_path.is_dir():
-                    try:
-                        sftp.mkdir(remote)
-                    except OSError:
-                        pass  # already exists
-                else:
-                    if on_file:
-                        on_file(str(rel))
-                    sftp.put(str(local_path), remote)
-                    n += 1
-        finally:
-            sftp.close()
-        return n
-
-    @staticmethod
-    def _mkdir_p(sftp: paramiko.SFTPClient, remote_path: str) -> None:
-        """Create *remote_path* and all missing parent directories."""
-        parts   = Path(remote_path).parts
-        current = ""
-        for part in parts:
-            if part == "/":
-                current = "/"
-                continue
-            current = current.rstrip("/") + "/" + part
-            try:
-                sftp.stat(current)
-            except FileNotFoundError:
-                try:
-                    sftp.mkdir(current)
-                except OSError:
-                    pass  # race condition or already exists
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _uio_devices_from_cfg(cfg: dict) -> dict:
-    """Return per-kernel UIO sysfs name dict (handles old uio_device string too)."""
-    remote = cfg["remote"]
-    if remote.get("uio_devices"):
-        return dict(remote["uio_devices"])
-    legacy = remote.get("uio_device")
-    if legacy:
-        return {"VectorOPKernel": legacy}
-    return {}
-
 
 def _cmake_instance_flags(uio_devices: dict) -> List[str]:
     """Convert per-kernel UIO name map to cmake -D compile-definition flags."""
@@ -532,7 +310,7 @@ def run_model_test(model_path: Path,
     except FileNotFoundError as exc:
         result.steps.append(StepResult("drivers", False, str(exc), 0.0))
         return result
-    uio_devices   = _uio_devices_from_cfg(cfg)
+    uio_devices   = uio_devices_from_cfg(cfg)
 
     work_dir        = cfg["remote"]["work_dir"].rstrip("/")
     remote_project  = f"{work_dir}/{name}"
@@ -697,67 +475,6 @@ def cleanup_remote(session: RemoteSession, cfg: dict,
         session.exec(f"rm -rf {work_dir}/{name}", timeout=30)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Prerequisite check
-# ──────────────────────────────────────────────────────────────────────────────
-
-def check_prerequisites(session: RemoteSession, cfg: dict) -> bool:
-    """
-    Verify that the remote machine has the tools and devices required to
-    build and run the inference tests.  Returns True if all checks pass.
-    """
-    uio_devices = _uio_devices_from_cfg(cfg)
-
-    checks = [
-        # (shell command that exits 0 on success, label)
-        ("cmake --version 2>&1 | head -1", "cmake"),
-        ("make --version  2>&1 | head -1", "make"),
-        ("gcc  --version  2>&1 | head -1", "gcc"),
-        (
-            "pkg-config --exists xrt 2>/dev/null && echo 'xrt via pkg-config' || "
-            "{ [ -f /opt/xilinx/xrt/include/xrt.h ] && echo 'xrt at /opt/xilinx/xrt'; } || "
-            "{ [ -f /usr/include/xrt/xrt.h ]        && echo 'xrt at /usr/include/xrt'; } || "
-            "echo '__MISSING__'",
-            "xrt headers",
-        ),
-        (
-            "sudo -n true 2>/dev/null && echo 'passwordless sudo OK' || "
-            "[ \"$(id -u)\" = '0' ] && echo 'running as root' || "
-            "echo '__MISSING__'",
-            "sudo / root access",
-        ),
-    ]
-
-    # Add one UIO check per configured kernel instance name.
-    # X*_Initialize() scans /sys/class/uio/*/name for a string match.
-    for kernel_name, uio_name in uio_devices.items():
-        checks.append((
-            f"match=$(grep -rl '^{uio_name}$' /sys/class/uio/*/name 2>/dev/null | head -1); "
-            f"[ -n \"$match\" ] && echo \"/dev/uio$(echo $match | grep -o 'uio[0-9]*' | tail -1 | sed 's/uio//')\" "
-            f"|| echo '__MISSING__'",
-            f"uio ({kernel_name}: {uio_name})",
-        ))
-
-    if not uio_devices:
-        checks.append((
-            "grep -rl '' /sys/class/uio/*/name 2>/dev/null | head -1 | "
-            "xargs -r cat 2>/dev/null || echo '__MISSING__'",
-            "uio devices (using header defaults)",
-        ))
-
-    all_ok = True
-    for cmd, label in checks:
-        out, _, rc = session.exec(cmd, timeout=15)
-        missing = "__MISSING__" in out or (rc != 0 and not out.strip())
-        if missing:
-            print(f"    {_red('MISSING')} {label}")
-            all_ok = False
-        else:
-            desc = out.strip().splitlines()[0][:70]
-            print(f"    {_green('OK')}      {label:<28} {_dim(desc)}")
-
-    return all_ok
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Reporting helpers
@@ -846,7 +563,7 @@ def main(argv=None) -> int:
 
     # ── Load config ─────────────────────────────────────────────────────── #
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, _EXTRA_DEFAULTS)
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

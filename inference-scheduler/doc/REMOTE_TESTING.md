@@ -61,14 +61,19 @@ leave `ssh.key_file` null.
 
 ### 2. Config file
 
-Copy the example and fill in your board details:
+Copy the appropriate example and fill in your board details:
 
 ```bash
+# For run_remote_tests.py (correctness tests)
 cp remote_config.json.example remote_config.json
 $EDITOR remote_config.json
+
+# For run_remote_perf.py (performance benchmarks)
+cp perf_config.json.example perf_config.json
+$EDITOR perf_config.json
 ```
 
-Minimum required change: set `ssh.host` to your board's IP or hostname.
+Minimum required change in both: set `ssh.host` to your board's IP or hostname.
 
 ---
 
@@ -306,6 +311,295 @@ cat /sys/class/uio/uio*/name
 ```
 
 ---
+
+## Performance Benchmarking (`run_remote_perf.py`)
+
+`run_remote_perf.py` measures raw kernel throughput and latency on a physical
+KV260. Unlike `run_remote_tests.py`, it does **not** check numerical correctness
+— it only cares about how fast each kernel runs for a given set of parameters.
+
+The script:
+1. Generates a self-contained C benchmark project locally (four standalone
+   binaries, one per kernel)
+2. Uploads it to the board once, builds everything in one `cmake` + `make` pass
+3. Runs each test case as a separate binary invocation and parses the JSON output
+4. Prints a formatted table of latency (ms) and throughput (GB/s or GFLOPS)
+
+Kernels whose driver files are absent are silently skipped — you can benchmark
+only the kernels that are currently deployed.
+
+---
+
+### Prerequisites
+
+Same SSH, toolchain, and XRT requirements as `run_remote_tests.py`. See
+[Prerequisites](#prerequisites) above. Run `--check-only` to verify before
+starting a long benchmark run.
+
+Driver files must be available either locally (`local.driver_dirs`) or on the
+board (`remote.driver_dirs`). The local path is the standard Vitis HLS output:
+
+```
+<axi_demo>/build/kernels/<kernel>/kv260/<target>/solution1/impl/ip/drivers/<KernelName>_v1_0/src/
+```
+
+---
+
+### Config File — `perf_config.json`
+
+`perf_config.json` extends the same schema as the correctness-test configs with
+one additional top-level section: `benchmarks`.
+
+#### Full key reference
+
+All keys from the correctness-test config apply (see [Config File Reference](#config-file-reference)). Additional and modified keys:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `remote.work_dir` | `"/tmp/inference_hw_tests"` | Temporary build directory on the board |
+| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names; required for kernel initialization |
+| `local.driver_dirs` | `{}` | Per-kernel local HLS driver source paths; merged before upload |
+| `run.timeout` | `60` | Per-benchmark binary execution timeout in seconds |
+| `benchmarks.<Kernel>.enabled` | `true` | Set `false` to skip that kernel entirely |
+| `benchmarks.<Kernel>.warmup` | `10` | Default warmup iterations for all cases in this kernel group |
+| `benchmarks.<Kernel>.cases` | *(required)* | List of named-parameter case dicts; see [Case Fields](#case-fields). Kernels without a `cases` array are skipped. |
+
+#### `benchmarks` section
+
+Each kernel group has three keys:
+
+```json
+"benchmarks": {
+  "VectorOPKernel": {
+    "enabled": true,
+    "warmup": 10,
+    "cases": [ ... ]
+  },
+  "MatmulKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] },
+  "ConvKernel":   { "enabled": true, "warmup": 10, "cases": [ ... ] },
+  "PoolingKernel":{ "enabled": true, "warmup": 10, "cases": [ ... ] }
+}
+```
+
+If `"cases"` is omitted or empty that kernel is skipped entirely. If
+`"enabled"` is `false` no cases from that kernel are loaded or run
+(equivalent to `--kernels` without that kernel).
+
+#### Case fields
+
+Each element of `"cases"` is a JSON object with a `"label"` string plus the
+kernel-specific numeric fields listed below. All numeric values are integers.
+An optional `"warmup"` field overrides the per-kernel warmup for that case.
+
+**VectorOPKernel** — element-wise op benchmark
+
+| Field | Description |
+|-------|-------------|
+| `label` | Display name in the report |
+| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6 |
+| `size` | Elements per inner kernel call |
+| `outer` | Outer loop count; `outer=1` is the non-broadcast case |
+| `a_inc` | Stride for A between outer iterations (`size` to advance, `0` to repeat) |
+| `b_inc` | Stride for B between outer iterations (`size` to advance, `0` to repeat) |
+| `iters` | Timed iterations (after warmup) |
+
+Binary ops touch 3 memory ports (A, B, C); unary ops (RELU, RELU6) touch 2.
+The reported **GB/s** accounts for this: `ports × size × outer × 2B / lat`.
+
+**MatmulKernel** — matrix multiply benchmark
+
+| Field | Description |
+|-------|-------------|
+| `n` | Rows of A and C |
+| `k` | Columns of A / rows of B (accumulation dimension) |
+| `m` | Columns of B and C |
+| `batch` | Batch size; `1` = single matrix multiply |
+| `a_stride` | Elements between A batch slices (`n×k` for batched, `0` to broadcast A) |
+| `b_stride` | Elements between B batch slices (`k×m` for batched, `0` to broadcast B) |
+| `iters` | Timed iterations |
+
+Reported metric: **GFLOPS** = `2 × batch × n × k × m / lat`.
+
+**ConvKernel** — 2-D NCHW convolution benchmark
+
+| Field | Description |
+|-------|-------------|
+| `batch` | Batch size |
+| `in_ch` | Input channels |
+| `in_h`, `in_w` | Input spatial dimensions |
+| `out_ch` | Output channels |
+| `kh`, `kw` | Kernel (filter) size |
+| `stride_h`, `stride_w` | Convolution stride |
+| `dilation_h`, `dilation_w` | Dilation factor (1 = standard conv) |
+| `pad_top`, `pad_left` | Zero-padding; use `(k−1)/2` for same-padding |
+| `has_bias` | 1 to include a bias buffer in the benchmark, 0 to skip |
+| `is_dw` | 1 for depthwise (grouped, `in_ch=out_ch`), 0 for standard |
+| `iters` | Timed iterations |
+
+Output size is computed by the benchmark binary: `out_h = (in_h + 2×pad_top − dil×(kh−1) − 1) / stride_h + 1`.
+Reported metric: **GFLOPS** = `2 × MACs / lat` where MACs = `batch × out_ch × out_h × out_w × ic × kh × kw`
+(standard conv) or `batch × out_ch × out_h × out_w × kh × kw` (depthwise).
+
+**PoolingKernel** — 2-D NCHW pooling benchmark
+
+| Field | Description |
+|-------|-------------|
+| `batch`, `channels` | Batch and channel count |
+| `in_h`, `in_w` | Input spatial dimensions |
+| `pool_h`, `pool_w` | Pooling window size; set to `in_h×in_w` for global pool |
+| `stride_h`, `stride_w` | Pooling stride |
+| `pad_top`, `pad_left` | Zero-padding |
+| `dil_h`, `dil_w` | Dilation (1 = standard) |
+| `pool_type` | 0=MaxPool 1=AveragePool 2=LpPool |
+| `lp_order` | P value for LpPool (1 or 2); ignored for other types |
+| `count_include_pad` | 1 to include padding in the average denominator |
+| `iters` | Timed iterations |
+
+Reported metric: **GB/s** = `(x_bytes + y_bytes) / lat`.
+
+---
+
+### Running Benchmarks
+
+#### Full benchmark run (all enabled kernels)
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json
+```
+
+#### Specific kernels only (overrides `enabled` in config)
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json \
+    --kernels VectorOPKernel MatmulKernel
+```
+
+#### Override iteration and warmup counts
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json \
+    --iters 500 --warmup 20
+```
+
+`--iters` overrides the per-case `iters` field for every case. `--warmup`
+overrides the per-kernel `warmup` for every case.
+
+#### Preflight check (no benchmarks)
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json --check-only
+```
+
+#### Verbose — show error output for failed cases
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json --verbose
+```
+
+#### Keep remote build for manual inspection
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json --no-cleanup
+# then: ssh root@192.168.100.8
+#       ls /tmp/kernel_perf/kv260_perf/build/
+#       sudo /tmp/kernel_perf/kv260_perf/build/bench_vectorop fabric ADD-1K 0 16384 1 0 0 100 5
+```
+
+---
+
+### Reading the Report
+
+After all cases run, the script prints a per-kernel table:
+
+```
+  VectorOPKernel
+  ──────────────────────────────────────────────────────────────────────────────
+  Label               Parameters                        Lat(ms)      GB/s
+  ──────────────────────────────────────────────────────────────────────────────
+  ADD-1K              ADD    size=1024    outer=1          0.0048    1.274
+  ADD-4K              ADD    size=4096    outer=1          0.0092    2.672
+  ADD-16K             ADD    size=16384   outer=1          0.0214    4.580
+  ADD-64K             ADD    size=65536   outer=1          0.0731    5.366
+  ADD-256K            ADD    size=262144  outer=1          0.2743    5.719
+  ...
+  RELU-bcast-8x16K    RELU   size=16384   outer=8          0.1634    4.820
+  ──────────────────────────────────────────────────────────────────────────────
+  peak GB/s                                                           5.719
+  min latency                                              0.0048
+  14/14 OK
+
+  MatmulKernel
+  ...
+  peak GFLOPS                                                         8.441
+
+  ── OVERALL: 41/41 cases passed ──
+```
+
+| Column | Meaning |
+|--------|---------|
+| `Lat(ms)` | Mean kernel execution time per call (wall-clock, after warmup) |
+| `GB/s` | Memory bandwidth for VectorOPKernel and PoolingKernel |
+| `GFLOPS` | Arithmetic throughput for MatmulKernel and ConvKernel |
+| `peak GB/s` / `peak GFLOPS` | Best metric across all passing cases in the group |
+| `min latency` | Shortest latency across all passing cases in the group |
+| `ERR` | Case failed; run with `--verbose` to see the error message |
+
+The latency includes `inference_buf_sync_from_device()` (cache invalidation after
+each kernel write). For large buffers this adds a measurable but consistent
+overhead; it is included because it is part of the real inference path.
+
+---
+
+### Disabling Kernels
+
+To skip a kernel group without removing its cases from the config:
+
+```json
+"benchmarks": {
+  "ConvKernel": { "enabled": false, "warmup": 10, "cases": [ ... ] }
+}
+```
+
+The CLI `--kernels` flag takes precedence over `enabled`: passing
+`--kernels VectorOPKernel` runs only VectorOPKernel regardless of which kernels
+are marked `enabled` in the config.
+
+---
+
+### Adding Custom Test Cases
+
+Append entries to the kernel's `"cases"` array in `perf_config.json`. Use the
+field tables above to set the parameters. Example — a large square matmul:
+
+```json
+{"label": "512x512x512", "n": 512, "k": 512, "m": 512,
+ "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 5}
+```
+
+The `"cases"` array is required; a kernel with no `"cases"` key (or an empty
+array) is skipped.
+
+---
+
+### Debugging Failed Cases
+
+A case shows `ERR` when the benchmark binary exits non-zero. Common causes:
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `xclOpen(0) failed` | XRT not loaded / no bitstream active | Load the FPGA overlay: `fpgautil -b <bitstream>.bit.bin -o <overlay>.dtbo` |
+| `init 'fabric' failed` | UIO device name mismatch | Check `cat /sys/class/uio/uio*/name` and update `remote.uio_devices` |
+| `alloc failed` | DMA buffer allocation failed | Reduce `size` or number of concurrent allocations; check `dmesg` for CMA |
+| `No such file` (binary missing) | Driver files not found at build time | Verify `local.driver_dirs` paths exist and contain all `x<kernel>*.c/.h` files; re-run with `--no-cleanup` and inspect cmake output |
+
+Run with `--verbose` to see the first 5 lines of stderr from the failing binary:
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json --verbose
+```
+
+Run with `--no-cleanup` to keep the build on the board and invoke the binary
+manually for interactive debugging.
 
 ---
 
