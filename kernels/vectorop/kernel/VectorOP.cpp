@@ -1,5 +1,24 @@
 #include "VectorOP.h"
 #include "hls_stream.h"
+#ifdef __SYNTHESIS__
+#include "hls_math.h"
+#else
+#include <cmath>
+#endif
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+
+// hls::exp is available only under the HLS compiler; std::exp is used for
+// C simulation.  Wrapping in a static inline keeps the softmax body clean.
+static inline float sm_exp(float x) {
+#ifdef __SYNTHESIS__
+    return hls::exp(x);
+#else
+    return std::exp(x);
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Scalar compute helpers (inlined into the compute stage)
@@ -135,6 +154,57 @@ static void store_c(
 }
 
 // ---------------------------------------------------------------------------
+// Softmax kernel (axis = -1 only)
+//
+// Three sequential DDR passes per outer row:
+//   1. find max(a[i])       — prevents exp() overflow for wide fixed-point types
+//   2. sum exp(a[i]-max)    — loop-carried add; II > 1 for float, accepted
+//   3. write exp(a[i]-max) / sum — II=1, no loop-carried dependency
+//
+// All intermediate arithmetic is done in float so hls::exp can be inlined
+// efficiently regardless of Data_t (ap_fixed, half, float, …).
+// ---------------------------------------------------------------------------
+static void softmax_kernel(
+    const Data_t* a,
+    Data_t*       c,
+    unsigned      outer,
+    unsigned      size,
+    unsigned      a_inc,
+    unsigned      c_inc
+) {
+#pragma HLS INLINE off
+    for (unsigned o = 0; o < outer; ++o) {
+#pragma HLS LOOP_TRIPCOUNT min=1 max=1024
+        // Pass 1: find max for numerical stability
+        float max_val = static_cast<float>(a[o * a_inc]);
+        for (unsigned i = 1; i < size; ++i) {
+#pragma HLS PIPELINE
+#pragma HLS LOOP_TRIPCOUNT min=0 max=65535
+            const float v = static_cast<float>(a[o * a_inc + i]);
+            if (v > max_val) max_val = v;
+        }
+
+        // Pass 2: accumulate sum of exp(x - max)
+        float sum = 0.0f;
+        for (unsigned i = 0; i < size; ++i) {
+#pragma HLS PIPELINE
+#pragma HLS LOOP_TRIPCOUNT min=1 max=65536
+            sum += sm_exp(static_cast<float>(a[o * a_inc + i]) - max_val);
+        }
+        const float inv_sum = 1.0f / sum;
+
+        // Pass 3: write normalised output
+        for (unsigned i = 0; i < size; ++i) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=1 max=65536
+            const float val =
+                sm_exp(static_cast<float>(a[o * a_inc + i]) - max_val) * inv_sum;
+            c[o * c_inc + i] = saturate_cast<Data_t>(val);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top kernel
 // ---------------------------------------------------------------------------
 void VectorOPKernel(
@@ -166,6 +236,16 @@ void VectorOPKernel(
     #pragma HLS INTERFACE s_axilite port=b_inc  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return bundle=ctrl
 
+    // c_inc == 0 when outer==1 (a_inc==b_inc==0) — writes c[i] directly.
+    const unsigned c_inc = a_inc + b_inc;
+
+    // Softmax bypasses the element-wise dataflow pipeline: it requires two
+    // extra DDR passes (max-find + exp-sum) per row before normalisation.
+    if (op == OP_SOFTMAX) {
+        softmax_kernel(a, c, outer, size, a_inc, c_inc);
+        return;
+    }
+
     // Static streams persist across synthesis elaboration; depth=32 decouples
     // load and compute so that DDR bursts can run ahead of the compute stage.
     static hls::stream<Data_t> a_s("a_s");
@@ -174,9 +254,6 @@ void VectorOPKernel(
     #pragma HLS stream variable=a_s depth=32
     #pragma HLS stream variable=b_s depth=32
     #pragma HLS stream variable=c_s depth=32
-
-    // c_inc == 0 when outer==1 (a_inc==b_inc==0) — writes c[i] directly.
-    const unsigned c_inc = a_inc + b_inc;
 
     // Four concurrent pipeline stages; load stages overlap with compute and
     // store so that DDR read latency is hidden behind active computation.

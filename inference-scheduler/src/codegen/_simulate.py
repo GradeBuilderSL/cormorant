@@ -37,7 +37,7 @@ from typing import Dict, List
 import numpy as np
 
 from ..nodes  import (
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6, OP_SOFTMAX,
     MatmulNode, ConvNode, PoolNode, ReshapeNode,
     POOL_MAX, POOL_AVG, POOL_LP,
 )
@@ -370,6 +370,13 @@ class _SimulateMixin:
                 result = np.maximum(a, 0.0)
             elif sn.op_code == OP_RELU6:
                 result = np.minimum(np.maximum(a, 0.0), 6.0)
+            elif sn.op_code == OP_SOFTMAX:
+                # Numerically-stable softmax over the last axis, matching the
+                # hardware 3-pass implementation (max-subtract, exp-sum, divide).
+                a_flat   = a.reshape(sn.outer_count, sn.chunk_size)
+                max_vals = a_flat.max(axis=1, keepdims=True)
+                exp_vals = np.exp(a_flat - max_vals)
+                result   = (exp_vals / exp_vals.sum(axis=1, keepdims=True)).reshape(a.shape)
             else:
                 raise ValueError(
                     f"_forward_pass: unknown op_code {sn.op_code} "

@@ -203,6 +203,17 @@ if(POOL_VITIS_HLS)
             set(_p_clock "300")
         endif()
 
+        # Optional: AXI master bus width in bits (default: global AXI_BUS_WIDTH)
+        string(JSON _p_axi_bus_width ERROR_VARIABLE _e GET "${_pjson}" axi_bus_width)
+        if(_e OR NOT _p_axi_bus_width)
+            set(_p_axi_bus_width "$CACHE{AXI_BUS_WIDTH}")
+        elseif(NOT _p_axi_bus_width MATCHES "^(32|64|128|256|512)$")
+            message(WARNING "PoolingKernel platform '${_pname}': invalid axi_bus_width "
+                            "'${_p_axi_bus_width}' — must be 32, 64, 128, 256, or 512. "
+                            "Falling back to global AXI_BUS_WIDTH=$CACHE{AXI_BUS_WIDTH}.")
+            set(_p_axi_bus_width "$CACHE{AXI_BUS_WIDTH}")
+        endif()
+
         # Per-platform build directory
         set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
         file(MAKE_DIRECTORY "${_p_build_dir}")
@@ -225,6 +236,8 @@ if(POOL_VITIS_HLS)
             "-O3 -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${_p_build_dir}")
         set(POOL_TARGET_CLOCK_TCL  "${_p_clock}")
         set(POOL_IP_OUTPUT_DIR     "${_p_build_dir}/ip_catalog")
+        # Shadow the global AXI_BUS_WIDTH so configure_file picks up the per-platform value.
+        set(AXI_BUS_WIDTH          "${_p_axi_bus_width}")
 
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Synthesis.tcl.in"
@@ -236,13 +249,13 @@ if(POOL_VITIS_HLS)
             COMMAND ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}
                     "${_p_build_dir}/synthesize_${_pname}.tcl"
             WORKING_DIRECTORY "${_p_build_dir}"
-            COMMENT "HLS synthesis: PoolingKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
+            COMMENT "HLS synthesis: PoolingKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz, ${_p_axi_bus_width}-bit AXI)"
             DEPENDS
                 "${POOL_KERNEL_SRC}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/include/PoolingKernel.h"
                 "${_p_build_dir}/Config.h")
 
         message(STATUS "PoolingKernel: synthesis target 'synthesize_${_pname}' "
-                       "(${_p_part} @ ${_p_clock} MHz)")
+                       "(${_p_part} @ ${_p_clock} MHz, ${_p_axi_bus_width}-bit AXI)")
     endforeach()
 endif()

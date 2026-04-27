@@ -126,6 +126,28 @@ class TestSourceGen(unittest.TestCase):
         s = self._source("single_add.onnx")
         self.assertIn("<string.h>", s)
 
+    def test_softmax_define_present(self):
+        s = self._source("softmax_1d.onnx")
+        self.assertIn("#define VECTOROP_SOFTMAX", s)
+
+    def test_softmax_null_b(self):
+        # Softmax is unary — b must be NULL in the run_op call
+        s = self._source("softmax_1d.onnx")
+        self.assertIn("VECTOROP_SOFTMAX", s)
+        self.assertIn("NULL", s)
+
+    def test_softmax_outer_count(self):
+        # softmax_2d has shape [4,16]: outer=4, chunk=16
+        s = self._source("softmax_2d.onnx")
+        self.assertIn("VECTOROP_SOFTMAX", s)
+        self.assertIn("4u", s)
+
+    def test_softmax_chain(self):
+        # softmax after Add — both ops must appear in the generated source
+        s = self._source("softmax_chain.onnx")
+        self.assertIn("VECTOROP_ADD", s)
+        self.assertIn("VECTOROP_SOFTMAX", s)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -83,24 +83,74 @@ All four kernels share a single top-level CMake project.
 cd axi_demo
 mkdir build && cd build
 cmake ../
+```
 
-# C simulation tests (no hardware needed)
-make TestSimulation    # VectorOPKernel
-make TestConvRef       # ConvKernel
-make TestMatmulRef     # MatmulKernel
-make TestPoolingSim    # PoolingKernel
+### Make targets
 
-# Run all simulation tests
-ctest
+#### Simulation tests — no hardware required
 
-# HLS synthesis + Vivado IP export (requires Vitis)
+| Target | Kernel | Notes |
+|--------|--------|-------|
+| `TestSimulation` | VectorOPKernel | All 6 ops, saturation boundary cases |
+| `TestConvRef` | ConvKernel | Reference conv against float baseline |
+| `TestMatmulRef` | MatmulKernel | Reference matmul against float baseline |
+| `TestMatmulBlas` | MatmulKernel | Same, cross-checked against CBLAS *(only if BLAS found at configure time)* |
+| `TestPoolingSim` | PoolingKernel | MaxPool, AveragePool, LpPool variants |
+
+```bash
+make TestSimulation
+make TestConvRef
+make TestMatmulRef
+make TestPoolingSim
+
+ctest          # run all registered tests
+```
+
+#### HLS synthesis — requires Vitis
+
+Per-kernel targets run Vitis HLS and export an IP catalog archive:
+
+| Target | Kernel |
+|--------|--------|
+| `synthesize_vectorop_<platform>` | VectorOPKernel |
+| `synthesize_conv_<platform>` | ConvKernel |
+| `synthesize_matmul_<platform>` | MatmulKernel |
+| `synthesize_pool_<platform>` | PoolingKernel |
+| `synthesize_<platform>` | All four kernels (aggregate) |
+
+For the built-in `kv260` platform:
+
+```bash
 make synthesize_vectorop_kv260
 make synthesize_conv_kv260
 make synthesize_matmul_kv260
 make synthesize_pool_kv260
+
+make synthesize_kv260      # all four at once
 ```
 
-Each kernel can also be built standalone:
+#### Device tree overlay — requires `dtc`
+
+Each `.dts` file under `dts/<platform>/` gets a corresponding build target:
+
+| Target | Input | Output |
+|--------|-------|--------|
+| `dtbo_<platform>_<stem>` | `dts/<platform>/<stem>.dts` | `build/dts/<platform>/design_<stem>.dtbo` |
+
+For the built-in KV260 overlay:
+
+```bash
+make dtbo_kv260_cormorant
+# output: build/dts/kv260/design_cormorant.dtbo
+```
+
+`dtc` is located automatically at configure time. If it is absent, cmake prints
+an install hint (`sudo apt install device-tree-compiler`) and the target fails
+at build time with a clear error message.
+
+### Standalone per-kernel build
+
+Each kernel is also a self-contained CMake project:
 
 ```bash
 cd axi_demo/kernels/vectorop
@@ -120,13 +170,29 @@ make synthesize_vectorop_kv260
 
 ### Adding a new platform
 
-Create `kernels/<name>/platforms/<platform>.json` (required: `part`; optional: `board`, `clock`):
+Create `platforms/<platform>.json`:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `part` | yes | — | Xilinx device part string |
+| `board` | no | *(none)* | Board identifier passed to `set_part -board` |
+| `clock` | no | `300` | Target clock in MHz |
+| `axi_bus_width` | no | `AXI_BUS_WIDTH` CMake variable (default 32) | AXI master bus width in bits; sets `config_interface -m_axi_max_widen_bitwidth` in the HLS TCL script. Valid values: 32, 64, 128, 256, 512. |
+
+Example:
 
 ```json
-{ "part": "xczu9eg-ffvb1156-2-e", "board": "xilinx.com:zcu102:part0:3.4", "clock": 250 }
+{
+  "part": "xczu9eg-ffvb1156-2-e",
+  "board": "xilinx.com:zcu102:part0:3.4",
+  "clock": 250,
+  "axi_bus_width": 64
+}
 ```
 
-Re-run cmake, then `make synthesize_<kernel>_<platform>`.
+Re-run cmake. The new platform gets synthesis targets for all four kernels
+(`synthesize_<kernel>_<platform>`, `synthesize_<platform>`) and a device tree
+target for any `.dts` file placed under `dts/<platform>/`.
 
 ---
 
