@@ -27,7 +27,11 @@ from onnx import shape_inference, TensorProto
 from typing import Union
 from .tensor import TensorInfo
 from .nodes  import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
-                     POOL_OP_TYPES, SchedulerError)
+                     POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
+
+_ALL_SUPPORTED_OP_TYPES: frozenset = (
+    {"MatMul", "Conv", "Gemm"} | POOL_OP_TYPES | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES
+)
 from .dtype  import DataType, AP_FIXED_16_8
 
 
@@ -284,6 +288,12 @@ class OnnxGraph:
             elif node.op_type in ("Reshape", "Squeeze", "Unsqueeze", "Dropout"):
                 sn = ReshapeNode.from_onnx_node(node, self._tensors, idx, align_elems)
             else:
+                if node.op_type not in VECTOROP_OP_TYPES:
+                    raise SchedulerError(
+                        f"Node '{node.name or node.op_type}' "
+                        f"(op_type='{node.op_type}') is not supported.\n"
+                        f"Supported ops: {sorted(_ALL_SUPPORTED_OP_TYPES)}"
+                    )
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
 
