@@ -1,4 +1,8 @@
-# axi_demo — FPGA Neural-Network Inference Accelerator
+# Cormorant — FPGA Neural-Network Inference Accelerator
+
+<p align="center">
+  <img src="doc/images/cormorant.png" alt="Cormorant" width="320"/>
+</p>
 
 A set of Vitis HLS kernels for Xilinx FPGAs together with a Python
 code-generator that compiles ONNX models to self-contained C projects that
@@ -27,7 +31,7 @@ CMake) and share the same `saturate_cast` / AP_TRN+AP_SAT saturation pattern.
 ## Repository Layout
 
 ```
-axi_demo/
+cormorant/
 ├── kernels/
 │   ├── vectorop/    VectorOPKernel — element-wise vector ops
 │   │   ├── kernel/VectorOP.cpp
@@ -66,12 +70,87 @@ axi_demo/
 
 ---
 
-## Prerequisites
+## Quick Start
 
-- **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2` — HLS synthesis and IP export.
-  Source `settings64.sh` before building.
-- **CMake ≥ 3.19**
-- **Python ≥ 3.10** (inference-scheduler only)
+### 1. Run HLS simulation tests (no hardware needed)
+
+```bash
+git clone <repo-url> cormorant && cd cormorant
+mkdir build && cd build
+cmake ../
+make TestSimulation   # VectorOPKernel
+make TestConvRef      # ConvKernel
+make TestMatmulRef    # MatmulKernel
+make TestPoolingSim   # PoolingKernel
+ctest                 # run all four
+```
+
+### 2. Compile an ONNX model to a C inference project
+
+```bash
+cd inference-scheduler
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# Generate all test models, then run the Python test suite
+.venv/bin/python test/gen_all_models.py
+.venv/bin/python -m pytest test/ -q
+
+# Compile your own model
+.venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel_out
+```
+
+### 3. Synthesise for KV260 and run on hardware
+
+```bash
+# Source Vitis (required for HLS synthesis)
+source /mnt/data/xilinx/2025.2/settings64.sh
+
+cd build
+make synthesize_vectorop_kv260
+make synthesize_matmul_kv260
+make synthesize_conv_kv260
+make synthesize_pool_kv260
+make dtbo_kv260_cormorant   # build the device-tree overlay
+
+# On the KV260 — load bitstream + overlay
+fpgautil -b cormorant.bit.bin -o design_cormorant.dtbo
+
+# Back on the host — run all models over SSH
+cd inference-scheduler
+cp remote_config.json.example remote_config.json
+$EDITOR remote_config.json   # set ssh.host and local.driver_dirs
+.venv/bin/python run_remote_tests.py --config remote_config.json
+```
+
+---
+
+## Dependencies
+
+### Host (development machine)
+
+| Dependency | Min version | Purpose | Install |
+|------------|-------------|---------|---------|
+| **GCC / G++** | 9 | C simulation tests (`ctest`) | `sudo apt install build-essential` |
+| **CMake** | 3.19 | Build system | `sudo apt install cmake` |
+| **Python** | 3.10 | Inference scheduler, tests | `sudo apt install python3 python3-venv` |
+| **Xilinx Vitis** | 2025.2 | HLS synthesis, IP export | Xilinx installer; set `XILINX_VITIS` |
+| **dtc** | any | Device-tree overlay build | `sudo apt install device-tree-compiler` |
+
+Python packages (installed into `.venv` via `pip install -r requirements.txt`):
+
+| Package | Min version | Purpose |
+|---------|-------------|---------|
+| `onnx` | 1.14 | Model parsing and shape inference |
+| `numpy` | 1.24 | Weight encoding, simulation |
+| `paramiko` | 3.0 | SSH/SFTP for remote test runner |
+
+### Target board (KV260)
+
+| Dependency | Min version | Purpose | Install |
+|------------|-------------|---------|---------|
+| **GCC** | 11 | On-board build | pre-installed on KV260 Ubuntu |
+| **CMake** | 3.19 | On-board build | `sudo apt install cmake` |
+| **XRT runtime** | 2.13 | DMA buffer management, UIO | `sudo apt install xrt` or from Xilinx |
 
 ---
 
@@ -80,7 +159,7 @@ axi_demo/
 All four kernels share a single top-level CMake project.
 
 ```bash
-cd axi_demo
+cd cormorant
 mkdir build && cd build
 cmake ../
 
@@ -119,7 +198,7 @@ at build time with a clear error message.
 Each kernel can also be built standalone:
 
 ```bash
-cd axi_demo/kernels/vectorop
+cd cormorant/kernels/vectorop
 mkdir build && cd build
 cmake ../
 make TestSimulation
@@ -315,6 +394,25 @@ with `cmake + make`, executes `test_inference`, and reports PASS/FAIL per model.
 Driver directory paths in `local.driver_dirs` are validated before upload —
 a missing path fails fast with a clear error rather than a cryptic CMake error
 on the board.
+
+**UIO device names** in `remote.uio_devices` come from the node labels in the
+platform DTS overlay.  For `dts/kv260/cormorant.dts` the names are:
+
+| Kernel | UIO sysfs name |
+|--------|---------------|
+| `VectorOPKernel` | `fabric_vecop` |
+| `MatmulKernel`   | `fabric_matmul` |
+| `ConvKernel`     | `fabric_conv` |
+| `PoolingKernel`  | `fabric_pool` |
+
+To confirm names for any DTS file:
+```bash
+grep -B3 'generic-uio' dts/kv260/cormorant.dts
+# or on the board after loading the overlay:
+cat /sys/class/uio/uio*/name
+```
+
+See `inference-scheduler/doc/REMOTE_TESTING.md` for the full reference.
 
 ---
 

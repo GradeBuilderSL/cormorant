@@ -361,12 +361,107 @@ class _CoreMixin:
         """Return {output_onnx_name: source_c_name} for all ReshapeNode outputs.
 
         The reshape output shares the same DMA buffer as its source — no
-        allocation or free is needed; inference_init() just assigns the pointer.
+        allocation or free is needed.  Used by the pool allocator to skip
+        alias tensors and by inference_init() / inference_deinit() to manage
+        the pointer.  When the source is a graph input the actual pointer
+        assignment is deferred to inference_run() (see _run_reshape_aliases).
         """
         result: dict = {}
         for sn in self._graph.nodes:
             if isinstance(sn, ReshapeNode):
                 result[sn.output.onnx_name] = sn.inputs[0].c_name
+        return result
+
+    @property
+    def _run_reshape_aliases(self) -> dict:
+        """Subset of _reshape_aliases whose source is a graph input tensor.
+
+        Graph inputs only exist as inference_run() parameters, so their aliases
+        cannot be resolved in inference_init().  Instead, the pointer assignment
+        (e.g. ``Z = X;``) is emitted at the top of inference_run() and cleared
+        (``Z = NULL;``) at the bottom.
+        """
+        input_onnx = {t.onnx_name for t in self._graph.input_tensors}
+        result: dict = {}
+        for sn in self._graph.nodes:
+            if isinstance(sn, ReshapeNode) and sn.inputs[0].onnx_name in input_onnx:
+                result[sn.output.onnx_name] = sn.inputs[0].c_name
+        return result
+
+    @property
+    def _input_output_reshape_copies(self) -> list:
+        """Return [(out_t, in_c_name)] for graph outputs that are reshape
+        aliases of graph inputs (possibly through a chain of reshape-only
+        intermediate tensors).
+
+        When no hardware kernel sits between a graph input and a graph output,
+        the pointer-alias trick cannot be used (the caller supplied both
+        buffers independently).  inference_run() must copy the data explicitly:
+        ``memcpy(out, in, N * BYTES_PER_ELEM)`` followed by
+        ``inference_buf_sync_to_device(out)`` so the subsequent
+        ``inference_buf_sync_from_device(out)`` sees fresh DDR contents.
+        """
+        reshape_onnx: dict = {}
+        for sn in self._graph.nodes:
+            if isinstance(sn, ReshapeNode):
+                reshape_onnx[sn.output.onnx_name] = sn.inputs[0].onnx_name
+
+        input_map = {t.onnx_name: t.c_name for t in self._graph.input_tensors}
+        intermediate_onnx = {t.onnx_name for t in self._graph.intermediate_tensors}
+
+        result = []
+        for out_t in self._graph.output_tensors:
+            cur = out_t.onnx_name
+            while cur in reshape_onnx:
+                src = reshape_onnx[cur]
+                if src in input_map:
+                    result.append((out_t, input_map[src]))
+                    break
+                if src not in intermediate_onnx:
+                    break
+                cur = src
+        return result
+
+    @property
+    def _output_aliases(self) -> dict:
+        """Return {out_c_name: [chain_c_name, ...]} for graph outputs that are
+        the terminal node of a reshape alias chain.
+
+        A graph output is a "terminal alias" when it is produced by a ReshapeNode
+        (Reshape / Squeeze / Unsqueeze / Dropout) whose source is an intermediate
+        buffer (a kernel output).  In that case the kernel never writes directly
+        to the caller-supplied output buffer — the codegen must redirect the
+        internal buffer pointer so the kernel writes to the correct destination.
+
+        The returned list contains the c_names of every intermediate buffer in
+        the alias chain, ordered from the immediate source of the graph-output
+        ReshapeNode to the root buffer (the one the hardware kernel actually
+        writes to).  All entries are guaranteed to be intermediate tensors.
+        """
+        # Build onnx_name → onnx_name alias map from all ReshapeNodes
+        reshape_onnx: dict = {}
+        for sn in self._graph.nodes:
+            if isinstance(sn, ReshapeNode):
+                reshape_onnx[sn.output.onnx_name] = sn.inputs[0].onnx_name
+
+        # Only redirect intermediate tensors (never weights or graph inputs)
+        intermediate_c = {
+            t.onnx_name: t.c_name
+            for t in self._graph.intermediate_tensors
+        }
+
+        result: dict = {}
+        for out_t in self._graph.output_tensors:
+            if out_t.onnx_name not in reshape_onnx:
+                continue
+            chain: list = []
+            cur = reshape_onnx[out_t.onnx_name]
+            while cur is not None and cur in intermediate_c:
+                chain.append(intermediate_c[cur])
+                cur = reshape_onnx.get(cur)
+            if chain:
+                result[out_t.c_name] = chain
+
         return result
 
     @property

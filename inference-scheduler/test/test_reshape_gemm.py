@@ -29,7 +29,8 @@ def _m(name: str) -> str:
 def _models_exist() -> bool:
     return (os.path.isfile(_m("reshape_flatten.onnx"))
             and os.path.isfile(_m("squeeze_then_matmul.onnx"))
-            and os.path.isfile(_m("relu_dropout_relu.onnx")))
+            and os.path.isfile(_m("relu_dropout_relu.onnx"))
+            and os.path.isfile(_m("conv_then_squeeze.onnx")))
 
 
 def _gen(name: str) -> CodeGenerator:
@@ -656,6 +657,98 @@ class TestSqueezeSimulate(unittest.TestCase):
         x_q = gen._dtype.quantize(np.ones((1, 4), dtype=np.float64))
         y   = gen.simulate({"X": x_q})["Y"]
         np.testing.assert_allclose(y.flatten(), 1.0, atol=0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Terminal output alias redirect (Conv → Squeeze → graph output)
+# ═══════════════════════════════════════════════════════════════════
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_reshape_gemm_models.py first")
+class TestConvThenSqueezeOutputAlias(unittest.TestCase):
+    """Conv → Squeeze → graph output: kernel must write to caller's buffer."""
+
+    def test_node_types(self):
+        g = OnnxGraph(_m("conv_then_squeeze.onnx"))
+        types = [type(sn) for sn in g.nodes]
+        self.assertIn(ConvNode,    types)
+        self.assertIn(ReshapeNode, types)
+
+    def test_output_aliases_detected(self):
+        gen   = _gen("conv_then_squeeze.onnx")
+        aliases = gen._output_aliases
+        self.assertEqual(len(aliases), 1,
+                         "expected exactly one graph output alias")
+
+    def test_output_alias_chain_contains_conv_buf(self):
+        gen   = _gen("conv_then_squeeze.onnx")
+        aliases = gen._output_aliases
+        # The single graph output's chain should include the Conv output buffer
+        chain = next(iter(aliases.values()))
+        self.assertGreater(len(chain), 0)
+
+    def test_source_contains_retain(self):
+        gen = _gen("conv_then_squeeze.onnx")
+        s   = gen.generate_source()
+        self.assertIn("inference_buf_retain(", s)
+
+    def test_source_contains_release(self):
+        gen = _gen("conv_then_squeeze.onnx")
+        s   = gen.generate_source()
+        self.assertIn("inference_buf_release(", s)
+
+    def test_source_redirects_conv_output_to_graph_output(self):
+        gen   = _gen("conv_then_squeeze.onnx")
+        s     = gen.generate_source()
+        aliases = gen._output_aliases
+        chain = next(iter(aliases.values()))
+        root_buf = chain[-1]          # the Conv output buffer c_name
+        out_c    = next(iter(aliases))  # graph output c_name
+        # The redirect line: root_buf = out_c;
+        self.assertIn(f"{root_buf} = {out_c};", s)
+
+    def test_source_restores_prev_pointer(self):
+        gen   = _gen("conv_then_squeeze.onnx")
+        s     = gen.generate_source()
+        aliases = gen._output_aliases
+        chain = next(iter(aliases.values()))
+        root_buf = chain[-1]
+        # Restore line: root_buf = _prev_root_buf;
+        self.assertIn(f"{root_buf} = _prev_{root_buf};", s)
+
+    def test_header_has_refcount_field(self):
+        gen = _gen("conv_then_squeeze.onnx")
+        h   = gen.generate_header()
+        self.assertIn("refcount", h)
+
+    def test_buf_impl_has_retain(self):
+        gen = _gen("conv_then_squeeze.onnx")
+        b   = gen.generate_buf_impl()
+        self.assertIn("inference_buf_retain", b)
+
+    def test_buf_impl_has_release(self):
+        gen = _gen("conv_then_squeeze.onnx")
+        b   = gen.generate_buf_impl()
+        self.assertIn("inference_buf_release", b)
+
+    def test_simulate_correct(self):
+        """Conv identity weights [2,4,1,1] with first 2 channels: Y[0]=X[0], Y[1]=X[1]."""
+        gen = _gen("conv_then_squeeze.onnx")
+        x   = gen._dtype.quantize(np.array([[[[1.0]], [[2.0]], [[0.0]], [[0.0]]]],
+                                            dtype=np.float64))
+        y   = gen.simulate({"X": x})["Y"]
+        self.assertEqual(y.shape, (1, 2))
+        np.testing.assert_allclose(y.flatten(), [1.0, 2.0], atol=0.02)
+
+    def test_non_aliased_output_unchanged(self):
+        """squeeze_then_matmul has no terminal alias — _output_aliases must be empty."""
+        gen = _gen("squeeze_then_matmul.onnx")
+        self.assertEqual(gen._output_aliases, {})
+
+    def test_source_no_retain_for_non_alias(self):
+        """No retain/release emitted when graph output is not a reshape alias."""
+        gen = _gen("squeeze_then_matmul.onnx")
+        s   = gen.generate_source()
+        self.assertNotIn("inference_buf_retain(", s)
 
 
 # ═══════════════════════════════════════════════════════════════════

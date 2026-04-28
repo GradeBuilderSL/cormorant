@@ -149,6 +149,32 @@ def gen_reshape_gemm_pipeline() -> None:
 
 
 # ---------------------------------------------------------------------------
+# conv_then_squeeze: Conv → Squeeze → graph output (terminal alias bug)
+# X[1,4,1,1] → Conv(W[2,4,1,1], B[2]) → C[1,2,1,1] → Squeeze(axes=[2,3]) → Y[1,2]
+# The graph output Y is the terminal reshape alias of the Conv output C.
+# This model exercises the output-alias redirect code path in inference_run().
+# ---------------------------------------------------------------------------
+def gen_conv_then_squeeze() -> None:
+    w_data = np.eye(2, 4, dtype=np.float32)  # [2, 4] as [2, 4, 1, 1]
+    w_data = w_data.reshape(2, 4, 1, 1)
+    b_data = np.zeros(2, dtype=np.float32)
+    w_init = _init("W", w_data)
+    b_init = _init("B", b_data)
+
+    conv    = oh.make_node("Conv",    inputs=["X", "W", "B"], outputs=["C"],
+                           kernel_shape=[1, 1])
+    squeeze = oh.make_node("Squeeze", inputs=["C"],           outputs=["Y"],
+                           axes=[2, 3])
+    graph = oh.make_graph(
+        [conv, squeeze], "conv_then_squeeze",
+        inputs=[_vi("X", [1, 4, 1, 1])],
+        outputs=[_vi("Y", [1, 2])],
+        initializer=[w_init, b_init],
+    )
+    _save(oh.make_model(graph, opset_imports=_opset(7)), "conv_then_squeeze.onnx")
+
+
+# ---------------------------------------------------------------------------
 # squeeze_then_matmul: GlobalAveragePool → Squeeze → MatMul (MobileNet head)
 # X[1,4,4,4] → Pool → P[1,4,1,1] → Squeeze(axes=[2,3]) → F[1,4] → Y[1,8]
 # ---------------------------------------------------------------------------
@@ -229,6 +255,7 @@ ALL_GENERATORS = [
     gen_gemm_with_bias,
     gen_gemm_chain,
     gen_reshape_gemm_pipeline,
+    gen_conv_then_squeeze,
     gen_squeeze_then_matmul,
     gen_unsqueeze_then_relu,
     gen_relu_dropout_relu,

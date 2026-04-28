@@ -199,7 +199,8 @@ class TestPoolAlloc(unittest.TestCase):
 
     def test_reshape_alias_assigned_not_allocated(self):
         s = _cg("reshape_then_matmul.onnx").generate_source()
-        self.assertIn("Z = X;  /* reshape alias */", s)
+        # Source is a graph input → assignment is in inference_run(), not inference_init()
+        self.assertIn("Z = X;  /* input reshape alias */", s)
 
     # ------------------------------------------------------------------ #
     # Deinit — pool freed once, sub-buffers never freed individually      #

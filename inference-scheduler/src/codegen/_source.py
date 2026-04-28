@@ -477,8 +477,9 @@ class _SourceMixin:
         weights       = graph.weight_tensors
         intermediates = graph.intermediate_tensors
 
-        reshape_aliases = self._reshape_aliases  # {out_name: src_c_name}
-        external        = {t.onnx_name for t in self.large_weight_tensors}
+        reshape_aliases     = self._reshape_aliases      # {out_name: src_c_name}
+        run_reshape_aliases = self._run_reshape_aliases  # subset: source is graph input
+        external            = {t.onnx_name for t in self.large_weight_tensors}
 
         # Compute pool layout: list of (onnx_name, offset, alloc) + total_elems
         pool_layout, total_pool_elems = self._compute_pool_layout()
@@ -555,6 +556,13 @@ class _SourceMixin:
             if alias_tensors:
                 alloc_lines.append("    /* Reshape aliases */")
                 for t in alias_tensors:
+                    if t.onnx_name in run_reshape_aliases:
+                        # Source is a graph input — assigned in inference_run(), not here.
+                        alloc_lines.append(
+                            f"    /* {t.c_name}: input reshape alias — assigned in"
+                            f" inference_run() */"
+                        )
+                        continue
                     src_c = reshape_aliases[t.onnx_name]
                     alloc_lines.append(
                         f"    {t.c_name} = {src_c};  /* reshape alias */"
@@ -677,13 +685,100 @@ class _SourceMixin:
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
 
+        # ---- Run-time input reshape aliases ----------------------------------- #
+        # Intermediate tensors that are reshape aliases of graph inputs cannot be
+        # resolved in inference_init() because graph inputs only exist as
+        # inference_run() parameters.  Assign them here at the top of the
+        # function body and clear them at the bottom.
+        # -------------------------------------------------------------------
+        run_reshape_aliases = self._run_reshape_aliases  # {onnx_name: src_c_name}
+        intermediates_map = {t.onnx_name: t for t in graph.intermediate_tensors}
+
+        run_alias_assign_lines: list = []
+        run_alias_clear_lines:  list = []
+        for onnx_name, src_c in run_reshape_aliases.items():
+            t = intermediates_map.get(onnx_name)
+            if t is None:
+                continue  # graph-output alias — handled by _input_output_reshape_copies
+            run_alias_assign_lines.append(
+                f"    {t.c_name} = {src_c};  /* input reshape alias */"
+            )
+            run_alias_clear_lines.append(
+                f"    {t.c_name} = NULL;    /* input reshape alias */"
+            )
+
+        # ---- Input-to-output reshape copies ----------------------------------- #
+        # When a graph output is the terminus of a reshape chain rooted at a graph
+        # input (no kernel in between), the data never passes through the FPGA.
+        # A CPU memcpy followed by sync_to_device ensures the subsequent
+        # sync_from_device reads the correct data from DDR.
+        # -------------------------------------------------------------------
+        io_reshape_copies = self._input_output_reshape_copies  # [(out_t, in_c_name)]
+
+        io_reshape_copy_lines: list = []
+        for out_t, in_c in io_reshape_copies:
+            io_reshape_copy_lines += [
+                f"    /* '{out_t.onnx_name}' is a reshape alias of input"
+                f" '{in_c}' — copy data (no kernel involved). */",
+                f"    memcpy(inference_buf_ptr({out_t.c_name}),"
+                f" inference_buf_ptr({in_c}),"
+                f" {out_t.numel}u * INFERENCE_BYTES_PER_ELEM);",
+                f"    inference_buf_sync_to_device({out_t.c_name});",
+            ]
+
+        # ---- Output alias redirect ----------------------------------------- #
+        # When a graph output is the terminal node of a reshape alias chain
+        # (e.g. Conv → Reshape → Squeeze → graph_output), the hardware kernel
+        # writes to an internal intermediate buffer, not to the caller-supplied
+        # output buffer.  We fix this by redirecting the internal buffer
+        # pointer to the caller's buffer before the kernels run, then restoring
+        # it after.  inference_buf_retain/release guard against a premature free
+        # of the caller's buffer while the internal pointer borrows it.
+        # -------------------------------------------------------------------
+        output_aliases = self._output_aliases  # {out_c_name: [chain_c_name, ...]}
+
+        alias_redirect_lines: list = []
+        alias_restore_lines: list  = []
+
+        for out_t in outputs:
+            chain = output_aliases.get(out_t.c_name)
+            if not chain:
+                continue
+            out_c = out_t.c_name
+            alias_redirect_lines += [
+                f"    /* '{out_t.onnx_name}' is a terminal reshape alias — redirect the",
+                f"     * kernel output chain to write directly into the caller's buffer. */",
+                f"    inference_buf_retain({out_c});",
+            ]
+            for c in chain:
+                alias_redirect_lines.append(f"    inference_buf_t *_prev_{c} = {c};")
+            for c in chain:
+                alias_redirect_lines.append(f"    {c} = {out_c};")
+
+            alias_restore_lines += [
+                f"    /* Restore internal buffer pointers for '{out_t.onnx_name}'. */",
+            ]
+            for c in reversed(chain):
+                alias_restore_lines.append(f"    {c} = _prev_{c};")
+            alias_restore_lines.append(f"    inference_buf_release({out_c});")
+
         sections = []
+        if run_alias_assign_lines:
+            sections.append("\n".join(run_alias_assign_lines))
+        if alias_redirect_lines:
+            sections.append("\n".join(alias_redirect_lines))
         if inputs:
             sections.append("\n".join(sync_in_lines))
         if body_lines:
             sections.append("\n".join(body_lines))
+        if io_reshape_copy_lines:
+            sections.append("\n".join(io_reshape_copy_lines))
         if outputs:
             sections.append("\n".join(sync_out_lines))
+        if alias_restore_lines:
+            sections.append("\n".join(alias_restore_lines))
+        if run_alias_clear_lines:
+            sections.append("\n".join(run_alias_clear_lines))
         body = "\n\n".join(sections) if sections else "    /* (empty graph) */"
 
         return (

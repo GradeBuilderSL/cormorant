@@ -46,11 +46,53 @@ void inference_buf_init_view(inference_buf_t *view,
     view->virt         = (char *)base->virt + (size_t)byte_off;
     view->phys         = base->phys + byte_off;
     view->count        = count_elems;
+    view->refcount     = 0u;
     view->is_owner     = 0u;
 #ifdef __linux__
     view->bo           = base->bo;
     view->bo_offset    = base->bo_offset + byte_off;
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////
+/* Reference counting                                                  */
+/*                                                                     */
+/* inference_buf_retain / inference_buf_release implement a simple     */
+/* reference-counted ownership model for owner buffers (is_owner==1). */
+/* Views (is_owner==0) are backed by a parent owner buffer and their   */
+/* refcount is always 0; retain/release are no-ops for them.           */
+/*                                                                     */
+/* Usage in inference_run():                                            */
+/*   inference_buf_retain(out);     // borrow caller's output buffer   */
+/*   internal_buf = out;            // redirect kernel output          */
+/*   ... run kernels ...                                                */
+/*   internal_buf = prev;           // restore                         */
+/*   inference_buf_release(out);    // end borrow                      */
+/*                                                                     */
+/* This prevents premature free if the caller calls                    */
+/* inference_buf_free() while inference_run() holds a reference.       */
+////////////////////////////////////////////////////////////////////////
+
+/* Forward declaration — platform-specific dealloc defined below. */
+static void _inference_buf_dealloc(inference_buf_t *buf);
+
+void inference_buf_retain(inference_buf_t *buf)
+{
+    if (buf && buf->is_owner)
+        buf->refcount++;
+}
+
+void inference_buf_release(inference_buf_t *buf)
+{
+    if (!buf || !buf->is_owner)
+        return;
+    if (--buf->refcount == 0u)
+        _inference_buf_dealloc(buf);
+}
+
+void inference_buf_free(inference_buf_t *buf)
+{
+    inference_buf_release(buf);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -164,15 +206,14 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->phys      = props.paddr;
     buf->count     = n_elem;
     buf->bo        = (unsigned)bo;
+    buf->refcount  = 1u;
     buf->is_owner  = 1u;
     buf->bo_offset = 0;
     return buf;
 }
 
-void inference_buf_free(inference_buf_t *buf)
+static void _inference_buf_dealloc(inference_buf_t *buf)
 {
-    if (!buf || !buf->is_owner)
-        return;
     xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
     xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
     free(buf);
@@ -225,14 +266,13 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     /* VA == PA on Xilinx standalone with identity-mapped DDR */
     buf->phys     = (uint64_t)(uintptr_t)mem;
     buf->count    = n_elem;
+    buf->refcount = 1u;
     buf->is_owner = 1u;
     return buf;
 }
 
-void inference_buf_free(inference_buf_t *buf)
+static void _inference_buf_dealloc(inference_buf_t *buf)
 {
-    if (!buf || !buf->is_owner)
-        return;
     free(buf->virt);
     free(buf);
 }

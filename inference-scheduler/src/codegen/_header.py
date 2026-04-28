@@ -156,6 +156,7 @@ class _HeaderMixin:
             "    void     *virt;       /* CPU-accessible virtual address */\n"
             "    uint64_t  phys;       /* physical DDR address for AXI DMA registers */\n"
             "    unsigned  count;      /* number of Data_t elements allocated */\n"
+            "    unsigned  refcount;   /* reference count; 0 for views, >=1 for owners */\n"
             "    uint8_t   is_owner;   /* 1 = owns the allocation; 0 = view (alias) */\n"
             "#ifdef __linux__\n"
             "    unsigned  bo;         /* XRT buffer object handle */\n"
@@ -173,8 +174,22 @@ class _HeaderMixin:
         lines.append("inference_buf_t *inference_buf_alloc(unsigned n_elem);")
         lines.append("")
         lines.append(
-            "/* Release a buffer.  Bare-metal: frees heap memory.\n"
-            " * Linux: frees the struct metadata only (pool memory released at deinit). */"
+            "/* Increment the reference count.  No-op for views (is_owner == 0).\n"
+            " * Call before sharing a buffer with an alias that may outlive the\n"
+            " * original pointer (e.g. redirecting an internal buffer to a\n"
+            " * caller-supplied output in inference_run()). */"
+        )
+        lines.append("void  inference_buf_retain(inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Decrement the reference count and free when it reaches zero.\n"
+            " * Equivalent to inference_buf_free() for a freshly allocated buffer. */"
+        )
+        lines.append("void  inference_buf_release(inference_buf_t *buf);")
+        lines.append("")
+        lines.append(
+            "/* Release a buffer — equivalent to inference_buf_release().\n"
+            " * Kept for backward compatibility; respects the reference count. */"
         )
         lines.append("void  inference_buf_free(inference_buf_t *buf);")
         lines.append("")

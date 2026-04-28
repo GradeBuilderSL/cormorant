@@ -104,24 +104,49 @@ Minimum required change in both: set `ssh.host` to your board's IP or hostname.
 
 ### UIO device names
 
-Each hardware kernel has a UIO sysfs name set by the device tree overlay (DTSI).
-For the `design_matmul_vecop` bitstream the names are:
+Each hardware kernel has a UIO sysfs name determined by the **node label** in the
+device tree overlay (DTS).  The canonical DTS file for the KV260 is:
 
-| Kernel | UIO sysfs name |
-|--------|---------------|
-| `VectorOPKernel` | `VectorOPKernel_0` |
-| `MatmulKernel` | `MatmulKernel_0` |
-
-Verify after loading the DTBO:
-```bash
-cat /sys/class/uio/uio*/name
-# VectorOPKernel_0
-# MatmulKernel_0
+```
+dts/kv260/cormorant.dts
 ```
 
-These names are passed to cmake as `-DINFERENCE_VECTOROPKERNEL_INSTANCE` and
-`-DINFERENCE_MATMULKERNEL_INSTANCE` compile definitions, which override the
-matching `#ifndef` macros in `inference.h`.
+The four UIO nodes and their names as they appear in `/sys/class/uio/uio*/name`:
+
+| Kernel | DTS node label | UIO sysfs name |
+|--------|----------------|----------------|
+| `VectorOPKernel` | `fabric_vecop`  | `fabric_vecop`  |
+| `MatmulKernel`   | `fabric_matmul` | `fabric_matmul` |
+| `ConvKernel`     | `fabric_conv`   | `fabric_conv`   |
+| `PoolingKernel`  | `fabric_pool`   | `fabric_pool`   |
+
+To look up or confirm names, grep the DTS for `generic-uio`:
+
+```bash
+grep -B3 'generic-uio' dts/kv260/cormorant.dts
+# fabric_vecop: fabric_vecop@a0000000 {
+# fabric_matmul: fabric_matmul@a0010000 {
+# fabric_conv: fabric_conv@a0020000 {
+# fabric_pool: fabric_pool@a0030000 {
+```
+
+Verify on the board after loading the DTBO:
+
+```bash
+cat /sys/class/uio/uio*/name
+# fabric_vecop
+# fabric_matmul
+# fabric_conv
+# fabric_pool
+```
+
+These names are passed to cmake as `-DINFERENCE_VECTOROPKERNEL_INSTANCE`,
+`-DINFERENCE_MATMULKERNEL_INSTANCE`, etc., which override the matching
+`#ifndef` defaults in `inference.h`.
+
+> **Note**: an older or third-party bitstream may use different node labels
+> (e.g. `VectorOPKernel_0`).  Always derive `remote.uio_devices` from the
+> DTS/DTSI that was used to build the overlay, not from kernel driver defaults.
 
 ### Driver source resolution
 
@@ -171,14 +196,16 @@ Remote prerequisites
     OK      gcc                          gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
     OK      xrt headers                  xrt via pkg-config
     OK      sudo / root access           passwordless sudo OK
-    OK      uio (VectorOPKernel: VectorOPKernel_0)  /dev/uio4
+    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio0
 ```
 
-For a mixed-kernel model with both kernels configured:
+For a model that uses all four kernels:
 
 ```
-    OK      uio (VectorOPKernel: VectorOPKernel_0)  /dev/uio4
-    OK      uio (MatmulKernel: MatmulKernel_0)      /dev/uio5
+    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio0
+    OK      uio (MatmulKernel: fabric_matmul)    /dev/uio1
+    OK      uio (ConvKernel: fabric_conv)        /dev/uio2
+    OK      uio (PoolingKernel: fabric_pool)     /dev/uio3
 ```
 
 ### Subset of models
@@ -285,20 +312,31 @@ quantization rounding mismatch between the Python simulator and the hardware. Se
 
 ### UIO device not found
 
-The prerequisite check reports `MISSING uio (VectorOPKernel: VectorOPKernel_0)`:
+The prerequisite check reports `MISSING uio (VectorOPKernel: fabric_vecop)`.
+
+The UIO sysfs name comes from the **node label** in the DTS overlay.  Check what
+names the loaded overlay actually exported:
 
 ```bash
 # On the board: list UIO device names
 cat /sys/class/uio/uio*/name
 
-# Expected for design_matmul_vecop:
-# VectorOPKernel_0
-# MatmulKernel_0
+# Expected for cormorant.dts (all four kernels):
+# fabric_vecop
+# fabric_matmul
+# fabric_conv
+# fabric_pool
 ```
 
-If the names differ (older bitstream or different DTSI), update `remote.uio_devices`
-in your config to match. The driver scans `/sys/class/uio/uio*/name` for a string
-match — these must be sysfs names, not `/dev/uioN` paths.
+If the names differ, find the `.dts` that was used to build the overlay:
+
+```bash
+grep -B3 'generic-uio' dts/kv260/cormorant.dts
+```
+
+Update `remote.uio_devices` in your config to match the labels found there.
+The driver scans `/sys/class/uio/uio*/name` for an exact string match — these
+must be sysfs names, not `/dev/uioN` paths.
 
 If no UIO devices appear at all, the DTBO overlay may not be loaded:
 
@@ -629,11 +667,13 @@ the `design_matmul_vecop` bitstream and both UIO devices active on the board.
 ### 2. Load the bitstream on the board
 
 ```bash
-# On the KV260
-fpgautil -b design_matmul_vecop.bit.bin -o matmul_vecop.dtbo
+# On the KV260 — load the overlay built from dts/kv260/cormorant.dts
+fpgautil -b cormorant.bit.bin -o design_cormorant.dtbo
 cat /sys/class/uio/uio*/name
-# VectorOPKernel_0
-# MatmulKernel_0
+# fabric_vecop
+# fabric_matmul
+# fabric_conv
+# fabric_pool
 ```
 
 ### 3. Use remote_config_mixed.json
@@ -655,8 +695,8 @@ The runner merges driver files from `local.driver_dirs.VectorOPKernel` and
 passes both UIO names as compile definitions:
 
 ```
-cmake … -DINFERENCE_VECTOROPKERNEL_INSTANCE="VectorOPKernel_0" \
-         -DINFERENCE_MATMULKERNEL_INSTANCE="MatmulKernel_0"
+cmake … -DINFERENCE_VECTOROPKERNEL_INSTANCE="fabric_vecop" \
+         -DINFERENCE_MATMULKERNEL_INSTANCE="fabric_matmul"
 ```
 
 ### 4. Config files by bitstream
