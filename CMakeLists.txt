@@ -125,7 +125,15 @@ if(EXISTS "${_HW_REPO}/build.sh")
         COMMENT "Vivado: synthesis + implementation + bitstream (KV260 128-bit)"
     )
     message(STATUS "axi_kernels: target 'build_hw_kv260' (depends on synthesize_kv260)")
+
+    add_custom_target(sim_hw_kv260
+        COMMAND bash "${_HW_REPO}/sim.sh"
+                -ip-repo "${CMAKE_BINARY_DIR}/kernels"
+        WORKING_DIRECTORY "${_HW_REPO}"
+        COMMENT "Vivado: behavioral simulation (KV260)"
+    )
+    message(STATUS "axi_kernels: target 'sim_hw_kv260'")
 else()
-    message(STATUS "axi_kernels: 'build_hw_kv260' not available — submodule not initialised")
+    message(STATUS "axi_kernels: 'build_hw_kv260' and 'sim_hw_kv260' not available — submodule not initialised")
     message(STATUS "             Run: git submodule update --init hw/cormorant_hw_128")
 endif()
