@@ -101,3 +101,31 @@ foreach(_PF IN LISTS AXI_PLATFORM_FILES)
         message(STATUS "axi_kernels: target 'dtbo_${_pname}_${_stem}'")
     endforeach()
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Hardware build target — Vivado synthesis + implementation + bitstream.
+# Requires the cormorant_hw_128 submodule and Vivado 2025.2.
+# Must configure with -DAXI_BUS_WIDTH=128 to match the 128-bit block design.
+#
+# Usage:
+#   cmake .. -DAXI_BUS_WIDTH=128
+#   make synthesize_kv260      # build all four HLS kernel IPs first
+#   make build_hw_kv260        # then run Vivado on the block design
+#
+# Or in one shot (synthesize_kv260 is listed as a dependency):
+#   make build_hw_kv260
+# ---------------------------------------------------------------------------
+set(_HW_REPO "${CMAKE_SOURCE_DIR}/hw/cormorant_hw_128")
+if(EXISTS "${_HW_REPO}/build.sh")
+    add_custom_target(build_hw_kv260
+        COMMAND bash "${_HW_REPO}/build.sh" all
+                -ip-repo "${CMAKE_BINARY_DIR}/kernels"
+        WORKING_DIRECTORY "${_HW_REPO}"
+        DEPENDS synthesize_kv260
+        COMMENT "Vivado: synthesis + implementation + bitstream (KV260 128-bit)"
+    )
+    message(STATUS "axi_kernels: target 'build_hw_kv260' (depends on synthesize_kv260)")
+else()
+    message(STATUS "axi_kernels: 'build_hw_kv260' not available — submodule not initialised")
+    message(STATUS "             Run: git submodule update --init hw/cormorant_hw_128")
+endif()
