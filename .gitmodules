@@ -1,0 +1,3 @@
+[submodule "hw/cormorant_hw_128"]
+	path = hw/cormorant_hw_128
+	url = git@github.com:GradeBuilderSL/cormorant_hw_128.git
