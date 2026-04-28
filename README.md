@@ -439,4 +439,5 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 
 ## License
 
-BSD 3-Clause License.
+Copyright 2025 GradeBuilder SL. Licensed under the
+[Apache License, Version 2.0](LICENSE).
