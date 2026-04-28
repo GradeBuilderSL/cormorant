@@ -267,6 +267,34 @@ class _CoreMixin:
             result[t.onnx_name] = (lay.n_chunks, lay.stride)
         return result
 
+    def _compute_live_intervals(self) -> dict:
+        """Return {onnx_name: (produce_idx, last_consume_idx)} for every
+        non-reshape-alias intermediate tensor.
+
+        Weights and graph inputs/outputs are excluded — they live for the
+        entire inference call and are never candidates for buffer reuse.
+        """
+        reshape_aliases = set(self._reshape_aliases)
+        intermediate_names = {
+            t.onnx_name
+            for t in self._graph.intermediate_tensors
+            if t.onnx_name not in reshape_aliases
+        }
+        produced_at: dict = {}
+        last_consumed_at: dict = {}
+        for idx, sn in enumerate(self._graph.nodes):
+            out = sn.output.onnx_name
+            if out in intermediate_names:
+                produced_at[out] = idx
+            for inp in sn.inputs:
+                if inp.onnx_name in intermediate_names:
+                    last_consumed_at[inp.onnx_name] = idx
+        return {
+            name: (produced_at[name], last_consumed_at.get(name, produced_at[name]))
+            for name in intermediate_names
+            if name in produced_at
+        }
+
     def _compute_pool_layout(self):
         """
         Compute per-buffer offsets for the single contiguous pool allocation.
@@ -278,7 +306,8 @@ class _CoreMixin:
           total_elems = total pool size in elements (sum of aligned alloc sizes)
 
         Each slot is padded to a 64-byte boundary to ensure DMA cache-line
-        alignment between sub-buffers.
+        alignment between sub-buffers.  Intermediate tensors with non-overlapping
+        live intervals are packed into the same slot to minimise pool size.
         """
         bpe       = self._dtype.bytes_per_elem
         align_to  = 64 // bpe   # elements per 64-byte boundary
@@ -289,16 +318,56 @@ class _CoreMixin:
         layout  = []
         offset  = 0
 
+        # Weights: live for the entire call — always sequential, never shared.
         for t in self._graph.weight_tensors:
             alloc = self._alloc_sizes[t.onnx_name]
             layout.append((t.onnx_name, offset, alloc))
             offset += align_up(alloc)
 
-        for t in self._graph.intermediate_tensors:
-            if t.onnx_name in reshape_aliases:
-                continue
-            alloc = self._alloc_sizes[t.onnx_name]
-            layout.append((t.onnx_name, offset, alloc))
+        # Intermediates: greedy interval-graph colouring.
+        # Two tensors may share a slot only when their live intervals are disjoint.
+        intervals   = self._compute_live_intervals()
+        alloc_sizes = self._alloc_sizes
+
+        # Preserve graph order for tensors without an interval entry (fallback).
+        cand_names = [
+            t.onnx_name for t in self._graph.intermediate_tensors
+            if t.onnx_name not in reshape_aliases
+        ]
+
+        # Sort candidates by start time; break ties largest-first so that the
+        # biggest buffer claims the slot and smaller ones only reuse it.
+        with_intervals = sorted(
+            [(n, intervals[n]) for n in cand_names if n in intervals],
+            key=lambda kv: (kv[1][0], -alloc_sizes.get(kv[0], 0)),
+        )
+        no_intervals = [n for n in cand_names if n not in intervals]
+
+        # slots: [(end_time, slot_alloc_elems, [onnx_name, ...])]
+        slots: list = []
+        for name, (start, end) in with_intervals:
+            a = alloc_sizes.get(name, 0)
+            placed = False
+            for slot in slots:
+                if slot[0] < start:      # slot is free before this tensor starts
+                    slot[0] = end
+                    slot[1] = max(slot[1], align_up(a))
+                    slot[2].append(name)
+                    placed = True
+                    break
+            if not placed:
+                slots.append([end, align_up(a), [name]])
+
+        for slot_end, slot_alloc, names in slots:
+            for name in names:
+                layout.append((name, offset, alloc_sizes[name]))
+            offset += slot_alloc
+
+        # Tensors with no interval data (should not occur in a well-formed
+        # graph but handled defensively) get their own sequential slot.
+        for name in no_intervals:
+            alloc = alloc_sizes[name]
+            layout.append((name, offset, alloc))
             offset += align_up(alloc)
 
         return layout, offset

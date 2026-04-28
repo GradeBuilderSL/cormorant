@@ -136,13 +136,30 @@ class TestPoolAlloc(unittest.TestCase):
     # ------------------------------------------------------------------ #
 
     def _assert_no_overlap(self, model_name: str):
-        layout, _ = _cg(model_name)._compute_pool_layout()
+        cg = _cg(model_name)
+        layout, _ = cg._compute_pool_layout()
+        intervals = cg._compute_live_intervals()
         for i, (n1, off1, sz1) in enumerate(layout):
             for n2, off2, sz2 in layout[i + 1:]:
-                overlap = off1 < off2 + sz2 and off2 < off1 + sz1
+                pool_overlap = off1 < off2 + sz2 and off2 < off1 + sz1
+                if not pool_overlap:
+                    continue
+                # Pool ranges overlap: only valid when both tensors are
+                # intermediates whose live intervals are disjoint.
+                iv1 = intervals.get(n1)
+                iv2 = intervals.get(n2)
+                if iv1 is None or iv2 is None:
+                    self.fail(
+                        f"Pool overlap for non-intermediate: "
+                        f"{n1}@[{off1},{off1+sz1}) vs {n2}@[{off2},{off2+sz2})"
+                    )
+                live_overlap = iv1[0] <= iv2[1] and iv2[0] <= iv1[1]
                 self.assertFalse(
-                    overlap,
-                    msg=f"Overlap: {n1}[{off1},{off1+sz1}) vs {n2}[{off2},{off2+sz2})",
+                    live_overlap,
+                    msg=(
+                        f"Live+pool overlap: {n1} live={iv1} pool=[{off1},{off1+sz1}) "
+                        f"vs {n2} live={iv2} pool=[{off2},{off2+sz2})"
+                    ),
                 )
 
     def test_no_overlap_gemm_with_bias(self):

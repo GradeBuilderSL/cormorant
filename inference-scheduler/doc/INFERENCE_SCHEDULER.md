@@ -21,6 +21,8 @@ per-layer execution loop — all without any Python or ONNX runtime on the targe
 9. [Building the Generated Project](#9-building-the-generated-project)
 10. [Running Tests](#10-running-tests)
 
+**Related:** [Buffer Reuse — Live-Interval Optimisation](BUFFER_REUSE.md)
+
 ---
 
 ## 1. What It Does
@@ -295,6 +297,11 @@ typedef uint16_t Data_t;
 /* Minimum contiguous DMA pool required (Linux only) */
 #define INFERENCE_BUF_POOL_SIZE_BYTES  8192u
 ```
+
+> **Pool sizing note:** intermediate tensors with non-overlapping execution
+> lifetimes share the same pool slot, so `INFERENCE_BUF_POOL_SIZE_BYTES` can be
+> significantly smaller than the sum of all individual tensor sizes.  See
+> **[doc/BUFFER_REUSE.md](BUFFER_REUSE.md)** for the full analysis.
 
 ### DMA Buffer API (inference.h)
 
