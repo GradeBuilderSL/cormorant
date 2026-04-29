@@ -162,17 +162,44 @@ All four kernels share a single top-level CMake project.
 cd cormorant
 mkdir build && cd build
 cmake ../
+```
 
-# C simulation tests (no hardware needed)
-make TestSimulation    # VectorOPKernel
-make TestConvRef       # ConvKernel
-make TestMatmulRef     # MatmulKernel
-make TestPoolingSim    # PoolingKernel
+### Make targets
 
-# Run all simulation tests
-ctest
+#### Simulation tests — no hardware required
 
-# HLS synthesis + Vivado IP export (requires Vitis)
+| Target | Kernel | Notes |
+|--------|--------|-------|
+| `TestSimulation` | VectorOPKernel | All 6 ops, saturation boundary cases |
+| `TestConvRef` | ConvKernel | Reference conv against float baseline |
+| `TestMatmulRef` | MatmulKernel | Reference matmul against float baseline |
+| `TestMatmulBlas` | MatmulKernel | Same, cross-checked against CBLAS *(only if BLAS found at configure time)* |
+| `TestPoolingSim` | PoolingKernel | MaxPool, AveragePool, LpPool variants |
+
+```bash
+make TestSimulation
+make TestConvRef
+make TestMatmulRef
+make TestPoolingSim
+
+ctest          # run all registered tests
+```
+
+#### HLS synthesis — requires Vitis
+
+Per-kernel targets run Vitis HLS and export an IP catalog archive:
+
+| Target | Kernel |
+|--------|--------|
+| `synthesize_vectorop_<platform>` | VectorOPKernel |
+| `synthesize_conv_<platform>` | ConvKernel |
+| `synthesize_matmul_<platform>` | MatmulKernel |
+| `synthesize_pool_<platform>` | PoolingKernel |
+| `synthesize_<platform>` | All four kernels (aggregate) |
+
+For the built-in `kv260` platform:
+
+```bash
 make synthesize_vectorop_kv260
 make synthesize_conv_kv260
 make synthesize_matmul_kv260

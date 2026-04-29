@@ -339,6 +339,94 @@ static bool RunBroadcastTests() {
 }
 
 // ---------------------------------------------------------------------------
+// RunSoftmaxTest — single-row softmax over 'size' elements.
+//
+// Reference: numerically-stable softmax computed in double precision.
+// Tolerance: 3 LSB for fixed-point types (quantisation + float exp rounding),
+//            1e-4 absolute for floating-point Data_t.
+// ---------------------------------------------------------------------------
+static void ref_softmax_row(const std::vector<double>& a, std::vector<double>& c) {
+    const double max_val = *std::max_element(a.begin(), a.end());
+    double sum = 0.0;
+    for (double v : a) sum += std::exp(v - max_val);
+    const double inv = 1.0 / sum;
+    for (size_t i = 0; i < a.size(); ++i)
+        c[i] = std::exp(a[i] - max_val) * inv;
+}
+
+static bool RunSoftmaxTest(unsigned outer, unsigned size, unsigned seed) {
+    std::default_random_engine rng(seed);
+    std::uniform_real_distribution<double> dist(-5.0, 5.0);
+
+    const unsigned total = outer * size;
+    std::vector<Data_t> a(total), b(total, Data_t(0)), c(total, Data_t(0));
+    std::vector<double> a_d(total), c_ref(total);
+
+    for (unsigned i = 0; i < total; ++i) {
+        a_d[i] = dist(rng);
+        a[i]   = Data_t(a_d[i]);
+        a_d[i] = static_cast<double>(a[i]);  // use the quantised value
+    }
+    for (unsigned o = 0; o < outer; ++o) {
+        std::vector<double> row(a_d.begin() + o * size, a_d.begin() + o * size + size);
+        std::vector<double> row_ref(size);
+        ref_softmax_row(row, row_ref);
+        for (unsigned i = 0; i < size; ++i)
+            c_ref[o * size + i] = row_ref[i];
+    }
+
+    VectorOPKernel(a.data(), b.data(), c.data(), size,
+                   static_cast<unsigned>(OP_SOFTMAX), outer, size, 0u);
+
+    const bool isFloat = std::is_floating_point<Data_t>::value;
+    const double tol   = isFloat ? 1e-4 : 3.0 / 256.0;
+
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < total; ++i) {
+        const double got  = static_cast<double>(c[i]);
+        const double ref  = c_ref[i];
+        const double diff = std::abs(got - ref);
+        if (diff > tol) {
+            ++mismatches;
+            if (mismatches <= 3)
+                std::cerr << "  [SOFTMAX] MISMATCH at [" << i << "]: "
+                          << "got=" << got << "  ref=" << ref
+                          << "  a=" << a_d[i] << "\n";
+        }
+    }
+    return mismatches == 0;
+}
+
+static bool RunSoftmaxTests(const unsigned* sizes, unsigned nSizes) {
+    bool allPassed = true;
+    const unsigned nTests = nSizes + 1u;  // per-size + 1 batch test
+    unsigned idx = 0;
+
+    std::cout << "\n--- Softmax tests (" << nTests << ") ---\n";
+
+    for (unsigned s = 0; s < nSizes; ++s) {
+        ++idx;
+        std::cout << "[" << idx << "/" << nTests << "] SOFTMAX  outer=1"
+                  << "  size=" << sizes[s] << " ... " << std::flush;
+        const bool ok = RunSoftmaxTest(1u, sizes[s], kSeed + 1000u + s);
+        std::cout << (ok ? "PASS" : "FAIL") << "\n";
+        allPassed &= ok;
+    }
+
+    // Batch test: outer=4, size=8 — verifies per-row independence
+    {
+        ++idx;
+        std::cout << "[" << idx << "/" << nTests << "] SOFTMAX  outer=4"
+                  << "  size=8 ... " << std::flush;
+        const bool ok = RunSoftmaxTest(4u, 8u, kSeed + 2000u);
+        std::cout << (ok ? "PASS" : "FAIL") << "\n";
+        allPassed &= ok;
+    }
+
+    return allPassed;
+}
+
+// ---------------------------------------------------------------------------
 // Ops table (used by RunAllTests and single-run mode)
 // ---------------------------------------------------------------------------
 struct OpEntry { Op op; const char* name; };
@@ -380,8 +468,12 @@ static bool RunAllTests() {
 
     allPassed &= RunSatTests();
     allPassed &= RunBroadcastTests();
+    allPassed &= RunSoftmaxTests(sizes, nSizes);
 
-    const unsigned nTotal = nRandom + sizeof(kSatTests) / sizeof(kSatTests[0]) + 2u;
+    const unsigned nTotal = nRandom
+                          + sizeof(kSatTests) / sizeof(kSatTests[0])
+                          + 2u           // broadcast tests
+                          + nSizes + 1u; // softmax tests
     std::cout << "\n"
               << (allPassed ? "All " : "FAILED — ")
               << nTotal << " tests"

@@ -24,8 +24,9 @@ Supported ONNX ops (VectorOPKernel)
   Sub                 → OP_SUB   (binary)
   Mul                 → OP_MUL   (binary)
   Div                 → OP_DIV   (binary)
-  Relu                → OP_RELU  (unary)
-  Clip(min=0, max=6)  → OP_RELU6 (unary)
+  Relu                → OP_RELU    (unary)
+  Clip(min=0, max=6)  → OP_RELU6  (unary)
+  Softmax (axis=-1)   → OP_SOFTMAX (unary, axis must be last dim)
 
 Supported ONNX ops (MatmulKernel)
 ----------------------------------
@@ -76,33 +77,37 @@ class SchedulerError(Exception):
 # Op-code constants (must match VectorOP.h)                          #
 # ------------------------------------------------------------------ #
 
-OP_ADD   = 0
-OP_SUB   = 1
-OP_MUL   = 2
-OP_DIV   = 3
-OP_RELU  = 4
-OP_RELU6 = 5
+OP_ADD     = 0
+OP_SUB     = 1
+OP_MUL     = 2
+OP_DIV     = 3
+OP_RELU    = 4
+OP_RELU6   = 5
+OP_SOFTMAX = 6
 
 # Human-readable names for comments
 OP_NAMES = {
-    OP_ADD:   "VECTOROP_ADD",
-    OP_SUB:   "VECTOROP_SUB",
-    OP_MUL:   "VECTOROP_MUL",
-    OP_DIV:   "VECTOROP_DIV",
-    OP_RELU:  "VECTOROP_RELU",
-    OP_RELU6: "VECTOROP_RELU6",
+    OP_ADD:     "VECTOROP_ADD",
+    OP_SUB:     "VECTOROP_SUB",
+    OP_MUL:     "VECTOROP_MUL",
+    OP_DIV:     "VECTOROP_DIV",
+    OP_RELU:    "VECTOROP_RELU",
+    OP_RELU6:   "VECTOROP_RELU6",
+    OP_SOFTMAX: "VECTOROP_SOFTMAX",
 }
 
 # ONNX op_type → (op_code, arity)
 # arity 2 = binary (reads a and b), arity 1 = unary (reads a only)
 _ONNX_OP_MAP = {
-    "Add":  (OP_ADD,   2),
-    "Sub":  (OP_SUB,   2),
-    "Mul":  (OP_MUL,   2),
-    "Div":  (OP_DIV,   2),
-    "Relu": (OP_RELU,  1),
+    "Add":     (OP_ADD,     2),
+    "Sub":     (OP_SUB,     2),
+    "Mul":     (OP_MUL,     2),
+    "Div":     (OP_DIV,     2),
+    "Relu":    (OP_RELU,    1),
     # Clip is matched by name but validated for (0,6) attributes below
-    "Clip": (OP_RELU6, 1),
+    "Clip":    (OP_RELU6,   1),
+    # Softmax axis is validated below; only axis=-1 (last dim) is supported
+    "Softmax": (OP_SOFTMAX, 1),
 }
 
 # Public sets used by graph.py to build a comprehensive "supported ops" list.
@@ -364,11 +369,39 @@ class ScheduledNode:
                     f"input '{t.onnx_name}' has {t.numel} elements but output "
                     f"'{self.output.onnx_name}' has {self.output.numel} elements."
                 )
-            self.outer_count        = 1
-            self.chunk_size         = self.output.numel
-            self.aligned_chunk_size = self.output.numel
-            self.a_advances         = True
-            self.b_advances         = True
+
+            if op_type == "Softmax":
+                # Softmax must run independently over the last axis.
+                # Validate axis, then set outer_count = prod(shape[:-1]),
+                # chunk_size = shape[-1] so the kernel processes one row at a time.
+                attrs = {a.name: a for a in self.onnx_node.attribute}
+                rank  = len(t.shape)
+                # ONNX default: axis=-1 for opset≥13, axis=1 for opset<13.
+                # We accept -1 or rank-1; anything else is unsupported.
+                raw_axis = attrs["axis"].i if "axis" in attrs else -1
+                norm_axis = raw_axis if raw_axis >= 0 else rank + raw_axis
+                if norm_axis != rank - 1:
+                    raise SchedulerError(
+                        f"Softmax node '{self.onnx_node.name}': only the last "
+                        f"axis (axis=-1 / axis={rank - 1}) is supported; "
+                        f"got axis={raw_axis} (rank={rank})."
+                    )
+                outer_count = 1
+                for d in t.shape[:-1]:
+                    outer_count *= int(d)
+                chunk_size  = int(t.shape[-1])
+                ae = self.align_elems
+                aligned_chunk_size = (chunk_size + ae - 1) & ~(ae - 1)
+                self.outer_count        = outer_count
+                self.chunk_size         = chunk_size
+                self.aligned_chunk_size = aligned_chunk_size
+            else:
+                self.outer_count        = 1
+                self.chunk_size         = self.output.numel
+                self.aligned_chunk_size = self.output.numel
+
+            self.a_advances = True
+            self.b_advances = True
 
         else:
             # Binary ops: check each input for trailing-contiguous broadcast.

@@ -35,6 +35,9 @@ Models produced:
   sat_sub_neg.onnx          X[1,256] - 63 - 65.5 -> Y; elements [0..128] saturate to min (-128)
   sat_div_pos.onnx          X[1,256] / (1/256) -> Y=i; elements [128..255] saturate to max (+127.996)
   sat_div_neg.onnx          X[1,256] / (-1/256) -> Y=-i; elements [128..255] saturate to min (-128)
+  softmax_1d.onnx           Softmax(axis=-1) on X[1,16] — single row
+  softmax_2d.onnx           Softmax(axis=-1) on X[4,16] — outer=4 batched rows
+  softmax_chain.onnx        Add(bias) → Softmax — exercises producer→consumer flow
   unsupported.onnx          Tanh node — must trigger a SchedulerError
 
 Run from the inference-scheduler directory:
@@ -1176,6 +1179,45 @@ def make_sat_div_neg(out_dir: str) -> None:
 # Model 34: unsupported op (Tanh)                                    #
 # ------------------------------------------------------------------ #
 
+def make_softmax(out_dir: str) -> None:
+    """Softmax over the last axis.
+
+    Models produced:
+      softmax_1d.onnx   X[1, 16]    → Softmax(axis=-1) → Y[1, 16]
+      softmax_2d.onnx   X[4, 16]    → Softmax(axis=-1) → Y[4, 16]  (outer=4)
+      softmax_chain.onnx X[1, 16] → Add(bias) → Softmax → Y[1, 16]
+    """
+    def _softmax_model(name, shape):
+        X = _float32("X", shape)
+        Y = _float32("Y", shape)
+        sm = oh.make_node("Softmax", inputs=["X"], outputs=["Y"],
+                          axis=-1)
+        graph = oh.make_graph([sm], name, [X], [Y])
+        model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+        model.ir_version = 8
+        _save(model, os.path.join(out_dir, f"{name}.onnx"))
+
+    _softmax_model("softmax_1d", [1, 16])
+    _softmax_model("softmax_2d", [4, 16])
+
+    # softmax_chain: Add(bias) → Softmax — exercises producer→consumer flow
+    batch, feat = 1, 16
+    bias_data   = np.zeros((feat,), dtype=np.float32)
+    X    = _float32("X",    [batch, feat])
+    bias = nph.from_array(bias_data, name="bias")
+    add_out = oh.make_tensor_value_info("add_out", TensorProto.FLOAT, [batch, feat])
+    Y    = _float32("Y",    [batch, feat])
+    add_node = oh.make_node("Add",     inputs=["X", "bias"],  outputs=["add_out"])
+    sm_node  = oh.make_node("Softmax", inputs=["add_out"],    outputs=["Y"], axis=-1)
+    graph = oh.make_graph([add_node, sm_node], "softmax_chain",
+                          inputs=[X], outputs=[Y],
+                          initializer=[bias],
+                          value_info=[add_out])
+    model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+    model.ir_version = 8
+    _save(model, os.path.join(out_dir, "softmax_chain.onnx"))
+
+
 def make_unsupported(out_dir: str) -> None:
     """A single Tanh node — must cause SchedulerError."""
     X = _float32("X", [1, 8])
@@ -1241,6 +1283,7 @@ def main():
     make_sat_sub_neg(args.out_dir)
     make_sat_div_pos(args.out_dir)
     make_sat_div_neg(args.out_dir)
+    make_softmax(args.out_dir)
     make_unsupported(args.out_dir)
     print("Done.")
 

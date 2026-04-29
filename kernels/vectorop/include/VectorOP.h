@@ -48,12 +48,13 @@ inline T saturate_cast(From v) {
 // Passed at runtime via the AXI-Lite 'op' register.
 // ---------------------------------------------------------------------------
 enum Op : unsigned {
-    OP_ADD   = 0,  // c[i] = saturate_cast<Data_t>(a[i] + b[i])
-    OP_SUB   = 1,  // c[i] = saturate_cast<Data_t>(a[i] - b[i])
-    OP_MUL   = 2,  // c[i] = saturate_cast<Data_t>(a[i] * b[i])
-    OP_DIV   = 3,  // c[i] = saturate_cast<Data_t>(a[i] / b[i])  (b[i] ≠ 0)
-    OP_RELU  = 4,  // c[i] = max(a[i], 0)          — unary, b[] not read
-    OP_RELU6 = 5,  // c[i] = min(max(a[i], 0), 6)  — unary, b[] not read
+    OP_ADD     = 0,  // c[i] = saturate_cast<Data_t>(a[i] + b[i])
+    OP_SUB     = 1,  // c[i] = saturate_cast<Data_t>(a[i] - b[i])
+    OP_MUL     = 2,  // c[i] = saturate_cast<Data_t>(a[i] * b[i])
+    OP_DIV     = 3,  // c[i] = saturate_cast<Data_t>(a[i] / b[i])  (b[i] ≠ 0)
+    OP_RELU    = 4,  // c[i] = max(a[i], 0)                — unary, b[] not read
+    OP_RELU6   = 5,  // c[i] = min(max(a[i], 0), 6)        — unary, b[] not read
+    OP_SOFTMAX = 6,  // c[i] = exp(a[i]) / Σ exp(a[j])     — unary, axis=-1, b[] not read
 };
 
 // ---------------------------------------------------------------------------
@@ -80,8 +81,10 @@ enum Op : unsigned {
 // For broadcast with a advancing: outer=N, a_inc=aligned_chunk, b_inc=0.
 // For broadcast with b advancing: outer=N, a_inc=0, b_inc=aligned_chunk.
 //
-// For unary operations (OP_RELU, OP_RELU6) only a[] is read; no AXI
-// transactions are issued on the gmem1 port and b_addr is ignored.
+// For unary operations (OP_RELU, OP_RELU6, OP_SOFTMAX) only a[] is read; no
+// AXI transactions are issued on the gmem1 port and b_addr is ignored.
+// OP_SOFTMAX applies softmax over the inner dimension (axis=-1): each of the
+// outer rows of size elements is independently normalised to sum to 1.0.
 // ---------------------------------------------------------------------------
 void VectorOPKernel(
     const Data_t* a,

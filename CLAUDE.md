@@ -30,6 +30,10 @@ make synthesize_vectorop_kv260
 make synthesize_conv_kv260
 make synthesize_matmul_kv260
 make synthesize_pool_kv260
+
+# Device tree overlay for the KV260 (requires dtc)
+make dtbo_kv260_cormorant
+# Output: build/dts/kv260/design_cormorant.dtbo
 ```
 
 Each kernel can also be built standalone:
@@ -52,12 +56,28 @@ make synthesize_vectorop_kv260
 
 ### Per-platform HLS synthesis
 
-Each `kernels/<kernel>/platforms/<name>.json` file defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.
+Each `platforms/<name>.json` file defines `synthesize_<kernel>_<name>` targets for all four kernels plus an aggregate `synthesize_<name>` target. Vitis HLS is invoked for each kernel and an IP catalog archive is exported.
 
 **Required JSON fields:** `part`
-**Optional JSON fields:** `board`, `clock` (default 300 MHz)
+**Optional JSON fields:** `board`, `clock` (default 300 MHz), `axi_bus_width` (default: global `AXI_BUS_WIDTH` CMake variable, initially 32)
+
+`axi_bus_width` sets `config_interface -m_axi_max_widen_bitwidth` in the generated Vitis HLS TCL script. Valid values: 32, 64, 128, 256, 512. An invalid value triggers a CMake warning and falls back to the global default.
 
 Adding a new platform requires only a JSON file and a re-run of cmake.
+
+### Device tree overlays
+
+Each `.dts` file under `dts/<platform>/` gets a `dtbo_<platform>_<stem>` CMake target that compiles it to a `.dtbo` overlay using `dtc`.
+
+```
+dts/
+└── kv260/
+    └── cormorant.dts  →  build/dts/kv260/design_cormorant.dtbo
+```
+
+The output is always named `design_<stem>.dtbo`. CMake checks for `dtc` at configure time and prints an install hint if it is absent (`sudo apt install device-tree-compiler`); if it is absent the target fails at build time with a clear error message.
+
+Adding a new overlay: place a `.dts` file in `dts/<platform>/` matching an existing `platforms/<platform>.json` and re-run cmake.
 
 ## Architecture
 
@@ -141,3 +161,4 @@ See `doc/INFERENCE_SCHEDULER.md` for the full technical reference.
 
 - **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.
+- **`dtc`** (device-tree-compiler) — required only for `dtbo_*` targets. Located automatically by CMake (`find_program`). Install: `sudo apt install device-tree-compiler`.
