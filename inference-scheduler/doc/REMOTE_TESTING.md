@@ -361,7 +361,7 @@ The script:
    binaries, one per kernel)
 2. Uploads it to the board once, builds everything in one `cmake` + `make` pass
 3. Runs each test case as a separate binary invocation and parses the JSON output
-4. Prints a formatted table of latency (ms) and throughput (GB/s or GFLOPS)
+4. Prints a formatted table of latency (ms) and throughput (GB/s or GOps/s)
 
 Kernels whose driver files are absent are silently skipped — you can benchmark
 only the kernels that are currently deployed.
@@ -456,7 +456,7 @@ The reported **GB/s** accounts for this: `ports × size × outer × 2B / lat`.
 | `b_stride` | Elements between B batch slices (`k×m` for batched, `0` to broadcast B) |
 | `iters` | Timed iterations |
 
-Reported metric: **GFLOPS** = `2 × batch × n × k × m / lat`.
+Reported metric: **GOps/s** = `2 × batch × n × k × m / lat`.
 
 **ConvKernel** — 2-D NCHW convolution benchmark
 
@@ -475,7 +475,7 @@ Reported metric: **GFLOPS** = `2 × batch × n × k × m / lat`.
 | `iters` | Timed iterations |
 
 Output size is computed by the benchmark binary: `out_h = (in_h + 2×pad_top − dil×(kh−1) − 1) / stride_h + 1`.
-Reported metric: **GFLOPS** = `2 × MACs / lat` where MACs = `batch × out_ch × out_h × out_w × ic × kh × kw`
+Reported metric: **GOps/s** = `2 × MACs / lat` where MACs = `batch × out_ch × out_h × out_w × ic × kh × kw`
 (standard conv) or `batch × out_ch × out_h × out_w × kh × kw` (depthwise).
 
 **PoolingKernel** — 2-D NCHW pooling benchmark
@@ -551,34 +551,91 @@ After all cases run, the script prints a per-kernel table:
 
 ```
   VectorOPKernel
-  ──────────────────────────────────────────────────────────────────────────────
-  Label               Parameters                        Lat(ms)      GB/s
-  ──────────────────────────────────────────────────────────────────────────────
-  ADD-1K              ADD    size=1024    outer=1          0.0048    1.274
-  ADD-4K              ADD    size=4096    outer=1          0.0092    2.672
-  ADD-16K             ADD    size=16384   outer=1          0.0214    4.580
-  ADD-64K             ADD    size=65536   outer=1          0.0731    5.366
-  ADD-256K            ADD    size=262144  outer=1          0.2743    5.719
-  ...
-  RELU-bcast-8x16K    RELU   size=16384   outer=8          0.1634    4.820
-  ──────────────────────────────────────────────────────────────────────────────
-  peak GB/s                                                           5.719
-  min latency                                              0.0048
-  14/14 OK
+  ───────────────────────────────────────────────────────────────────────────────────
+  Label                    Parameters                        Lat(ms)      GB/s
+  ───────────────────────────────────────────────────────────────────────────────────
+  ADD-1K                   ADD    size=1024    outer=1        0.0207     0.297
+  ADD-4K                   ADD    size=4096    outer=1        0.0516     0.476
+  ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
+  ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
+  ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
+  MUL-16K                  MUL    size=16384   outer=1        0.1756     0.560
+  MUL-64K                  MUL    size=65536   outer=1        0.6712     0.586
+  DIV-4K                   DIV    size=4096    outer=1        0.0520     0.473
+  RELU-16K                 RELU   size=16384   outer=1        0.1728     0.379
+  RELU-64K                 RELU   size=65536   outer=1        0.6683     0.392
+  RELU6-16K                RELU6  size=16384   outer=1        0.1729     0.379
+  ADD-bcast-8x16K          ADD    size=16384   outer=8        1.3813     0.569
+  MUL-bcast-8x16K          MUL    size=16384   outer=8        1.3813     0.569
+  RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3484     0.389
+  MUL-bcast-dw-12544x16    MUL    size=16      outer=12544    5.8274     0.207
+  SOFTMAX-1K-1row          6      size=1024    outer=1        0.0181     0.226
+  SOFTMAX-4K-1row          6      size=4096    outer=1        0.0491     0.334
+  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
+  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1100     0.298
+  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
+  ───────────────────────────────────────────────────────────────────────────────────
+                                                 peak GB/s                0.593
+                                               min latency     0.0181
+  20/20 OK
 
   MatmulKernel
-  ...
-  peak GFLOPS                                                         8.441
+  ─────────────────────────────────────────────────────────────────────────────
+  Label              Parameters                        Lat(ms)    GOps/s
+  ─────────────────────────────────────────────────────────────────────────────
+  8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
+  16x16x16           N=16   K=16   M=16   batch=1       0.0520     0.157
+  32x32x32           N=32   K=32   M=32   batch=1       0.3039     0.216
+  64x64x64           N=64   K=64   M=64   batch=1       2.1416     0.245
+  128x128x128        N=128  K=128  M=128  batch=1      16.1860     0.259
+  256x256x256        N=256  K=256  M=256  batch=1     126.2730     0.266
+  FC-1x256x256       N=1    K=256  M=256  batch=1       1.9489     0.067
+  FC-4x256x256       N=4    K=256  M=256  batch=1       1.9778     0.265
+  batch4-64x64x64    N=64   K=64   M=64   batch=4       8.5376     0.246
+  batch4-A-bcast     N=64   K=64   M=64   batch=4       8.5382     0.246
+  dw-12544x16x1      N=12544 K=16   M=1    batch=1     13.3935     0.030
+  dw-12544x16x3      N=12544 K=16   M=1    batch=3     40.1768     0.030
+  ─────────────────────────────────────────────────────────────────────────────
+                                         peak GOps/s                0.266
+                                         min latency     0.0176
+  12/12 OK
 
-  ── OVERALL: 41/41 cases passed ──
+  ConvKernel
+  ─────────────────────────────────────────────────────────────────────────────────
+  Label                  Parameters                        Lat(ms)    GOps/s
+  ─────────────────────────────────────────────────────────────────────────────────
+  3x3-1ch-28x28-32out    1ch 28x28→32ch 3x3k               14.5811     0.031
+  ─────────────────────────────────────────────────────────────────────────────────
+                                             peak GOps/s                0.031
+                                             min latency    14.5811
+  1/1 OK
+
+  PoolingKernel
+  ─────────────────────────────────────────────────────────────────────────────────
+  Label                  Parameters                        Lat(ms)      GB/s
+  ─────────────────────────────────────────────────────────────────────────────────
+  MaxPool-2x2-56x56      MaxPool 2x2 64ch 56x56            21.6922     0.023
+  MaxPool-2x2-28x28      MaxPool 2x2 64ch 28x28             5.3711     0.023
+  MaxPool-3x3-56x56      MaxPool 3x3 64ch 56x56            36.2833     0.014
+  MaxPool-3x3-14x14      MaxPool 3x3 64ch 14x14             2.1684     0.014
+  AvgPool-2x2-56x56      AvgPool 2x2 64ch 56x56            21.6922     0.023
+  AvgPool-3x3-28x28      AvgPool 3x3 64ch 28x28             8.8810     0.014
+  GlobalMaxPool-14x14    MaxPool 14x14 64ch 14x14           0.7044     0.036
+  GlobalAvgPool-7x7      AvgPool 7x7 64ch 7x7               0.1908     0.034
+  ─────────────────────────────────────────────────────────────────────────────────
+                                               peak GB/s                0.036
+                                             min latency     0.1908
+  8/8 OK
+
+  ── OVERALL: All 41 cases passed ──
 ```
 
 | Column | Meaning |
 |--------|---------|
 | `Lat(ms)` | Mean kernel execution time per call (wall-clock, after warmup) |
 | `GB/s` | Memory bandwidth for VectorOPKernel and PoolingKernel |
-| `GFLOPS` | Arithmetic throughput for MatmulKernel and ConvKernel |
-| `peak GB/s` / `peak GFLOPS` | Best metric across all passing cases in the group |
+| `GOps/s` | Arithmetic throughput for MatmulKernel and ConvKernel |
+| `peak GB/s` / `peak GOps/s` | Best metric across all passing cases in the group |
 | `min latency` | Shortest latency across all passing cases in the group |
 | `ERR` | Case failed; run with `--verbose` to see the error message |
 

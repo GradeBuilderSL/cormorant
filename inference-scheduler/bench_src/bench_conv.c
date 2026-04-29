@@ -1,4 +1,4 @@
-/* bench_conv.c — ConvKernel latency / GFLOPS benchmark
+/* bench_conv.c — ConvKernel latency / GOps/s benchmark
  *
  * args: instance label batch in_ch in_h in_w out_ch kh kw sh sw
  *             dh dw pt pl has_bias is_dw iters [warmup]
@@ -128,15 +128,16 @@ int main(int argc, char **argv)
     double lat = ms / (double)iters;
     double macs = (double)batch * oc * oh * ow;
     macs *= idw ? (double)(kh * kw) : (double)(ic * kh * kw);
-    double gflops = 2.0 * macs / (lat * 1e-3) / 1e9;
+    /* 2 ops per MAC (multiply + accumulate); reported as GOps/s (not GFLOPS) */
+    double gops = 2.0 * macs / (lat * 1e-3) / 1e9;
 
     printf("{\"kernel\":\"ConvKernel\",\"label\":\"%s\","
            "\"batch\":%u,\"in_ch\":%u,\"in_h\":%u,\"in_w\":%u,"
            "\"out_ch\":%u,\"out_h\":%u,\"out_w\":%u,"
            "\"kh\":%u,\"kw\":%u,\"sh\":%u,\"sw\":%u,"
-           "\"is_dw\":%u,\"iters\":%u,\"lat_ms\":%.4f,\"gflops\":%.4f}\n",
+           "\"is_dw\":%u,\"iters\":%u,\"lat_ms\":%.4f,\"gops\":%.4f}\n",
            label, batch, ic, ih, iw, oc, oh, ow,
-           kh, kw, sh, sw, idw, iters, lat, gflops);
+           kh, kw, sh, sw, idw, iters, lat, gops);
 
     inference_buf_free(bx); inference_buf_free(bw);
     inference_buf_free(bb); inference_buf_free(by);

@@ -4,7 +4,7 @@ run_remote_perf.py — On-device performance benchmark for KV260 hardware kernel
 
 Generates a self-contained C benchmark project, uploads it to the remote KV260,
 builds all four kernel benchmarks once, then runs each test case and reports
-latency (ms) and throughput (GB/s for memory-bound kernels, GFLOPS for compute).
+latency (ms) and throughput (GB/s for memory-bound kernels, GOps/s for compute).
 
 Test cases cover:
   VectorOPKernel — all 6 ops, sizes 1K–256K, broadcasting variants
@@ -101,8 +101,8 @@ class BenchResult:
     case:        BenchCase
     ok:          bool
     lat_ms:      float = 0.0
-    metric:      float = 0.0   # GB/s or GFLOPS
-    metric_key:  str   = ""    # "gbs" or "gflops"
+    metric:      float = 0.0   # GB/s or GOps/s
+    metric_key:  str   = ""    # "gbs" or "gops"
     raw:         str   = ""
 
 
@@ -316,7 +316,7 @@ def run_bench_case(session: RemoteSession, build_dir: str,
     try:
         data      = json.loads(out.strip())
         lat_ms    = float(data["lat_ms"])
-        mkey      = "gbs" if "gbs" in data else "gflops"
+        mkey      = "gbs" if "gbs" in data else "gops"
         metric    = float(data[mkey])
         return BenchResult(case=case, ok=True,
                            lat_ms=lat_ms, metric=metric,
@@ -388,7 +388,7 @@ def print_report(results: List[BenchResult], verbose: bool = False) -> None:
     for kernel, rows in by_kernel.items():
         passed = [r for r in rows if r.ok]
         metric_key = passed[0].metric_key if passed else "gbs"
-        metric_hdr = "GB/s" if metric_key == "gbs" else "GFLOPS"
+        metric_hdr = "GB/s" if metric_key == "gbs" else "GOps/s"
 
         lbl_w = max((len(r.case.label) for r in rows), default=12) + 2
         det_w = 30

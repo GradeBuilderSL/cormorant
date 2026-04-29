@@ -1,4 +1,4 @@
-/* bench_matmul.c — MatmulKernel latency / GFLOPS benchmark
+/* bench_matmul.c — MatmulKernel latency / GOps/s benchmark
  *
  * args: instance label n k m batch a_batch_stride b_batch_stride iters [warmup]
  */
@@ -91,14 +91,14 @@ int main(int argc, char **argv)
     double ms  = (double)(t1.tv_sec  - t0.tv_sec ) * 1e3
                + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6;
     double lat = ms / (double)iters;
-    /* 2 ops per MAC (multiply + accumulate) */
-    double gflops = 2.0 * n * kd * m * batch / (lat * 1e-3) / 1e9;
+    /* 2 ops per MAC (multiply + accumulate); reported as GOps/s (not GFLOPS) */
+    double gops = 2.0 * n * kd * m * batch / (lat * 1e-3) / 1e9;
 
     printf("{\"kernel\":\"MatmulKernel\",\"label\":\"%s\","
            "\"n\":%u,\"k\":%u,\"m\":%u,\"batch\":%u,"
            "\"a_str\":%u,\"b_str\":%u,\"iters\":%u,"
-           "\"lat_ms\":%.4f,\"gflops\":%.4f}\n",
-           label, n, kd, m, batch, as, bs, iters, lat, gflops);
+           "\"lat_ms\":%.4f,\"gops\":%.4f}\n",
+           label, n, kd, m, batch, as, bs, iters, lat, gops);
 
     inference_buf_free(ba); inference_buf_free(bb); inference_buf_free(bc);
     XMatmulkernel_Release(&k);

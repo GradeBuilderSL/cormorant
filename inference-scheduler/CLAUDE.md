@@ -248,7 +248,7 @@ Two scripts drive KV260 hardware over SSH:
 | Script | Purpose | Config |
 |--------|---------|--------|
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config_*.json` |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GFLOPS) | `perf_config.json` |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` |
 
 Both share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
 the full reference including the `benchmarks` config section and per-kernel
