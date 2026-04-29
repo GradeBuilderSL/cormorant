@@ -449,24 +449,32 @@ End-to-end correctness testing over SSH. The runner generates a C project per
 model, uploads it, builds on the board, executes the test binary, and compares
 every output element against Python-simulated ground truth.
 
-**Config files** (pick the one matching your loaded bitstream):
-
-| Config | Bitstream | Kernels tested |
-|--------|-----------|----------------|
-| `remote_config_vectorop.json` | VectorOPKernel bitstream | VectorOPKernel |
-| `remote_config_matmul.json` | MatmulKernel bitstream | MatmulKernel |
-| `remote_config_conv.json` | ConvKernel bitstream | ConvKernel |
-| `remote_config_pool.json` | PoolingKernel bitstream | PoolingKernel |
-| `remote_config_mixed.json` | Multi-kernel bitstream | VectorOPKernel + MatmulKernel |
-| `remote_config_all_models.json` | Full cormorant bitstream | All four kernels |
+Each example config in `inference-scheduler/` targets a specific set of kernels.
+Copy the one that matches your loaded bitstream, then fill in your board details:
 
 ```bash
 cd inference-scheduler
 
-# Edit the config for your board (set ssh.host and local.driver_dirs)
-cp remote_config_vectorop.json remote_config.json
+# Copy and adapt the example that matches your loaded bitstream
+cp remote_config.json.example.json remote_config.json
 $EDITOR remote_config.json
+```
 
+The two fields you must set are:
+
+- **`ssh.host`** — IP address or hostname of the KV260 (`"192.168.100.8"` by default)
+- **`local.driver_dirs`** — paths on your host machine to the Vitis HLS-generated
+  driver sources for each kernel, e.g.:
+  ```
+  "VectorOPKernel": "<cormorant_base>/build/kernels/vectorop/kv260/<target>/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
+  ```
+
+The `remote.uio_devices` map must list the UIO sysfs name for every kernel in
+the config. After loading the `design_cormorant.dtbo` overlay all four names are
+`fabric_vecop`, `fabric_matmul`, `fabric_conv`, and `fabric_pool` — the example
+configs already have these set correctly for the full-cormorant bitstream.
+
+```bash
 # Verify board prerequisites before running
 .venv/bin/python run_remote_tests.py --config remote_config.json --check-only
 
@@ -491,6 +499,14 @@ The script uploads a single self-contained C benchmark project, builds all
 four kernel binaries in one pass, then runs each case and reports results.
 Kernels whose driver files are absent are silently skipped, so you can
 benchmark only what is currently deployed.
+
+Copy the example config and fill in your board details before the first run:
+
+```bash
+cd inference-scheduler
+cp perf_config.json.example perf_config.json
+$EDITOR perf_config.json   # set ssh.host and local.driver_dirs
+```
 
 **Config file:** `perf_config.json` — extends the same SSH schema as the
 correctness configs with an additional `benchmarks` section.
