@@ -10,17 +10,37 @@ the device tree overlay (.dtbo) so that UIO devices appear in /dev/.
 See src/bitstream/ for the implementation and src/bitstream/platforms/kv260.py
 for KV260-specific register tables and xclbin metadata.
 
+Configuration
+─────────────
+File paths (bit / hwh / dtbo) can be supplied via a "bitstream" section in
+the JSON config file.  Paths are resolved relative to the config file's
+directory, so configs are portable across checkouts.
+
+  {
+    "ssh": { "host": "...", ... },
+    "bitstream": {
+      "bit":          "path/to/design.bit",
+      "hwh":          "path/to/design.hwh",
+      "dtbo":         "path/to/pl.dtbo",
+      "overlay_name": null,
+      "xclbinutil":   "xclbinutil"
+    }
+  }
+
+CLI flags always override config values.  The hwh path is also auto-detected
+as <bit_stem>.hwh when it sits alongside the .bit file.
+
 Usage:
-  python upload_bitstream.py --config remote_config.json \\
-      --bit ../hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper.bit \\
-      --hwh ../hw/cormorant_hw_128/.gen/sources_1/bd/design_cormorant/hw_handoff/design_cormorant.hwh \\
-      --dtbo ../dts/kv260/pl.dtbo
+  # All paths from config
+  python upload_bitstream.py --config bitstream_config_kv260.json
 
-  # --hwh may be omitted when <bit_stem>.hwh exists alongside the .bit file.
-  # xclbinutil must be on PATH (e.g. source Vitis settings64.sh).
+  # Override individual paths on the CLI
+  python upload_bitstream.py --config bitstream_config_kv260.json \\
+      --bit   ../hw/.../design_cormorant_wrapper.bit \\
+      --dtbo  ../dts/kv260/pl.dtbo
 
-  # Check board readiness only (no upload)
-  python upload_bitstream.py --config remote_config.json --check-only
+  # Check board readiness only
+  python upload_bitstream.py --config bitstream_config_kv260.json --check-only
 """
 
 import argparse
@@ -38,29 +58,39 @@ from src.remote import (  # noqa: E402
     RemoteSession,
 )
 
-_REPO_ROOT = Path(__file__).parent.parent
+_BITSTREAM_DEFAULTS = {
+    "bitstream": {
+        "bit":          None,
+        "hwh":          None,
+        "dtbo":         None,
+        "overlay_name": None,
+        "xclbinutil":   "xclbinutil",
+    }
+}
 
-_DEFAULT_BIT = (
-    _REPO_ROOT / "hw" / "cormorant_hw_128"
-    / "cormorant_hw_128.runs" / "impl_1"
-    / "design_cormorant_wrapper.bit"
-)
+
+def _cfg_path(value: str | None, config_dir: Path) -> Path | None:
+    """Resolve a config-file path relative to the config file's directory."""
+    if value is None:
+        return None
+    p = Path(value).expanduser()
+    return (config_dir / p).resolve() if not p.is_absolute() else p.resolve()
 
 
-def _resolve_hwh(explicit: str | None, bit_path: Path) -> Path:
+def _resolve_hwh(explicit: Path | None, bit_path: Path) -> Path:
     """
     Resolve the HWH path.
-    1. Explicit --hwh argument
+    1. Explicit value (from CLI or config)
     2. <bit_stem>.hwh alongside the .bit file
     """
-    if explicit:
-        return Path(explicit).expanduser().resolve()
+    if explicit is not None:
+        return explicit
     candidate = bit_path.with_suffix(".hwh")
     if candidate.exists():
         return candidate
     raise FileNotFoundError(
         f"HWH file not found alongside {bit_path.name} "
-        f"(looked for {candidate}).  Pass --hwh explicitly."
+        f"(looked for {candidate}).  Set bitstream.hwh in config or pass --hwh."
     )
 
 
@@ -72,30 +102,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--config", required=True, metavar="FILE",
-        help="JSON config file (same format as remote_config.json).",
+        help="JSON config file.  May contain a 'bitstream' section with file paths.",
     )
     p.add_argument(
         "--bit", metavar="FILE", default=None,
-        help=f"Vivado .bit file.  Default: {_DEFAULT_BIT.relative_to(_REPO_ROOT)}",
+        help="Vivado .bit file (overrides config).",
     )
     p.add_argument(
         "--hwh", metavar="FILE", default=None,
-        help="Hardware-handoff .hwh file.  Default: <bit_stem>.hwh alongside the .bit.",
+        help="Hardware-handoff .hwh (overrides config).  Default: auto-detect alongside .bit.",
     )
     p.add_argument(
-        "--dtbo", metavar="FILE", required=True,
-        help="Device tree overlay .dtbo (required).",
+        "--dtbo", metavar="FILE", default=None,
+        help="Device tree overlay .dtbo (overrides config).",
     )
     p.add_argument(
         "--overlay-name", metavar="NAME", default=None,
         help=(
-            "Name for the configfs overlay directory and /lib/firmware/<name>.bin.  "
-            "Defaults to the .dtbo stem."
+            "Configfs overlay dir name and /lib/firmware/<name>.bin "
+            "(overrides config).  Default: .dtbo stem."
         ),
     )
     p.add_argument(
-        "--xclbinutil", metavar="CMD", default="xclbinutil",
-        help="xclbinutil command or path (default: xclbinutil from PATH).",
+        "--xclbinutil", metavar="CMD", default=None,
+        help="xclbinutil command or path (overrides config).  Default: xclbinutil from PATH.",
     )
     p.add_argument(
         "--check-only", action="store_true",
@@ -105,36 +135,69 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = _build_parser().parse_args()
+    args   = _build_parser().parse_args()
+    cfg    = load_config(args.config, _BITSTREAM_DEFAULTS)
+    bs_cfg = cfg["bitstream"]
 
-    bit_path   = Path(args.bit).expanduser().resolve() if args.bit else _DEFAULT_BIT
-    dtbo_path  = Path(args.dtbo).expanduser().resolve()
-    xclbinutil = args.xclbinutil
+    config_dir = Path(args.config).expanduser().resolve().parent
 
-    try:
-        hwh_path = _resolve_hwh(args.hwh, bit_path)
-    except FileNotFoundError as exc:
-        print(_red(f"error: {exc}"), file=sys.stderr)
-        return 1
+    # ── resolve paths: CLI > config > built-in default ──────────────────────
+    bit_path = (
+        Path(args.bit).expanduser().resolve() if args.bit
+        else _cfg_path(bs_cfg.get("bit"), config_dir)
+    )
+    dtbo_path = (
+        Path(args.dtbo).expanduser().resolve() if args.dtbo
+        else _cfg_path(bs_cfg.get("dtbo"), config_dir)
+    )
+    hwh_explicit = (
+        Path(args.hwh).expanduser().resolve()  if args.hwh
+        else _cfg_path(bs_cfg.get("hwh"), config_dir)
+    )
+    overlay_name = (
+        args.overlay_name
+        or bs_cfg.get("overlay_name")
+        or (dtbo_path.stem if dtbo_path else None)
+    )
+    xclbinutil = args.xclbinutil or bs_cfg.get("xclbinutil") or "xclbinutil"
 
-    overlay_name = args.overlay_name or dtbo_path.stem
-
+    # ── validate required inputs ─────────────────────────────────────────────
     if not args.check_only:
+        if bit_path is None:
+            print(
+                _red("error: bit path is required — "
+                     "set bitstream.bit in config or pass --bit"),
+                file=sys.stderr,
+            )
+            return 1
+        if dtbo_path is None:
+            print(
+                _red("error: dtbo path is required — "
+                     "set bitstream.dtbo in config or pass --dtbo"),
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            hwh_path = _resolve_hwh(hwh_explicit, bit_path)
+        except FileNotFoundError as exc:
+            print(_red(f"error: {exc}"), file=sys.stderr)
+            return 1
+
         for label, path in [(".bit", bit_path), (".dtbo", dtbo_path), (".hwh", hwh_path)]:
             if not path.exists():
                 print(_red(f"error: {label} file not found: {path}"), file=sys.stderr)
                 if label == ".bit":
                     print(
-                        "       Build the bitstream first:\n"
-                        "         cd <repo>/build && cmake .. -DAXI_BUS_WIDTH=128\n"
-                        "         make build_hw_kv260",
+                        "       Build with: cd <repo>/build && make build_hw_kv260",
                         file=sys.stderr,
                     )
                 return 1
+    else:
+        hwh_path = hwh_explicit  # not needed for --check-only
 
-    cfg     = load_config(args.config, {})
+    # ── connect ──────────────────────────────────────────────────────────────
     ssh_cfg = cfg["ssh"]
-
     print(f"Connecting to {ssh_cfg['user']}@{ssh_cfg['host']}:{ssh_cfg['port']} …")
     session = RemoteSession(ssh_cfg)
     session.connect()
@@ -155,13 +218,14 @@ def main() -> int:
                 print(f"  UIO devices: none")
             return 0 if ok else 1
 
-        print(f"\n  .bit        {bit_path}")
-        print(f"  .hwh        {hwh_path}")
-        print(f"  .dtbo       {dtbo_path}")
-        print(f"  name        {overlay_name}")
-        print(f"  xclbinutil  {xclbinutil}")
+        print(f"\n  .bit         {bit_path}")
+        print(f"  .hwh         {hwh_path}")
+        print(f"  .dtbo        {dtbo_path}")
+        print(f"  name         {overlay_name}")
+        print(f"  xclbinutil   {xclbinutil}")
 
-        upload_bitstream(session, bit_path, hwh_path, dtbo_path, overlay_name, xclbinutil)
+        upload_bitstream(
+            session, bit_path, hwh_path, dtbo_path, overlay_name, xclbinutil)
 
     except (RuntimeError, TimeoutError) as exc:
         print(f"\n{_red('Error:')} {exc}", file=sys.stderr)
