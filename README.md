@@ -54,24 +54,40 @@ cormorant/
 │
 ├── doc/             Technical reference documents
 │
-└── inference-scheduler/   ONNX → C code-generator
+└── inference-scheduler/   ONNX → C code-generator + board tools
     ├── inference_scheduler.py
-    ├── src/
-    │   ├── graph.py        ONNX loading, shape inference, Gemm decomposition
-    │   ├── nodes.py        ScheduledNode / MatmulNode / ConvNode / PoolNode / ReshapeNode
-    │   ├── tensor.py       Weight encoding, buffer declarations
-    │   ├── kernels.py      KernelDesc registry (driver prefixes, file lists)
-    │   ├── dtype.py        DataType abstraction (ap_fixed<W,I>, float32)
-    │   ├── layout.py       TensorLayout (alloc sizes, broadcast strides)
-    │   └── codegen/        Multi-mixin code generator
-    │       ├── _core.py    Pool layout, live-interval buffer reuse
-    │       ├── _header.py  include/inference.h
-    │       ├── _source.py  src/inference.c
-    │       ├── _buf_impl.py src/inference_buf.c (XRT / bare-metal DMA)
-    │       ├── _test.py    test/test_inference.c
-    │       ├── _cmake.py   CMakeLists.txt
-    │       └── _simulate.py Fixed-point forward simulation
-    └── run_remote_tests.py  SSH-based hardware test runner
+    ├── upload_bitstream.py        KV260 bitstream upload tool
+    ├── run_remote_tests.py        SSH-based hardware correctness runner
+    ├── run_remote_perf.py         SSH-based performance benchmark runner
+    ├── bitstream_config_kv260.json  Example config for upload_bitstream.py
+    └── src/
+        ├── graph.py        ONNX loading, shape inference, Gemm decomposition
+        ├── nodes.py        ScheduledNode / MatmulNode / ConvNode / PoolNode / ReshapeNode
+        ├── tensor.py       Weight encoding, buffer declarations
+        ├── kernels.py      KernelDesc registry (driver prefixes, file lists)
+        ├── dtype.py        DataType abstraction (ap_fixed<W,I>, float32)
+        ├── layout.py       TensorLayout (alloc sizes, broadcast strides)
+        ├── codegen/        Multi-mixin code generator
+        │   ├── _core.py    Pool layout, live-interval buffer reuse
+        │   ├── _header.py  include/inference.h
+        │   ├── _source.py  src/inference.c
+        │   ├── _buf_impl.py src/inference_buf.c (XRT / bare-metal DMA)
+        │   ├── _test.py    test/test_inference.c
+        │   ├── _cmake.py   CMakeLists.txt
+        │   └── _simulate.py Fixed-point forward simulation
+        ├── bitstream/      Bitstream loading package
+        │   ├── convert.py  .bit → .bin conversion
+        │   ├── hwh.py      HWH parsing (PS params, memory topology)
+        │   ├── xclbin.py   Synthetic xclbin generation via xclbinutil
+        │   ├── board.py    Remote board operations (fpga_manager, DTBO, xclbin)
+        │   ├── loader.py   upload_bitstream() orchestration
+        │   └── platforms/
+        │       └── kv260.py  KV260 register tables and xclbin metadata
+        └── remote/         Shared SSH/SFTP utilities
+            ├── session.py  RemoteSession (paramiko wrapper)
+            ├── config.py   load_config, deep_merge, SHARED_DEFAULTS
+            ├── colors.py   ANSI colour helpers
+            └── checks.py   Board prerequisite checks
 ```
 
 ---
@@ -143,19 +159,21 @@ make sim_hw_kv260
 ### 6. Deploy and run on the KV260
 
 ```bash
-# On the KV260 — load bitstream and device-tree overlay
-fpgautil -b design_cormorant_wrapper.bit.bin -o design_cormorant.dtbo
+cd inference-scheduler
 
-# Confirm UIO devices are visible
+# Load the bitstream + device-tree overlay from the host over SSH
+# (edit bitstream_config_kv260.json first: set ssh.host and check paths)
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
+
+# Confirm UIO devices are visible (on the board)
 cat /sys/class/uio/uio*/name
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
 # fabric_pool
 
-# Back on the host — run all models over SSH (see inference-scheduler/doc/REMOTE_TESTING.md)
-cd inference-scheduler
-cp remote_config_vectorop.json remote_config.json
+# Run correctness tests over SSH (see inference-scheduler/doc/REMOTE_TESTING.md)
+cp remote_config_all_models.json remote_config.json
 $EDITOR remote_config.json   # set ssh.host and local.driver_dirs
 .venv/bin/python run_remote_tests.py --config remote_config.json
 ```
@@ -449,6 +467,10 @@ End-to-end correctness testing over SSH. The runner generates a C project per
 model, uploads it, builds on the board, executes the test binary, and compares
 every output element against Python-simulated ground truth.
 
+**Prerequisite:** the Cormorant bitstream must be loaded on the board before
+running any hardware tests.  Use `upload_bitstream.py` (see Quick Start step 6
+or `inference-scheduler/doc/REMOTE_TESTING.md` → *Bitstream Upload*).
+
 Each example config in `inference-scheduler/` targets a specific set of kernels.
 Copy the one that matches your loaded bitstream, then fill in your board details:
 
@@ -456,7 +478,7 @@ Copy the one that matches your loaded bitstream, then fill in your board details
 cd inference-scheduler
 
 # Copy and adapt the example that matches your loaded bitstream
-cp remote_config.json.example.json remote_config.json
+cp remote_config_all_models.json remote_config.json
 $EDITOR remote_config.json
 ```
 

@@ -59,21 +59,25 @@ ssh-copy-id -i ~/.ssh/kv260-testkey root@192.168.100.8
 Password authentication is also supported; set `ssh.password` in the config and
 leave `ssh.key_file` null.
 
-### 2. Config file
+### 2. Config files
 
-Copy the appropriate example and fill in your board details:
+Copy the appropriate example(s) and set your board's IP:
 
 ```bash
-# For run_remote_tests.py (correctness tests)
+# Bitstream upload
+cp bitstream_config_kv260.json my_bitstream_config.json
+$EDITOR my_bitstream_config.json          # set ssh.host and check bitstream paths
+
+# Correctness tests
 cp remote_config.json.example remote_config.json
 $EDITOR remote_config.json
 
-# For run_remote_perf.py (performance benchmarks)
+# Performance benchmarks
 cp perf_config.json.example perf_config.json
 $EDITOR perf_config.json
 ```
 
-Minimum required change in both: set `ssh.host` to your board's IP or hostname.
+Minimum required change in all configs: set `ssh.host` to your board's IP or hostname.
 
 ---
 
@@ -165,6 +169,112 @@ The runner places kernel driver sources (`.c`/`.h` files) in the project's
 When `local.*` is set, the drivers are bundled before upload and `remote.*`
 driver options are skipped. When none is set, `driver/` contains only a
 `README.md` and the build will fail until you populate it manually.
+
+---
+
+## Bitstream Upload (`upload_bitstream.py`)
+
+Before running any hardware tests the Cormorant bitstream must be loaded onto
+the KV260.  `upload_bitstream.py` automates the full loading sequence, mirroring
+what PYNQ's `Overlay` class does internally:
+
+1. Parse the `.bit` header, byte-swap the payload → raw `.bin`
+2. Parse the `.hwh` — extract PS AXI port-width parameters and memory topology
+3. Build a minimal xclbin (MEM_TOPOLOGY) locally with `xclbinutil`
+4. Upload `.bin` → `/lib/firmware/<name>.bin` on the board
+5. Remove any existing configfs DTBO overlay with the same name
+6. Write to `fpga_manager` sysfs — triggers PL reconfiguration
+7. Verify `fpga_manager` state == `operating`
+8. Write PS SLCR / AXIFM registers to match the bitstream's AXI bus widths
+9. Load the xclbin into the zocl DRM driver (`xclLoadXclBin`) — registers
+   memory topology so `xclAllocBO` resolves to a named DDR bank
+10. Upload the `.dtbo` and apply it via configfs
+11. Verify overlay status == `applied`
+12. List `/dev/uio*` devices to confirm UIO nodes are up
+
+### Prerequisites
+
+- `xclbinutil` on `PATH` (source the Vitis `settings64.sh`):
+  ```bash
+  source /mnt/data/xilinx/2025.2/Vitis/2025.2/settings64.sh
+  which xclbinutil   # should print the path
+  ```
+- SSH access to the board as root (or passwordless sudo) — same requirement
+  as `run_remote_tests.py`.
+
+### Config file
+
+`bitstream_config_kv260.json` is the ready-to-use example for the Cormorant
+design.  Edit it once to set your board address:
+
+```json
+{
+  "ssh": {
+    "host": "192.168.100.8",
+    "key_file": "~/.ssh/kv260-testkey"
+  },
+  "bitstream": {
+    "bit":  "../hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper.bit",
+    "hwh":  "../hw/cormorant_hw_128/cormorant_hw_128.gen/sources_1/bd/design_cormorant/hw_handoff/design_cormorant.hwh",
+    "dtbo": "../dts/kv260/pl.dtbo"
+  }
+}
+```
+
+All paths under `"bitstream"` are resolved relative to the config file, so the
+config is portable across checkouts.  The `hwh` key may be omitted when
+`<bit_stem>.hwh` sits alongside the `.bit` file (Vivado writes it there by default).
+
+#### `bitstream` config keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `bitstream.bit` | *(required)* | Local path to the Vivado `.bit` file |
+| `bitstream.hwh` | auto-detect | Local path to the hardware-handoff `.hwh`; auto-detected as `<bit_stem>.hwh` when omitted |
+| `bitstream.dtbo` | *(required)* | Local path to the compiled device tree overlay `.dtbo` |
+| `bitstream.overlay_name` | `.dtbo` stem | Configfs directory name and `/lib/firmware/<name>.bin` filename |
+| `bitstream.xclbinutil` | `"xclbinutil"` | `xclbinutil` command or absolute path |
+
+### Usage
+
+```bash
+cd inference-scheduler
+
+# Load bitstream — all paths from config
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
+
+# Override individual paths on the CLI (takes precedence over config)
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json \
+    --bit   ../hw/cormorant_hw_128/.../design_cormorant_wrapper.bit \
+    --dtbo  ../dts/kv260/pl.dtbo
+
+# Check board readiness without loading anything
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json \
+    --check-only
+```
+
+After a successful run, verify the UIO devices are up:
+
+```bash
+cat /sys/class/uio/uio*/name
+# fabric_vecop
+# fabric_matmul
+# fabric_conv
+# fabric_pool
+```
+
+### Implementation
+
+The script and its helper modules live in `src/bitstream/`:
+
+| Module | Contents |
+|--------|----------|
+| `src/bitstream/convert.py` | `.bit` → `.bin` conversion |
+| `src/bitstream/hwh.py` | HWH parsing — PS params and memory topology |
+| `src/bitstream/xclbin.py` | xclbin synthesis via `xclbinutil` |
+| `src/bitstream/board.py` | All remote SSH/SFTP board operations |
+| `src/bitstream/loader.py` | `upload_bitstream()` orchestration |
+| `src/bitstream/platforms/kv260.py` | KV260 register tables (`FPD_SLCR`, `AXIFM`) and `BLANK_METADATA` XML |
 
 ---
 
@@ -338,11 +448,11 @@ Update `remote.uio_devices` in your config to match the labels found there.
 The driver scans `/sys/class/uio/uio*/name` for an exact string match — these
 must be sysfs names, not `/dev/uioN` paths.
 
-If no UIO devices appear at all, the DTBO overlay may not be loaded:
+If no UIO devices appear at all, the DTBO overlay may not be loaded.
+Load it with `upload_bitstream.py` (see [Bitstream Upload](#bitstream-upload-upload_bitstreampy)):
 
 ```bash
-# Load the overlay (KV260 with fpgautil)
-fpgautil -b design_matmul_vecop.bit.bin -o matmul_vecop.dtbo
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
 
 # Verify
 cat /sys/class/uio/uio*/name
@@ -682,7 +792,7 @@ A case shows `ERR` when the benchmark binary exits non-zero. Common causes:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `xclOpen(0) failed` | XRT not loaded / no bitstream active | Load the FPGA overlay: `fpgautil -b <bitstream>.bit.bin -o <overlay>.dtbo` |
+| `xclOpen(0) failed` | XRT not loaded / no bitstream active | Load the bitstream: `python upload_bitstream.py --config bitstream_config_kv260.json` |
 | `init 'fabric' failed` | UIO device name mismatch | Check `cat /sys/class/uio/uio*/name` and update `remote.uio_devices` |
 | `alloc failed` | DMA buffer allocation failed | Reduce `size` or number of concurrent allocations; check `dmesg` for CMA |
 | `No such file` (binary missing) | Driver files not found at build time | Verify `local.driver_dirs` paths exist and contain all `x<kernel>*.c/.h` files; re-run with `--no-cleanup` and inspect cmake output |
@@ -724,14 +834,18 @@ the `design_matmul_vecop` bitstream and both UIO devices active on the board.
 ### 2. Load the bitstream on the board
 
 ```bash
-# On the KV260 — load the overlay built from dts/kv260/cormorant.dts
-fpgautil -b cormorant.bit.bin -o design_cormorant.dtbo
-cat /sys/class/uio/uio*/name
+# From the inference-scheduler directory on the local machine
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
+
+# Verify UIO devices are up
+cat /sys/class/uio/uio*/name   # run on the board
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
 # fabric_pool
 ```
+
+See [Bitstream Upload](#bitstream-upload-upload_bitstreampy) for config reference and CLI options.
 
 ### 3. Use remote_config_mixed.json
 
@@ -756,13 +870,18 @@ cmake … -DINFERENCE_VECTOROPKERNEL_INSTANCE="fabric_vecop" \
          -DINFERENCE_MATMULKERNEL_INSTANCE="fabric_matmul"
 ```
 
-### 4. Config files by bitstream
+### 4. Config files by purpose
 
-| Config file | Bitstream | Kernels |
-|-------------|-----------|---------|
-| `remote_config_vectorop.json` | `vadd_kv260` | VectorOPKernel only |
-| `remote_config_matmul.json` | `matmul_kv260` | MatmulKernel only |
-| `remote_config_mixed.json` | `design_matmul_vecop` | Both |
+| Config file | Script | Purpose |
+|-------------|--------|---------|
+| `bitstream_config_kv260.json` | `upload_bitstream.py` | Load Cormorant bitstream + DTBO onto the board |
+| `remote_config_all_models.json` | `run_remote_tests.py` | Correctness tests — all four kernels |
+| `remote_config_vectorop.json` | `run_remote_tests.py` | VectorOPKernel only |
+| `remote_config_matmul.json` | `run_remote_tests.py` | MatmulKernel only |
+| `remote_config_conv.json` | `run_remote_tests.py` | ConvKernel only |
+| `remote_config_pool.json` | `run_remote_tests.py` | PoolingKernel only |
+| `remote_config_mixed.json` | `run_remote_tests.py` | VectorOPKernel + MatmulKernel |
+| `perf_config.json` | `run_remote_perf.py` | Performance benchmarks |
 
 ---
 
