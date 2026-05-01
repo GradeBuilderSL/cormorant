@@ -30,16 +30,26 @@ per-layer execution loop — all without any Python or ONNX runtime on the targe
 Consider a simple ONNX graph: `X + bias → Y` where `bias` is a constant weight
 tensor. The scheduler turns this into:
 
-```
-┌─────────────────┐     inference_scheduler.py      ┌──────────────────────────┐
-│  model.onnx     │ ──────────────────────────────►  │  inference project/      │
-│                 │                                  │  ├── CMakeLists.txt       │
-│  X──┬──Add──►Y  │                                  │  ├── include/inference.h  │
-│     │           │                                  │  ├── src/inference.c      │
-│   bias          │                                  │  ├── src/inference_buf.c  │
-└─────────────────┘                                  │  ├── test/test_inference.c│
-                                                     │  └── driver/             │
-                                                     └──────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph M["model.onnx"]
+        direction TB
+        MG["X ──Add──► Y\n         │\n       bias"]
+    end
+
+    IS[["inference_scheduler.py"]]
+
+    subgraph OUT["output project/"]
+        direction TB
+        F1["CMakeLists.txt"]
+        F2["include/inference.h"]
+        F3["src/inference.c"]
+        F4["src/inference_buf.c"]
+        F5["test/test_inference.c"]
+        F6["driver/"]
+    end
+
+    M --> IS --> OUT
 ```
 
 The generated `inference.c` contains:
@@ -654,6 +664,24 @@ cmake .. -DINFERENCE_TEST_INSTANCE=my_instance_name
 ```
 
 ### Automated Remote Testing
+
+```mermaid
+flowchart TD
+    M["ONNX model\ntest/models/model.onnx"]
+    GEN["inference_scheduler.py\nGenerate C project locally"]
+    DRV["Bundle driver sources\nfrom local.driver_dirs"]
+    UP["Upload project to board\nSSH / SFTP"]
+    BUILD["Build on board\ncmake -DINFERENCE_TARGET=LINUX\nmake"]
+    RUN["Execute test_inference binary\non board (sudo -n)"]
+    CMP["Compare every output element\nvs Python GT simulation\nexact Data_t match"]
+    RES{all elements match?}
+    PASS(["PASSED ✓"])
+    FAIL(["FAILED — mismatch at element N"])
+
+    M --> GEN --> DRV --> UP --> BUILD --> RUN --> CMP --> RES
+    RES -->|yes| PASS
+    RES -->|no| FAIL
+```
 
 `run_remote_tests.py` automates the full generate → upload → build → run cycle
 for a list of models on a physical KV260. It handles SSH connectivity, driver

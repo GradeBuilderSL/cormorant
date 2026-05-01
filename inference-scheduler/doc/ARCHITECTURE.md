@@ -25,51 +25,39 @@ and how to extend it.
 
 ## 1. High-Level Pipeline
 
-```
-model.onnx
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  OnnxGraph (src/graph.py)                                            │
-│                                                                      │
-│  1. Load ONNX proto, validate with onnx.checker.check_model()        │
-│  2. Run shape inference (onnx.shape_inference.infer_shapes)          │
-│  3. _preprocess_model(): decompose Gemm → MatMul + optional Add      │
-│     (raises SchedulerError for unsupported alpha/beta/transA/transB) │
-│  4. Build tensor registry: weights, inputs, intermediates, outputs   │
-│  5. For each node, dispatch to the appropriate node class:           │
-│       MatMul   → MatmulNode  (MatmulKernel)                          │
-│       Conv     → ConvNode    (ConvKernel)                            │
-│       Pool ops → PoolNode    (PoolingKernel)                         │
-│       Reshape  → ReshapeNode (buffer alias, no hardware call)        │
-│       others   → ScheduledNode (VectorOPKernel)                      │
-└──────────────────────────────────────────────────────────────────────┘
-    │
-    ▼ OnnxGraph (nodes, tensors)
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  CodeGenerator._CoreMixin (src/codegen/_core.py)                     │
-│                                                                      │
-│  5. _compute_tensor_layouts()                                        │
-│     - Seed with natural sizes (numel)                                │
-│     - Override for broadcast nodes (padded stride layouts)           │
-│     - Forward-propagate padding through non-broadcast nodes          │
-│  6. _compute_pool_bytes() — total DMA memory needed                  │
-└──────────────────────────────────────────────────────────────────────┘
-    │
-    ▼ TensorLayout dict
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  Code Emission (mixins in src/codegen/)                              │
-│                                                                      │
-│  _HeaderMixin  →  include/inference.h   (types, macros, API decls)  │
-│  _SourceMixin  →  src/inference.c       (weight arrays, init, run)  │
-│  _BufImplMixin →  src/inference_buf.c   (DMA alloc, cache sync)     │
-│  _SimulateMixin + _TestMixin → test/test_inference.c                 │
-│  _CmakeMixin   →  CMakeLists.txt                                     │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    IN([model.onnx])
+
+    subgraph GRAPH["OnnxGraph · src/graph.py"]
+        direction TB
+        G1["① Load ONNX proto, validate with onnx.checker"]
+        G2["② Shape inference — infer_shapes fills intermediate shapes"]
+        G3["③ _preprocess_model — Gemm → MatMul + optional Add"]
+        G4["④ Build tensor registry\nweights · inputs · intermediates · outputs"]
+        G5["⑤ Dispatch each node to a typed class\nMatMul→MatmulNode · Conv→ConvNode · Pool→PoolNode\nReshape→ReshapeNode · others→ScheduledNode"]
+        G1 --> G2 --> G3 --> G4 --> G5
+    end
+
+    subgraph CORE["_CoreMixin · src/codegen/_core.py"]
+        direction TB
+        C1["_compute_tensor_layouts()\nPhase 1: flat seed · Phase 2: broadcast layouts · Phase 3: forward propagation"]
+        C2["_compute_pool_bytes() — total DMA memory required"]
+        C1 --> C2
+    end
+
+    subgraph EMIT["Code Emission · src/codegen/"]
+        direction LR
+        H["_HeaderMixin\ninclude/inference.h"]
+        S["_SourceMixin\nsrc/inference.c"]
+        B["_BufImplMixin\nsrc/inference_buf.c"]
+        T["_SimulateMixin + _TestMixin\ntest/test_inference.c"]
+        CM["_CmakeMixin\nCMakeLists.txt"]
+    end
+
+    IN --> GRAPH
+    GRAPH -- "OnnxGraph (nodes + tensors)" --> CORE
+    CORE -- "TensorLayout dict" --> EMIT
 ```
 
 ---
@@ -205,6 +193,20 @@ _ONNX_OP_MAP = {
     "Relu": (OP_RELU,  arity=1),
     "Clip": (OP_RELU6, arity=1),   # validated for (min=0, max=6)
 }
+```
+
+### Node Dispatch
+
+```mermaid
+flowchart TD
+    N["ONNX NodeProto"]
+    N --> D{op_type?}
+    D -->|MatMul| MN["MatmulNode\ndrives MatmulKernel\ntiled GEMM, batched"]
+    D -->|Conv| CN["ConvNode\ndrives ConvKernel\nNHCW 2-D convolution"]
+    D -->|"MaxPool · AveragePool\nLpPool · Global variants"| PN["PoolNode\ndrives PoolingKernel\nNHCW 2-D pooling"]
+    D -->|Reshape| RN["ReshapeNode\nbuffer alias — no hardware call\noutput ptr = source ptr"]
+    D -->|"Add · Sub · Mul · Div\nRelu · Clip(min=0, max=6)"| SN["ScheduledNode\ndrives VectorOPKernel\nelement-wise op"]
+    D -->|other| ERR(["SchedulerError\nunsupported operator"])
 ```
 
 ### Clip Validation
@@ -447,6 +449,14 @@ Factory methods: `flat(numel)`, `advancing(numel, n_chunks, stride)`, `repeating
 
 Returns `{onnx_name: TensorLayout}`. Three phases:
 
+```mermaid
+flowchart LR
+    P1["Phase 1 — Seed all tensors flat\nTensorLayout.flat(numel) for every tensor in graph"]
+    P2["Phase 2 — Broadcast VectorOP nodes\noutput → advancing layout\nadvancing inputs → advancing layout\nrepeating input → repeating layout\n(MatmulNode / ConvNode / PoolNode / ReshapeNode excluded)"]
+    P3["Phase 3 — Forward propagation\nnon-broadcast ScheduledNodes in topological order\nraise output and co-inputs to match\ndominant input allocation size"]
+    P1 --> P2 --> P3
+```
+
 **Phase 1 — Seed all tensors as flat**: every tensor starts with `TensorLayout.flat(numel)`.
 
 **Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`, MatmulNode /
@@ -491,6 +501,55 @@ class CodeGenerator(
     _CoreMixin,           # __init__ must be last
 ):
     pass
+```
+
+```mermaid
+classDiagram
+    direction TB
+    class CodeGenerator {
+        _graph : OnnxGraph
+        _dtype : DataType
+        _layouts : dict
+        _alloc_sizes : dict
+        _embed_large_weights : bool
+    }
+    class _CoreMixin {
+        __init__()
+        _compute_tensor_layouts()
+        _compute_pool_bytes()
+    }
+    class _HeaderMixin {
+        generate_header()
+    }
+    class _SourceMixin {
+        generate_source()
+        _run_op_helper()
+        _run_matmul_helper()
+        _run_conv_helper()
+        _run_pool_helper()
+        _init_function()
+        _inference_function()
+    }
+    class _BufImplMixin {
+        generate_buf_impl()
+    }
+    class _SimulateMixin {
+        simulate()
+        generate_expected_dat()
+    }
+    class _TestMixin {
+        generate_test()
+    }
+    class _CmakeMixin {
+        generate_cmake()
+    }
+    CodeGenerator --|> _HeaderMixin
+    CodeGenerator --|> _SourceMixin
+    CodeGenerator --|> _BufImplMixin
+    CodeGenerator --|> _SimulateMixin
+    CodeGenerator --|> _TestMixin
+    CodeGenerator --|> _CmakeMixin
+    CodeGenerator --|> _CoreMixin
 ```
 
 All mixins share state through `self`:
@@ -670,20 +729,22 @@ hardware's element-wise saturate-and-round behavior.
 
 ### Simulation Flow
 
-```
-1. Seed weights: for each weight tensor, quantize(float_data) → simulated array
-2. Seed inputs:  ramp_to_float(positions) → simulated input array
-   (positions account for broadcast stride layout)
-3. For each node in topological order:
-   ScheduledNode → numpy element-wise op (a + b, a * b, np.maximum, etc.),
-                   then quantize(result)
-   MatmulNode    → np.matmul(A, B), then quantize(result)
-   ConvNode      → _conv2d_ref() sliding-window reference, then quantize(result)
-   PoolNode      → _pool2d_ref() sliding-window reference (no quantization —
-                   pooling is a reduction, not a saturating arithmetic op)
-   ReshapeNode   → arrays[output] = arrays[source].reshape(output.shape)
-                   (zero cost; shares the numpy array)
-4. Return all arrays (inputs, weights, intermediates, outputs)
+```mermaid
+flowchart TD
+    W["Seed weights\nquantize float_data for each weight tensor"]
+    I["Seed inputs\nramp_to_float(positions)\naccounts for broadcast stride layout"]
+    W --> LOOP
+    I --> LOOP
+    LOOP["For each node in topological order"]
+    LOOP --> SW{node type}
+    SW -->|ScheduledNode| SN["numpy element-wise op\na+b · a-b · a*b · a/b · max(a,0) · clip(a,0,6)\nthen quantize(result)"]
+    SW -->|MatmulNode| MN["np.matmul(A, B)\nthen quantize(result)"]
+    SW -->|ConvNode| CN["_conv2d_ref() sliding-window reference\nthen quantize(result)"]
+    SW -->|PoolNode| PN["_pool2d_ref() sliding-window reference\nno quantize — reduction, not arithmetic"]
+    SW -->|ReshapeNode| RN["arrays[output] = arrays[source].reshape(shape)\nzero cost — shares the numpy array"]
+    SN & MN & CN & PN & RN --> NEXT{more nodes?}
+    NEXT -->|yes| LOOP
+    NEXT -->|no| OUT["Return all arrays\ninputs · weights · intermediates · outputs"]
 ```
 
 ### Quantization at Each Step
@@ -731,6 +792,32 @@ Two operations maintain coherency:
 |----------|-----------|------|----------------|
 | `sync_to_device(buf)` | CPU cache → DDR | Before PL reads | Linux: `xclSyncBO(TO_DEVICE)` / Bare-metal: `Xil_DCacheFlushRange` |
 | `sync_from_device(buf)` | DDR → CPU cache | After PL writes | Linux: `xclSyncBO(FROM_DEVICE)` / Bare-metal: `Xil_DCacheInvalidateRange` |
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU (Cortex-A53)
+    participant DDR as DDR Memory
+    participant PL as FPGA PL
+
+    rect rgb(230, 240, 255)
+        Note over CPU,PL: inference_init()
+        CPU->>DDR: memcpy(weight_buf_ptr, rom_data)
+        CPU->>DDR: sync_to_device(weight_buf) — dcache flush
+        Note right of DDR: weights flushed once, never re-synced
+    end
+
+    rect rgb(230, 255, 230)
+        Note over CPU,PL: inference_run(X, Y)
+        CPU->>DDR: sync_to_device(X) — flush input
+        DDR->>PL: kernel reads X via m_axi_gmem0
+        PL->>DDR: kernel writes intermediate T via m_axi_gmem2
+        Note over DDR: intermediate never touches CPU cache
+        DDR->>PL: next kernel reads T via m_axi_gmem0
+        PL->>DDR: kernel writes Y via m_axi_gmem2
+        CPU->>DDR: sync_from_device(Y) — invalidate dcache
+        Note right of CPU: CPU can now read Y safely
+    end
+```
 
 ### Sync Policy in Generated Code
 
