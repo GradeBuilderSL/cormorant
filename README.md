@@ -98,6 +98,7 @@ make sim_hw_kv260
 cd inference-scheduler
 
 # Load the bitstream + device-tree overlay from the host over SSH
+cp bitstream_config_kv260.json.example bitstream_config_kv260.json
 # (edit bitstream_config_kv260.json first: set ssh.host and check paths)
 .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
 
@@ -109,7 +110,7 @@ cat /sys/class/uio/uio*/name
 # fabric_pool
 
 # Run correctness tests over SSH (see inference-scheduler/doc/REMOTE_TESTING.md)
-cp remote_config_all_models.json remote_config.json
+cp remote_config.json.example remote_config.json
 $EDITOR remote_config.json   # set ssh.host and local.driver_dirs
 .venv/bin/python run_remote_tests.py --config remote_config.json
 ```
