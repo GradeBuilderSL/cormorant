@@ -28,70 +28,6 @@ CMake) and share the same `saturate_cast` / AP_TRN+AP_SAT saturation pattern.
 
 ---
 
-## Repository Layout
-
-```
-cormorant/
-├── kernels/
-│   ├── vectorop/    VectorOPKernel — element-wise vector ops
-│   │   ├── kernel/VectorOP.cpp
-│   │   ├── include/  VectorOP.h, Config.h.in
-│   │   ├── test/     TestSimulation.cpp
-│   │   ├── scripts/  Synthesis.tcl.in
-│   │   └── platforms/  kv260.json, …
-│   ├── conv/        ConvKernel — 2-D NCHW convolution
-│   │   └── kernel/ConvKernel.cpp
-│   ├── matmul/      MatmulKernel — tiled matrix multiply
-│   │   └── kernel/MatmulKernel.cpp
-│   └── pool/        PoolingKernel — 2-D NCHW pooling
-│       └── kernel/PoolingKernel.cpp
-│
-├── dts/kv260/       Device-tree overlay for the KV260
-│   └── cormorant.dts
-│
-├── hw/
-│   └── cormorant_hw_128/   Vivado block design (git submodule)
-│
-├── doc/             Technical reference documents
-│
-└── inference-scheduler/   ONNX → C code-generator + board tools
-    ├── inference_scheduler.py
-    ├── upload_bitstream.py        KV260 bitstream upload tool
-    ├── run_remote_tests.py        SSH-based hardware correctness runner
-    ├── run_remote_perf.py         SSH-based performance benchmark runner
-    ├── bitstream_config_kv260.json  Example config for upload_bitstream.py
-    └── src/
-        ├── graph.py        ONNX loading, shape inference, Gemm decomposition
-        ├── nodes.py        ScheduledNode / MatmulNode / ConvNode / PoolNode / ReshapeNode
-        ├── tensor.py       Weight encoding, buffer declarations
-        ├── kernels.py      KernelDesc registry (driver prefixes, file lists)
-        ├── dtype.py        DataType abstraction (ap_fixed<W,I>, float32)
-        ├── layout.py       TensorLayout (alloc sizes, broadcast strides)
-        ├── codegen/        Multi-mixin code generator
-        │   ├── _core.py    Pool layout, live-interval buffer reuse
-        │   ├── _header.py  include/inference.h
-        │   ├── _source.py  src/inference.c
-        │   ├── _buf_impl.py src/inference_buf.c (XRT / bare-metal DMA)
-        │   ├── _test.py    test/test_inference.c
-        │   ├── _cmake.py   CMakeLists.txt
-        │   └── _simulate.py Fixed-point forward simulation
-        ├── bitstream/      Bitstream loading package
-        │   ├── convert.py  .bit → .bin conversion
-        │   ├── hwh.py      HWH parsing (PS params, memory topology)
-        │   ├── xclbin.py   Synthetic xclbin generation via xclbinutil
-        │   ├── board.py    Remote board operations (fpga_manager, DTBO, xclbin)
-        │   ├── loader.py   upload_bitstream() orchestration
-        │   └── platforms/
-        │       └── kv260.py  KV260 register tables and xclbin metadata
-        └── remote/         Shared SSH/SFTP utilities
-            ├── session.py  RemoteSession (paramiko wrapper)
-            ├── config.py   load_config, deep_merge, SHARED_DEFAULTS
-            ├── colors.py   ANSI colour helpers
-            └── checks.py   Board prerequisite checks
-```
-
----
-
 ## Quick Start
 
 ### 1. Clone and initialise
@@ -133,7 +69,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ```bash
 # Source Vitis (required for HLS synthesis)
-source /mnt/data/xilinx/2025.2/settings64.sh
+source <Xilinx install dir>/settings64.sh
 
 cd build
 
