@@ -98,16 +98,143 @@ static void init_accumulators(
 }
 
 // ---------------------------------------------------------------------------
+// Standard: load input patch for (oh, ow, ic_tile).
+//
+// patch[ic_l][khi][kwi] holds the spatial patch for the current ic_tile.
+// First dim indexes input channels within the current ic_tile.
+// ---------------------------------------------------------------------------
+static void load_standard_patch(
+    const Data_t* x,
+    Data_t        patch[kTileIC][kMaxKH][kMaxKW],
+    unsigned      ni,
+    unsigned      oh,
+    unsigned      ow,
+    unsigned      ic_off,
+    unsigned      ic_valid,
+    unsigned      in_ch,
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left
+) {
+    #pragma HLS INLINE
+
+    for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+        for (unsigned khi = 0; khi < kh; khi++) {
+            const int ih = (int)(oh * stride_h + khi * dilation_h)
+                         - (int)pad_top;
+            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+            const unsigned x_row = (ni * in_ch + ic_off + ic_l)
+                                  * in_h * in_w
+                                  + (ih_ok ? (unsigned)ih * in_w : 0u);
+            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                #pragma HLS PIPELINE II=1
+                const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                             - (int)pad_left;
+                patch[ic_l][khi][kwi] =
+                    (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                    ? x[x_row + (unsigned)iw]
+                    : Data_t(0);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standard: load weight tile for (m_tile, ic_tile).
+//
+// Weight layout: [out_ch][in_ch][kh][kw].  Per lane offset:
+//   (m_off+m1)*in_ch*kh*kw + ic_off*kh*kw
+// w_buf is the local 4-D buffer owned by the standard tile compute.
+// ---------------------------------------------------------------------------
+static void load_standard_weights(
+    const Data_t* weight,
+    Data_t        w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      ic_off,
+    unsigned      ic_valid,
+    unsigned      in_ch,
+    unsigned      kh,
+    unsigned      kw
+) {
+    #pragma HLS INLINE
+
+    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+        const Data_t* w_ptr = weight
+            + (m_off + m1) * in_ch * kh * kw
+            + ic_off * kh * kw;
+        unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
+        const unsigned wt_len = ic_valid * kh * kw;
+        for (unsigned r = 0; r < wt_len; r++) {
+            #pragma HLS PIPELINE II=1
+            w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
+            if (++kwi_l == kw) {
+                kwi_l = 0;
+                if (++khi_l == kh) {
+                    khi_l = 0;
+                    ++ic_l;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM.
+//
+// ri runs 0 .. ic_valid*kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles
+// through lanes; acc[m1] is written every kTileM cycles, so the RAW
+// dependence distance ≥ MAC latency.
+// ---------------------------------------------------------------------------
+static void accumulate_standard(
+    const Data_t patch[kTileIC][kMaxKH][kMaxKW],
+    const Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
+    AccData_t    acc[kTileM],
+    unsigned     ic_valid,
+    unsigned     kh,
+    unsigned     kw
+) {
+    #pragma HLS INLINE
+
+    unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
+    const unsigned ri_bound = ic_valid * kh * kw * kTileM;
+    for (unsigned ri = 0; ri < ri_bound; ri++) {
+        #pragma HLS PIPELINE II=1
+        const unsigned m1 = ri & (kTileM - 1);
+        acc[m1] +=
+            AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
+            AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
+
+        if ((ri & (kTileM - 1)) == kTileM - 1) {
+            if (++kwi_cnt == kw) {
+                kwi_cnt = 0;
+                if (++khi_cnt == kh) {
+                    khi_cnt = 0;
+                    ++ic_cnt;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Standard convolution path (group=1).
 //
 // Tiles the input channel dimension (TILE_IC) and accumulates over
 // ic × kH × kW.  For each ic_tile:
-//   1. load the input patch for (oh, ow, ic_tile) into `patch`
-//   2. load the weight tile for (m_tile, ic_tile) into `w_buf`
-//   3. accumulate II=1 over ic_valid × kh × kw × kTileM
+//   1. load_standard_patch    — input patch for (oh, ow, ic_tile)
+//   2. load_standard_weights  — weight tile for (m_tile, ic_tile)
+//   3. accumulate_standard    — II=1 reduction
 //
-// INLINE so the partitioning of `patch`, `w_buf`, and `acc` declared in
-// ConvKernel propagates into this body's schedule.
+// INLINE to preserve the array partitioning of `patch` and `acc` declared
+// in ConvKernel.
 // ---------------------------------------------------------------------------
 static void compute_standard_conv_tile(
     const Data_t* x,
@@ -133,74 +260,24 @@ static void compute_standard_conv_tile(
     unsigned      ic_tiles
 ) {
     #pragma HLS INLINE
+
     Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
 
     for (unsigned ict = 0; ict < ic_tiles; ict++) {
         const unsigned ic_off   = ict * kTileIC;
         const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-        // Load input patch for (oh, ow, ic_tile).
-        for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-            for (unsigned khi = 0; khi < kh; khi++) {
-                const int ih = (int)(oh * stride_h + khi * dilation_h)
-                             - (int)pad_top;
-                const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                const unsigned x_row = (ni * in_ch + ic_off + ic_l)
-                                      * in_h * in_w
-                                      + (ih_ok ? (unsigned)ih * in_w : 0u);
-                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                    #pragma HLS PIPELINE II=1
-                    const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                 - (int)pad_left;
-                    patch[ic_l][khi][kwi] =
-                        (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                        ? x[x_row + (unsigned)iw]
-                        : Data_t(0);
-                }
-            }
-        }
+        load_standard_patch(x, patch,
+                            ni, oh, ow, ic_off, ic_valid,
+                            in_ch, in_h, in_w, kh, kw,
+                            stride_h, stride_w, dilation_h, dilation_w,
+                            pad_top, pad_left);
 
-        // Load weight tile for (m_tile, ic_tile).
-        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-            const Data_t* w_ptr = weight
-                + (m_off + m1) * in_ch * kh * kw
-                + ic_off * kh * kw;
-            unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
-            const unsigned wt_len = ic_valid * kh * kw;
-            for (unsigned r = 0; r < wt_len; r++) {
-                #pragma HLS PIPELINE II=1
-                w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
-                if (++kwi_l == kw) {
-                    kwi_l = 0;
-                    if (++khi_l == kh) {
-                        khi_l = 0;
-                        ++ic_l;
-                    }
-                }
-            }
-        }
+        load_standard_weights(weight, w_buf,
+                              m_off, m_valid, ic_off, ic_valid,
+                              in_ch, kh, kw);
 
-        // Accumulate: II=1 pipelined K-reduction.
-        // ri runs 0 .. ic_valid*kh*kw*kTileM - 1.
-        unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
-        const unsigned ri_bound = ic_valid * kh * kw * kTileM;
-        for (unsigned ri = 0; ri < ri_bound; ri++) {
-            #pragma HLS PIPELINE II=1
-            const unsigned m1 = ri & (kTileM - 1);
-            acc[m1] +=
-                AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
-                AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
-
-            if ((ri & (kTileM - 1)) == kTileM - 1) {
-                if (++kwi_cnt == kw) {
-                    kwi_cnt = 0;
-                    if (++khi_cnt == kh) {
-                        khi_cnt = 0;
-                        ++ic_cnt;
-                    }
-                }
-            }
-        }
+        accumulate_standard(patch, w_buf, acc, ic_valid, kh, kw);
     }
 }
 
