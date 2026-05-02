@@ -43,6 +43,356 @@
 #include <algorithm>
 #include "ConvKernel.h"
 
+// ---------------------------------------------------------------------------
+// Zero all kTileM accumulator lanes (full unroll, single cycle).
+// ---------------------------------------------------------------------------
+static void zero_accumulators(AccData_t acc[kTileM]) {
+    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+        #pragma HLS UNROLL
+        acc[m1] = AccData_t(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overwrite the m_valid valid lanes with bias values from DDR.
+// Guarded by has_bias so no m_axi transaction is issued on the bias bundle
+// when the caller does not supply a bias tensor.
+// ---------------------------------------------------------------------------
+static void load_bias(
+    AccData_t     acc[kTileM],
+    const Data_t* bias,
+    unsigned      m_valid,
+    unsigned      m_off,
+    unsigned      has_bias
+) {
+    if (has_bias) {
+        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+            #pragma HLS PIPELINE II=1
+            acc[m1] = AccData_t(bias[m_off + m1]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initialise the accumulator tile: zero all lanes, then optionally overlay
+// the bias values for the m_valid active lanes.
+//
+// NOTE on DATAFLOW: a previous version wrapped the two subtasks in
+// `#pragma HLS DATAFLOW` to overlap them, but Vitis HLS requires every
+// internal channel to be written by exactly one process function.  Both
+// subtasks here write to acc[], and HLS analysis cannot verify disjoint
+// indices across function boundaries — so DATAFLOW is rejected with
+// XFORM 203-711 / HLS 200-979.  The two calls therefore execute in
+// sequence; the cost is small (zero is one cycle, bias load is m_valid
+// cycles) and is amortised over the long accumulate phase that follows.
+// ---------------------------------------------------------------------------
+static void init_accumulators(
+    AccData_t     acc[kTileM],
+    const Data_t* bias,
+    unsigned      m_valid,
+    unsigned      m_off,
+    unsigned      has_bias
+) {
+    zero_accumulators(acc);
+    load_bias(acc, bias, m_valid, m_off, has_bias);
+}
+
+// ---------------------------------------------------------------------------
+// Standard convolution path (group=1).
+//
+// Tiles the input channel dimension (TILE_IC) and accumulates over
+// ic × kH × kW.  For each ic_tile:
+//   1. load the input patch for (oh, ow, ic_tile) into `patch`
+//   2. load the weight tile for (m_tile, ic_tile) into `w_buf`
+//   3. accumulate II=1 over ic_valid × kh × kw × kTileM
+//
+// INLINE so the partitioning of `patch`, `w_buf`, and `acc` declared in
+// ConvKernel propagates into this body's schedule.
+// ---------------------------------------------------------------------------
+static void compute_standard_conv_tile(
+    const Data_t* x,
+    const Data_t* weight,
+    Data_t        patch[kTileIC][kMaxKH][kMaxKW],
+    AccData_t     acc[kTileM],
+    unsigned      ni,
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      oh,
+    unsigned      ow,
+    unsigned      in_ch,
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left,
+    unsigned      ic_tiles
+) {
+    #pragma HLS INLINE
+    Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
+
+    for (unsigned ict = 0; ict < ic_tiles; ict++) {
+        const unsigned ic_off   = ict * kTileIC;
+        const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+
+        // Load input patch for (oh, ow, ic_tile).
+        for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+            for (unsigned khi = 0; khi < kh; khi++) {
+                const int ih = (int)(oh * stride_h + khi * dilation_h)
+                             - (int)pad_top;
+                const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                const unsigned x_row = (ni * in_ch + ic_off + ic_l)
+                                      * in_h * in_w
+                                      + (ih_ok ? (unsigned)ih * in_w : 0u);
+                for (unsigned kwi = 0; kwi < kw; kwi++) {
+                    #pragma HLS PIPELINE II=1
+                    const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                 - (int)pad_left;
+                    patch[ic_l][khi][kwi] =
+                        (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                        ? x[x_row + (unsigned)iw]
+                        : Data_t(0);
+                }
+            }
+        }
+
+        // Load weight tile for (m_tile, ic_tile).
+        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+            const Data_t* w_ptr = weight
+                + (m_off + m1) * in_ch * kh * kw
+                + ic_off * kh * kw;
+            unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
+            const unsigned wt_len = ic_valid * kh * kw;
+            for (unsigned r = 0; r < wt_len; r++) {
+                #pragma HLS PIPELINE II=1
+                w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
+                if (++kwi_l == kw) {
+                    kwi_l = 0;
+                    if (++khi_l == kh) {
+                        khi_l = 0;
+                        ++ic_l;
+                    }
+                }
+            }
+        }
+
+        // Accumulate: II=1 pipelined K-reduction.
+        // ri runs 0 .. ic_valid*kh*kw*kTileM - 1.
+        unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
+        const unsigned ri_bound = ic_valid * kh * kw * kTileM;
+        for (unsigned ri = 0; ri < ri_bound; ri++) {
+            #pragma HLS PIPELINE II=1
+            const unsigned m1 = ri & (kTileM - 1);
+            acc[m1] +=
+                AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
+                AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
+
+            if ((ri & (kTileM - 1)) == kTileM - 1) {
+                if (++kwi_cnt == kw) {
+                    kwi_cnt = 0;
+                    if (++khi_cnt == kh) {
+                        khi_cnt = 0;
+                        ++ic_cnt;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise: load per-lane input patches.
+//
+// patch[m1][khi][kwi] holds the spatial patch for input channel m_off+m1
+// (uses first kTileM slots of the kTileIC-deep patch buffer; kTileM ≤
+// kTileIC required, enforced by static_assert in ConvKernel).
+// ---------------------------------------------------------------------------
+static void load_depthwise_patch(
+    const Data_t* x,
+    Data_t        patch[kTileIC][kMaxKH][kMaxKW],
+    unsigned      ni,
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      oh,
+    unsigned      ow,
+    unsigned      in_ch,
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left
+) {
+    #pragma HLS INLINE
+
+    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+        for (unsigned khi = 0; khi < kh; khi++) {
+            const int ih = (int)(oh * stride_h + khi * dilation_h)
+                         - (int)pad_top;
+            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+            const unsigned x_row = (ni * in_ch + m_off + m1)
+                                  * in_h * in_w
+                                  + (ih_ok ? (unsigned)ih * in_w : 0u);
+            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                #pragma HLS PIPELINE II=1
+                const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                             - (int)pad_left;
+                patch[m1][khi][kwi] =
+                    (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                    ? x[x_row + (unsigned)iw]
+                    : Data_t(0);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise: load per-lane weight slices.
+//
+// Weight layout: [out_ch][1][kh][kw].  Offset for lane m: (m_off+m1)*kh*kw.
+// w_buf is the local 3-D buffer owned by the depthwise tile compute.
+// ---------------------------------------------------------------------------
+static void load_depthwise_weights(
+    const Data_t* weight,
+    Data_t        w_buf[kTileM][kMaxKH][kMaxKW],
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      kh,
+    unsigned      kw
+) {
+    #pragma HLS INLINE
+
+    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+        const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
+        unsigned khi_l = 0, kwi_l = 0;
+        for (unsigned r = 0; r < kh * kw; r++) {
+            #pragma HLS PIPELINE II=1
+            w_buf[m1][khi_l][kwi_l] = w_ptr[r];
+            if (++kwi_l == kw) {
+                kwi_l = 0;
+                ++khi_l;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise: II=1 kH×kW reduction with kTileM lanes.
+//
+// ri runs 0 .. kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles through
+// lanes; acc[m1] is written every kTileM cycles, so the RAW dependence
+// distance ≥ MAC latency.
+// ---------------------------------------------------------------------------
+static void accumulate_depthwise(
+    const Data_t patch[kTileIC][kMaxKH][kMaxKW],
+    const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
+    AccData_t    acc[kTileM],
+    unsigned     kh,
+    unsigned     kw
+) {
+    #pragma HLS INLINE
+
+    unsigned kwi_cnt = 0, khi_cnt = 0;
+    const unsigned ri_bound_dw = kh * kw * kTileM;
+    for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
+        #pragma HLS PIPELINE II=1
+        const unsigned m1 = ri & (kTileM - 1);
+        acc[m1] +=
+            AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
+            AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
+
+        if ((ri & (kTileM - 1)) == kTileM - 1) {
+            if (++kwi_cnt == kw) {
+                kwi_cnt = 0;
+                ++khi_cnt;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise convolution path (group=in_ch).
+//
+// Each output channel m is convolved with only its corresponding input
+// channel c=m.  No ic_tile loop.  Three phases: patch load → weight load →
+// accumulate, each in its own helper.
+//
+// INLINE to preserve the array partitioning of `patch` and `acc` declared
+// in ConvKernel.
+// ---------------------------------------------------------------------------
+static void compute_depthwise_conv_tile(
+    const Data_t* x,
+    const Data_t* weight,
+    Data_t        patch[kTileIC][kMaxKH][kMaxKW],
+    AccData_t     acc[kTileM],
+    unsigned      ni,
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      oh,
+    unsigned      ow,
+    unsigned      in_ch,
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left
+) {
+    #pragma HLS INLINE
+
+    Data_t w_buf[kTileM][kMaxKH][kMaxKW];
+
+    load_depthwise_patch(x, patch,
+                         ni, m_off, m_valid, oh, ow,
+                         in_ch, in_h, in_w, kh, kw,
+                         stride_h, stride_w, dilation_h, dilation_w,
+                         pad_top, pad_left);
+
+    load_depthwise_weights(weight, w_buf, m_off, m_valid, kh, kw);
+
+    accumulate_depthwise(patch, w_buf, acc, kh, kw);
+}
+
+// ---------------------------------------------------------------------------
+// Write one output tile (m_valid lanes of acc[]) to DDR.
+//
+// Each of the m_valid output channels writes to a non-contiguous DDR address
+// (stride = out_h*out_w elements).  y_addr is advanced by ohw each iteration
+// using a counter to avoid a multiplier inside the pipeline.
+// ---------------------------------------------------------------------------
+static void write_output_tile(
+    Data_t*         y,
+    const AccData_t acc[kTileM],
+    unsigned        m_valid,
+    unsigned        ni,
+    unsigned        out_ch,
+    unsigned        m_off,
+    unsigned        oh,
+    unsigned        ow,
+    unsigned        out_h,
+    unsigned        out_w
+) {
+    const unsigned ohw    = out_h * out_w;
+    unsigned       y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
+    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+        #pragma HLS PIPELINE II=1
+        y[y_addr] = saturate_cast<Data_t>(acc[m1]);
+        y_addr += ohw;
+    }
+}
+
 void ConvKernel(
     const Data_t* x,
     const Data_t* weight,
@@ -129,11 +479,9 @@ void ConvKernel(
                   "kTileM must be <= kTileIC");
 
     static Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-    static Data_t    w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
     static AccData_t acc  [kTileM];
 
     #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=1
     #pragma HLS ARRAY_PARTITION variable=acc   complete dim=0
 
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
@@ -148,191 +496,26 @@ void ConvKernel(
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-                    // -------------------------------------------------------
-                    // Initialise accumulators.
-                    //
-                    // All kTileM registers are zeroed first (full unroll, one
-                    // cycle).  If has_bias=1, the valid m1 lanes are then
-                    // overwritten with the bias values from DDR.  The bias
-                    // reads are guarded by the if-statement so no m_axi
-                    // transaction is issued on gmem2 when has_bias=0.
-                    // -------------------------------------------------------
-                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                        #pragma HLS UNROLL
-                        acc[m1] = AccData_t(0);
-                    }
-                    if (has_bias) {
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            #pragma HLS PIPELINE II=1
-                            acc[m1] = AccData_t(bias[m_off + m1]);
-                        }
-                    }
+                    init_accumulators(acc, bias, m_valid, m_off, has_bias);
 
                     if (!is_depthwise) {
-                        // -------------------------------------------------------
-                        // Standard convolution path (group=1).
-                        // Tiles the input channel dimension (TILE_IC) and
-                        // accumulates over ic × kH × kW.
-                        // -------------------------------------------------------
-                        for (unsigned ict = 0; ict < ic_tiles; ict++) {
-                            const unsigned ic_off   = ict * kTileIC;
-                            const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
-
-                            // -----------------------------------------------
-                            // Load input patch for (oh, ow, ic_tile).
-                            // -----------------------------------------------
-                            for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-                                for (unsigned khi = 0; khi < kh; khi++) {
-                                    const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                                 - (int)pad_top;
-                                    const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                                    const unsigned x_row = (ni * in_ch + ic_off + ic_l)
-                                                          * in_h * in_w
-                                                          + (ih_ok ? (unsigned)ih * in_w : 0u);
-                                    for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                        #pragma HLS PIPELINE II=1
-                                        const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                                     - (int)pad_left;
-                                        patch[ic_l][khi][kwi] =
-                                            (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                            ? x[x_row + (unsigned)iw]
-                                            : Data_t(0);
-                                    }
-                                }
-                            }
-
-                            // -----------------------------------------------
-                            // Load weight tile for (m_tile, ic_tile).
-                            // -----------------------------------------------
-                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                                const Data_t* w_ptr = weight
-                                    + (m_off + m1) * in_ch * kh * kw
-                                    + ic_off * kh * kw;
-                                unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
-                                const unsigned wt_len = ic_valid * kh * kw;
-                                for (unsigned r = 0; r < wt_len; r++) {
-                                    #pragma HLS PIPELINE II=1
-                                    w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
-                                    if (++kwi_l == kw) {
-                                        kwi_l = 0;
-                                        if (++khi_l == kh) {
-                                            khi_l = 0;
-                                            ++ic_l;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // -----------------------------------------------
-                            // Accumulate: II=1 pipelined K-reduction.
-                            // ri runs 0 .. ic_valid*kh*kw*kTileM - 1.
-                            // -----------------------------------------------
-                            unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
-                            const unsigned ri_bound = ic_valid * kh * kw * kTileM;
-                            for (unsigned ri = 0; ri < ri_bound; ri++) {
-                                #pragma HLS PIPELINE II=1
-                                const unsigned m1 = ri & (kTileM - 1);
-                                acc[m1] +=
-                                    AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
-                                    AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
-
-                                if ((ri & (kTileM - 1)) == kTileM - 1) {
-                                    if (++kwi_cnt == kw) {
-                                        kwi_cnt = 0;
-                                        if (++khi_cnt == kh) {
-                                            khi_cnt = 0;
-                                            ++ic_cnt;
-                                        }
-                                    }
-                                }
-                            }
-                        } // ic_tile loop
-
+                        compute_standard_conv_tile(
+                            x, weight, patch, acc,
+                            ni, m_off, m_valid, oh, ow,
+                            in_ch, in_h, in_w, kh, kw,
+                            stride_h, stride_w, dilation_h, dilation_w,
+                            pad_top, pad_left, ic_tiles);
                     } else {
-                        // -------------------------------------------------------
-                        // Depthwise convolution path (group=in_ch).
-                        //
-                        // Each output channel m is convolved with only its
-                        // corresponding input channel c=m.  No ic_tile loop.
-                        //
-                        // Weight layout: [out_ch][1][kh][kw]
-                        //   Offset for lane m: (m_off+m1)*kh*kw + khi*kw + kwi
-                        //
-                        // patch[m1][khi][kwi] holds the spatial patch for
-                        // input channel m_off+m1 (uses first kTileM slots of the
-                        // kTileIC-deep patch buffer; kTileM ≤ kTileIC required).
-                        // -------------------------------------------------------
-
-                        // Load per-lane input patches.
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                             - (int)pad_top;
-                                const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                                const unsigned x_row = (ni * in_ch + m_off + m1)
-                                                      * in_h * in_w
-                                                      + (ih_ok ? (unsigned)ih * in_w : 0u);
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                                 - (int)pad_left;
-                                    patch[m1][khi][kwi] =
-                                        (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                        ? x[x_row + (unsigned)iw]
-                                        : Data_t(0);
-                                }
-                            }
-                        }
-
-                        // Load per-lane weight slices (weight[m*kh*kw .. +kh*kw-1]).
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
-                            unsigned khi_l = 0, kwi_l = 0;
-                            for (unsigned r = 0; r < kh * kw; r++) {
-                                #pragma HLS PIPELINE II=1
-                                w_buf[m1][0][khi_l][kwi_l] = w_ptr[r];
-                                if (++kwi_l == kw) {
-                                    kwi_l = 0;
-                                    ++khi_l;
-                                }
-                            }
-                        }
-
-                        // Accumulate: II=1 kH×kW reduction, TILE_M lanes.
-                        // ri runs 0 .. kh*kw*kTileM - 1.
-                        unsigned kwi_cnt = 0, khi_cnt = 0;
-                        const unsigned ri_bound_dw = kh * kw * kTileM;
-                        for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned m1 = ri & (kTileM - 1);
-                            acc[m1] +=
-                                AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
-                                AccData_t(w_buf[m1][0][khi_cnt][kwi_cnt]);
-
-                            if ((ri & (kTileM - 1)) == kTileM - 1) {
-                                if (++kwi_cnt == kw) {
-                                    kwi_cnt = 0;
-                                    ++khi_cnt;
-                                }
-                            }
-                        }
-                    } // depthwise path
-
-                    // -------------------------------------------------------
-                    // Write output tile.
-                    //
-                    // Each of the m_valid output channels writes to a non-
-                    // contiguous DDR address (stride = out_h*out_w elements).
-                    // y_addr is advanced by ohw each iteration using a counter
-                    // to avoid a multiplier inside the pipeline.
-                    // -------------------------------------------------------
-                    const unsigned ohw   = out_h * out_w;
-                    unsigned y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        #pragma HLS PIPELINE II=1
-                        y[y_addr] = saturate_cast<Data_t>(acc[m1]);
-                        y_addr += ohw;
+                        compute_depthwise_conv_tile(
+                            x, weight, patch, acc,
+                            ni, m_off, m_valid, oh, ow,
+                            in_ch, in_h, in_w, kh, kw,
+                            stride_h, stride_w, dilation_h, dilation_w,
+                            pad_top, pad_left);
                     }
+
+                    write_output_tile(y, acc, m_valid,
+                                      ni, out_ch, m_off, oh, ow, out_h, out_w);
                 } // m_tile loop
 
             } // ow loop
