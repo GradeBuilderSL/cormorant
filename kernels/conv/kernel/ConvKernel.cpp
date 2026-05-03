@@ -8,11 +8,13 @@
 //
 // Loop structure — standard conv (is_depthwise=0):
 //
-//   batch loop      — iterates over input images
-//     oh / ow loops — slide over output spatial positions
-//       m_tile loop — tiles the output channel dimension (TILE_M)
-//         produce_bias (producer)  — push m_valid initial acc values to
-//                                    bias_stream (zero or bias[m_off+m1])
+//   m_tile loop      — tiles the output channel dimension (TILE_M); hoisted
+//                      outermost so bias for the tile is fetched from DDR once
+//     load_bias_tile — copy bias[m_off..m_off+m_valid-1] → on-chip bias_buf
+//     batch loop     — iterates over input images
+//       oh / ow loops — slide over output spatial positions
+//         produce_bias (producer)  — push m_valid initial acc values from
+//                                    bias_buf to bias_stream (zero if no bias)
 //         compute tile (producer):
 //           [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
 //           ic_tile loop — tiles the input channel dimension (TILE_IC)
@@ -25,9 +27,10 @@
 //
 // Loop structure — depthwise conv (is_depthwise=1):
 //
-//   batch loop
-//     oh / ow loops
-//       m_tile loop
+//   m_tile loop
+//     load_bias_tile
+//     batch loop
+//       oh / ow loops
 //         produce_bias (producer)
 //         compute tile (producer):
 //           [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
@@ -55,28 +58,52 @@
 #include "ConvKernel.h"
 
 // ---------------------------------------------------------------------------
+// Load the bias slice for one m_tile into an on-chip buffer (one DDR fetch
+// per m_tile, reused across all (ni, oh, ow) iterations).
+//
+// has_bias=1: read bias[m_off..m_off+m_valid-1] from DDR (gmem2) into bias_buf.
+// has_bias=0: no m_axi transactions issued on the bias bundle; bias_buf is
+//             left untouched (produce_bias never reads it in this case).
+// ---------------------------------------------------------------------------
+static void load_bias_tile(
+    const Data_t* bias,
+    Data_t        bias_buf[kTileM],
+    unsigned      m_off,
+    unsigned      m_valid,
+    unsigned      has_bias
+) {
+    if (has_bias) {
+        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+            #pragma HLS PIPELINE II=1
+            bias_buf[m1] = bias[m_off + m1];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bias producer.  Pushes m_valid AccData_t initialiser values onto bias_stream
 // (one push per output-channel lane, II=1).
 //
-// has_bias=1: read bias[m_off..m_off+m_valid-1] from DDR (gmem2) and forward
-//             cast to AccData_t.
-// has_bias=0: emit AccData_t(0); no m_axi transactions issued on the bias
-//             bundle (the bias pointer is never dereferenced).
+// Reads from the on-chip bias_buf populated once per m_tile by load_bias_tile;
+// no DDR traffic happens here regardless of how many times produce_bias is
+// invoked across (ni, oh, ow).
+//
+// has_bias=1: forward bias_buf[m1] cast to AccData_t.
+// has_bias=0: emit AccData_t(0); bias_buf is not read.
 //
 // Lanes m_valid..kTileM-1 are not produced — the consumer zeroes those
 // directly so they consume no bandwidth.
 // ---------------------------------------------------------------------------
 static void produce_bias(
-    const Data_t*           bias,
+    const Data_t            bias_buf[kTileM],
     hls::stream<AccData_t>& bias_stream,
-    unsigned                m_off,
     unsigned                m_valid,
     unsigned                has_bias
 ) {
     if (has_bias) {
         for (unsigned m1 = 0; m1 < m_valid; m1++) {
             #pragma HLS PIPELINE II=1
-            bias_stream.write(AccData_t(bias[m_off + m1]));
+            bias_stream.write(AccData_t(bias_buf[m1]));
         }
     } else {
         for (unsigned m1 = 0; m1 < m_valid; m1++) {
@@ -594,11 +621,20 @@ void ConvKernel(
     //   Depthwise: only [m1][0][khi][kwi] slots are used.
     //   ARRAY_PARTITION complete dim=1 → kTileM independent arrays.
     //
+    // bias_buf [kTileM]
+    //   On-chip cache of the bias slice for the current m_tile.  Loaded once
+    //   per m_tile by load_bias_tile (one DDR read on gmem2 of m_valid Data_t
+    //   elements) and reused across the entire (ni, oh, ow) sweep, so total
+    //   bias DDR traffic is m_tiles · m_valid elements instead of
+    //   m_tiles · batch · out_h · out_w · m_valid.  ARRAY_PARTITION complete
+    //   dim=0 → independent registers per lane.  When has_bias=0 the buffer
+    //   is never written or read.
+    //
     // bias_stream
     //   FIFO carrying m_valid AccData_t initial accumulator values from
-    //   produce_bias to the compute-tile consumer (init_accumulators).  When
-    //   has_bias=0 the producer emits zeros and no m_axi traffic hits gmem2.
-    //   Depth = kTileM matches the per-tile push/pop count.
+    //   produce_bias (sourced from bias_buf, not DDR) to the compute-tile
+    //   consumer (init_accumulators).  When has_bias=0 the producer emits
+    //   zeros.  Depth = kTileM matches the per-tile push/pop count.
     //
     // acc_stream
     //   FIFO carrying m_valid AccData_t lanes from the compute-tile producer
@@ -615,6 +651,9 @@ void ConvKernel(
     static Data_t patch[kTileIC][kMaxKH][kMaxKW];
     #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
 
+    Data_t bias_buf[kTileM];
+    #pragma HLS ARRAY_PARTITION variable=bias_buf complete dim=0
+
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
@@ -624,16 +663,20 @@ void ConvKernel(
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
-    for (unsigned ni = 0; ni < batch; ni++) {
+    // Loop order: mt → ni → oh → ow.  m_tile is hoisted outermost so the bias
+    // slice for each tile is fetched from DDR once (load_bias_tile) and reused
+    // across the entire (ni, oh, ow) sweep.  Inner loop body is unchanged.
+    for (unsigned mt = 0; mt < m_tiles; mt++) {
+        const unsigned m_off   = mt * kTileM;
+        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-        for (unsigned oh = 0; oh < out_h; oh++) {
-            for (unsigned ow = 0; ow < out_w; ow++) {
+        load_bias_tile(bias, bias_buf, m_off, m_valid, has_bias);
 
-                for (unsigned mt = 0; mt < m_tiles; mt++) {
-                    const unsigned m_off   = mt * kTileM;
-                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+        for (unsigned ni = 0; ni < batch; ni++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned ow = 0; ow < out_w; ow++) {
 
-                    produce_bias(bias, bias_stream, m_off, m_valid, has_bias);
+                    produce_bias(bias_buf, bias_stream, m_valid, has_bias);
 
                     if (!is_depthwise) {
                         compute_standard_conv_tile(
@@ -653,10 +696,9 @@ void ConvKernel(
 
                     write_output_tile(y, acc_stream, m_valid,
                                       ni, out_ch, m_off, oh, ow, out_h, out_w);
-                } // m_tile loop
 
-            } // ow loop
-        } // oh loop
-
-    } // batch loop
+                } // ow loop
+            } // oh loop
+        } // batch loop
+    } // m_tile loop
 }
