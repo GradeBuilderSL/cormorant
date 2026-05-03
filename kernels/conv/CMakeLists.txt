@@ -135,6 +135,30 @@ target_compile_options(TestConvRef PRIVATE -Wall -Wextra -O2)
 enable_testing()
 add_test(NAME TestConvRef COMMAND TestConvRef)
 
+# ---------------------------------------------------------------------------
+# gen_conv_test_data — regenerate hex fixtures for the HDL testbench.
+#
+# Runs TestConvRef in --dump-data mode, writing per-test x/w/b/y_ref hex
+# files plus manifest.txt to ${CMAKE_BINARY_DIR}/conv_test_data/.  The HDL
+# testbench loads these via $readmemh, so HW-level tests stay bit-identical
+# to the C++ verification (same kSeed, same ref_conv() oracle).
+#
+# Requires the ap_fixed build (CONV_HAVE_APFIXED=ON via Vitis HLS headers).
+# ---------------------------------------------------------------------------
+set(CONV_TEST_DATA_DIR "${CMAKE_BINARY_DIR}/conv_test_data"
+    CACHE PATH "Output directory for ConvKernel HDL testbench fixtures")
+
+if(_CONV_HAVE_HLS)
+    add_custom_target(gen_conv_test_data
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CONV_TEST_DATA_DIR}"
+        COMMAND $<TARGET_FILE:TestConvRef> --dump-data "${CONV_TEST_DATA_DIR}"
+        DEPENDS TestConvRef
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Generating ConvKernel HDL test fixtures → ${CONV_TEST_DATA_DIR}"
+        VERBATIM)
+    message(STATUS "ConvKernel: gen_conv_test_data → ${CONV_TEST_DATA_DIR}")
+endif()
+
 message(STATUS "ConvKernel: targets — conv_kernel, conv_kernel_float, TestConvRef")
 message(STATUS "ConvKernel: Data_t=${CONV_DATA_TYPE}  "
                "AccData_t=${CONV_ACC_DATA_TYPE}  "
