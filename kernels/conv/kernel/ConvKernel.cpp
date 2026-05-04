@@ -89,7 +89,7 @@ static void init_accumulators(
 // First dim indexes input channels within the current ic_tile.
 // ---------------------------------------------------------------------------
 static void load_standard_patch(
-    const Data_t* x,
+    hls::stream<Data_t>& patch_stream,
     Data_t        patch[kTileIC][kMaxKH][kMaxKW],
     unsigned      ni,
     unsigned      oh,
@@ -122,10 +122,7 @@ static void load_standard_patch(
                 #pragma HLS PIPELINE II=1
                 const int iw = (int)(ow * stride_w + kwi * dilation_w)
                              - (int)pad_left;
-                patch[ic_l][khi][kwi] =
-                    (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                    ? x[x_row + (unsigned)iw]
-                    : Data_t(0);
+                patch_stream.read(patch[ic_l][khi][kwi]);
             }
         }
     }
@@ -241,9 +238,8 @@ static void drain_acc_to_stream(
 // caller.
 // ---------------------------------------------------------------------------
 static void compute_standard_conv_tile(
-    const Data_t*           x,
+    hls::stream<Data_t>&    patch_stream,
     const Data_t*           weight,
-    Data_t                  patch[kTileIC][kMaxKH][kMaxKW],
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
     unsigned                ni,
@@ -266,6 +262,9 @@ static void compute_standard_conv_tile(
 ) {
     #pragma HLS INLINE
 
+    Data_t patch[kTileIC][kMaxKH][kMaxKW];
+    #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
+
     AccData_t acc[kTileM];
     #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
@@ -277,7 +276,7 @@ static void compute_standard_conv_tile(
         const unsigned ic_off   = ict * kTileIC;
         const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-        load_standard_patch(x, patch,
+        load_standard_patch(patch_stream, patch,
                             ni, oh, ow, ic_off, ic_valid,
                             in_ch, in_h, in_w, kh, kw,
                             stride_h, stride_w, dilation_h, dilation_w,
@@ -301,7 +300,7 @@ static void compute_standard_conv_tile(
 // kTileIC required, enforced by static_assert in ConvKernel).
 // ---------------------------------------------------------------------------
 static void load_depthwise_patch(
-    const Data_t* x,
+    hls::stream<Data_t>& patch_stream,
     Data_t        patch[kTileIC][kMaxKH][kMaxKW],
     unsigned      ni,
     unsigned      m_off,
@@ -334,10 +333,7 @@ static void load_depthwise_patch(
                 #pragma HLS PIPELINE II=1
                 const int iw = (int)(ow * stride_w + kwi * dilation_w)
                              - (int)pad_left;
-                patch[m1][khi][kwi] =
-                    (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                    ? x[x_row + (unsigned)iw]
-                    : Data_t(0);
+                patch_stream.read(patch[m1][khi][kwi]);
             }
         }
     }
@@ -380,6 +376,7 @@ static void load_depthwise_weights(
 // lanes; acc[m1] is written every kTileM cycles, so the RAW dependence
 // distance ≥ MAC latency.
 // ---------------------------------------------------------------------------
+//#include <iostream>
 static void accumulate_depthwise(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
     const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
@@ -394,6 +391,7 @@ static void accumulate_depthwise(
     for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
         #pragma HLS PIPELINE II=1
         const unsigned m1 = ri & (kTileM - 1);
+        //std::cout << "m1=" << m1 << " khi_cnt=" << khi_cnt << " kwi_cnt=" << kwi_cnt << std::endl;
         acc[m1] +=
             AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
             AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
@@ -422,9 +420,8 @@ static void accumulate_depthwise(
 // caller.
 // ---------------------------------------------------------------------------
 static void compute_depthwise_conv_tile(
-    const Data_t*           x,
+    hls::stream<Data_t>&    patch_stream,
     const Data_t*           weight,
-    Data_t                  patch[kTileIC][kMaxKH][kMaxKW],
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
     unsigned                ni,
@@ -446,6 +443,9 @@ static void compute_depthwise_conv_tile(
 ) {
     #pragma HLS INLINE
 
+    Data_t patch[kTileIC][kMaxKH][kMaxKW];
+    #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
+
     AccData_t acc[kTileM];
     #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
@@ -453,7 +453,7 @@ static void compute_depthwise_conv_tile(
 
     init_accumulators(acc, bias_stream, m_valid);
 
-    load_depthwise_patch(x, patch,
+    load_depthwise_patch(patch_stream, patch,
                          ni, m_off, m_valid, oh, ow,
                          in_ch, in_h, in_w, kh, kw,
                          stride_h, stride_w, dilation_h, dilation_w,
@@ -554,11 +554,12 @@ static void bias_producer(
     }
 }
 
+#include <map>
+#include <iostream>
+
 static void input_patch_producer(
     const Data_t*           x,
-    const Data_t*           weight,
-    hls::stream<AccData_t>& bias_stream,
-    hls::stream<AccData_t>& acc_stream,
+    hls::stream<Data_t>& patch_stream,
     unsigned                batch,
     unsigned                in_ch,
     unsigned                in_h,
@@ -576,11 +577,10 @@ static void input_patch_producer(
     unsigned                pad_left,
     unsigned                is_depthwise
 ) {
-    Data_t patch[kTileIC][kMaxKH][kMaxKW];
-    #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
+
+    std::map<size_t, int> read_addresses;
 
     for (unsigned mt = 0; mt < m_tiles; mt++) {
         const unsigned m_off   = mt * kTileM;
@@ -607,10 +607,24 @@ static void input_patch_producer(
                                         #pragma HLS PIPELINE II=1
                                         const int iw = (int)(ow * stride_w + kwi * dilation_w)
                                                     - (int)pad_left;
-                                        patch[ic_l][khi][kwi] =
+                                        // patch[ic_l][khi][kwi] =
+                                        //     (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                                        //     ? x[x_row + (unsigned)iw]
+                                        //     : Data_t(0);
+                                        if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
+                                            size_t read_addr = x_row + (unsigned)iw;
+                                            if (read_addresses.find(read_addr) != read_addresses.end()) {
+//                                                std::cout << "Address " << read_addr << " was already readed" << std::endl;
+                                                read_addresses[read_addr] += 1;
+                                            } else {
+                                                read_addresses.insert(std::make_pair(read_addr, 0));
+                                            }
+                                        }
+                                        patch_stream.write(
                                             (ih_ok && iw >= 0 && (unsigned)iw < in_w)
                                             ? x[x_row + (unsigned)iw]
-                                            : Data_t(0);
+                                            : Data_t(0)
+                                        );
                                     }
                                 }
                             }
@@ -628,10 +642,24 @@ static void input_patch_producer(
                                     #pragma HLS PIPELINE II=1
                                     const int iw = (int)(ow * stride_w + kwi * dilation_w)
                                                 - (int)pad_left;
-                                    patch[m1][khi][kwi] =
+                                    // patch[m1][khi][kwi] =
+                                    //     (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                                    //     ? x[x_row + (unsigned)iw]
+                                    //     : Data_t(0);
+                                    if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
+                                        size_t read_addr = x_row + (unsigned)iw;
+                                        if (read_addresses.find(read_addr) != read_addresses.end()) {
+                                            //std::cout << "Address " << read_addr << " was already readed" << std::endl;
+                                            read_addresses[read_addr] += 1;
+                                        } else {
+                                            read_addresses.insert(std::make_pair(read_addr, 0));
+                                        }
+                                    }
+                                    patch_stream.write(
                                         (ih_ok && iw >= 0 && (unsigned)iw < in_w)
                                         ? x[x_row + (unsigned)iw]
-                                        : Data_t(0);
+                                        : Data_t(0)
+                                    );
                                 }
                             }
                         }
@@ -640,6 +668,12 @@ static void input_patch_producer(
             } // oh loop
         } // batch loop
     } // m_tile loop
+
+    for (auto it : read_addresses) {
+        if (it.second) {
+            std::cout << it.first << " --> " << it.second << std::endl;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +689,7 @@ static void input_patch_producer(
 // streaming dependency is bias_stream (input) and y (output via DDR).
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
-    const Data_t*           x,
+    hls::stream<Data_t>&    patch_stream,
     const Data_t*           weight,
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
@@ -676,9 +710,6 @@ static void process_conv_kernel_tile(
     unsigned                pad_left,
     unsigned                is_depthwise
 ) {
-    Data_t patch[kTileIC][kMaxKH][kMaxKW];
-    #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
@@ -692,14 +723,14 @@ static void process_conv_kernel_tile(
 
                     if (!is_depthwise) {
                         compute_standard_conv_tile(
-                            x, weight, patch, bias_stream, acc_stream,
+                            patch_stream, weight, bias_stream, acc_stream,
                             ni, m_off, m_valid, oh, ow,
                             in_ch, in_h, in_w, kh, kw,
                             stride_h, stride_w, dilation_h, dilation_w,
                             pad_top, pad_left, ic_tiles);
                     } else {
                         compute_depthwise_conv_tile(
-                            x, weight, patch, bias_stream, acc_stream,
+                            patch_stream, weight, bias_stream, acc_stream,
                             ni, m_off, m_valid, oh, ow,
                             in_ch, in_h, in_w, kh, kw,
                             stride_h, stride_w, dilation_h, dilation_w,
@@ -791,14 +822,21 @@ void ConvKernel(
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
+    hls::stream<Data_t> patch_stream;
+    #pragma HLS STREAM variable=patch_stream depth=kTileIC
+
     hls::stream<AccData_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
 
     bias_producer(bias, bias_stream,
                   out_ch, rep_count, has_bias);
+    input_patch_producer(x, patch_stream, batch, in_ch, in_h, in_w,
+        out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
+        dilation_w, pad_top, pad_left, is_depthwise
+    );
 
     process_conv_kernel_tile(
-        x, weight, bias_stream, acc_stream,
+        patch_stream, weight, bias_stream, acc_stream,
         batch, in_ch, in_h, in_w, out_ch, out_h, out_w,
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise);
