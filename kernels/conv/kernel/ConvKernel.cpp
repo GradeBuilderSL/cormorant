@@ -6,40 +6,39 @@
 // See doc/CONV_PLAN.md for a full explanation of the architecture, tiling
 // strategy, and II=1 rationale.
 //
-// Loop structure — standard conv (is_depthwise=0):
+// Loop structure — standard conv (is_depthwise=0), row-stationary:
 //
 //   m_tile loop      — tiles the output channel dimension (TILE_M); hoisted
 //                      outermost so bias for the tile is fetched from DDR once
 //     load_bias_tile — copy bias[m_off..m_off+m_valid-1] → on-chip bias_buf
 //     batch loop     — iterates over input images
-//       oh / ow loops — slide over output spatial positions
+//       oh loop      — sweeps output rows
 //         produce_bias (producer)  — push m_valid initial acc values from
 //                                    bias_buf to bias_stream (zero if no bias)
-//         compute tile (producer):
-//           [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
-//           ic_tile loop — tiles the input channel dimension (TILE_IC)
-//             load patch  — current (oh,ow) input patch to on-chip BRAM
-//             load w_buf  — weight tile for (m_tile, ic_tile) to on-chip BRAM
-//             accumulate  — II=1 K-reduction over ic×kH×kW with TILE_M lanes
-//           drain        — push m_valid lanes of acc[] to acc_stream
-//         write output (consumer):
-//           saturate_cast acc_stream → DDR y
+//         compute_standard_conv_row:
+//           init_y_row_from_bias  — replicate bias_stream across all out_w
+//           ic_tile loop          — tiles the input channel dimension
+//             load w_buf            — weight tile for (m_tile, ic_tile) ONCE
+//             ow loop               — slide along the output row
+//               load patch          — input patch for (oh, ow, ic_tile)
+//               accumulate_into_row — II=1 K-reduction → y_row[ow][m1]
+//         write_output_row:
+//           saturate_cast y_row → DDR y, lane-major (per-lane AXI burst)
 //
-// Loop structure — depthwise conv (is_depthwise=1):
+// Loop structure — depthwise conv (is_depthwise=1), row-stationary:
 //
 //   m_tile loop
 //     load_bias_tile
 //     batch loop
-//       oh / ow loops
+//       oh loop
 //         produce_bias (producer)
-//         compute tile (producer):
-//           [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
-//           load patch  — one spatial patch per m1 lane, from input channel m_off+m1
-//           load w_buf  — weight slice per m1, weight[m*kh*kw .. +kh*kw-1]
-//           accumulate  — II=1 kH×kW reduction with TILE_M lanes (no ic loop)
-//           drain       — push m_valid lanes of acc[] to acc_stream
-//         write output (consumer):
-//           saturate_cast acc_stream → DDR y
+//         compute_depthwise_conv_row:
+//           init_y_row_from_bias
+//           load_depthwise_weights  — w_buf for m_tile ONCE per row
+//           ow loop:
+//             load_depthwise_patch  — one spatial patch per m1 lane
+//             accumulate_into_row   — II=1 kH×kW reduction → y_row[ow][m1]
+//         write_output_row
 //
 // II=1 strategy (§2.4):
 //   The flat counter ri runs 0 .. ic_valid*kh*kw*TILE_M-1 (standard) or
@@ -56,6 +55,13 @@
 #include "hls_stream.h"
 
 #include "ConvKernel.h"
+
+// ---------------------------------------------------------------------------
+// Compile-time upper bound on out_w (used to size the row-stationary
+// y_row[kMaxOutW][kTileM] accumulator buffer).  Models with out_w > kMaxOutW
+// are rejected by the inference scheduler / caller.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxOutW = 256u;
 
 // ---------------------------------------------------------------------------
 // Load the bias slice for one m_tile into an on-chip buffer (one DDR fetch
@@ -114,24 +120,37 @@ static void produce_bias(
 }
 
 // ---------------------------------------------------------------------------
-// Initialise the accumulator tile from bias_stream.
+// Initialise the row-stationary y_row buffer from bias_stream.
 //
-// Zeroes all kTileM lanes (full unroll, one cycle) so unused tail lanes start
-// clean, then overlays the m_valid valid lanes by reading from bias_stream.
-// The producer always pushes exactly m_valid items, regardless of has_bias.
+// Reads m_valid initial values from bias_stream once (producer always pushes
+// exactly m_valid items per row), parks them in a small register file, then
+// replicates that vector across all out_w positions of y_row.  Lanes
+// m_valid..kTileM-1 are zeroed so unused tail lanes start clean.
 // ---------------------------------------------------------------------------
-static void init_accumulators(
-    AccData_t               acc[kTileM],
+static void init_y_row_from_bias(
+    AccData_t               y_row[kMaxOutW][kTileM],
     hls::stream<AccData_t>& bias_stream,
+    unsigned                out_w,
     unsigned                m_valid
 ) {
+    AccData_t bias_init[kTileM];
+    #pragma HLS ARRAY_PARTITION variable=bias_init complete dim=0
+
     for (unsigned m1 = 0; m1 < kTileM; m1++) {
         #pragma HLS UNROLL
-        acc[m1] = AccData_t(0);
+        bias_init[m1] = AccData_t(0);
     }
     for (unsigned m1 = 0; m1 < m_valid; m1++) {
         #pragma HLS PIPELINE II=1
-        acc[m1] = bias_stream.read();
+        bias_init[m1] = bias_stream.read();
+    }
+
+    for (unsigned ow = 0; ow < out_w; ow++) {
+        #pragma HLS PIPELINE II=1
+        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+            #pragma HLS UNROLL
+            y_row[ow][m1] = bias_init[m1];
+        }
     }
 }
 
@@ -225,16 +244,19 @@ static void load_standard_weights(
 }
 
 // ---------------------------------------------------------------------------
-// Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM.
+// Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM,
+// accumulating into one column of the row-stationary y_row buffer.
 //
 // ri runs 0 .. ic_valid*kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles
-// through lanes; acc[m1] is written every kTileM cycles, so the RAW
-// dependence distance ≥ MAC latency.
+// through lanes; y_row[ow][m1] is written every kTileM cycles for fixed ow,
+// so the RAW dependence distance for the same lane is kTileM ≥ MAC latency.
+// y_row is partitioned on dim=2 so each m1 sees an independent BRAM bank.
 // ---------------------------------------------------------------------------
-static void accumulate_standard(
+static void accumulate_standard_into_row(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
     const Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
-    AccData_t    acc[kTileM],
+    AccData_t    y_row[kMaxOutW][kTileM],
+    unsigned     ow,
     unsigned     ic_valid,
     unsigned     kh,
     unsigned     kw
@@ -246,7 +268,7 @@ static void accumulate_standard(
     for (unsigned ri = 0; ri < ri_bound; ri++) {
         #pragma HLS PIPELINE II=1
         const unsigned m1 = ri & (kTileM - 1);
-        acc[m1] +=
+        y_row[ow][m1] +=
             AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
             AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
 
@@ -263,49 +285,37 @@ static void accumulate_standard(
 }
 
 // ---------------------------------------------------------------------------
-// Drain m_valid accumulator lanes into acc_stream.  One II=1 push per lane.
-// ---------------------------------------------------------------------------
-static void drain_acc_to_stream(
-    const AccData_t         acc[kTileM],
-    hls::stream<AccData_t>& acc_stream,
-    unsigned                m_valid
-) {
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        #pragma HLS PIPELINE II=1
-        acc_stream.write(acc[m1]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Standard convolution path (group=1).
+// Standard convolution path (group=1) — row-stationary.
 //
-// Tiles the input channel dimension (TILE_IC) and accumulates over
-// ic × kH × kW.  For each ic_tile:
-//   1. load_standard_patch    — input patch for (oh, ow, ic_tile)
-//   2. load_standard_weights  — weight tile for (m_tile, ic_tile)
-//   3. accumulate_standard    — II=1 reduction
-// After the ic_tile loop the m_valid valid lanes are pushed to acc_stream.
+// Produces one full output row of m_valid lanes for (mt, ni, oh) in y_row.
+// Loop order is ict outer, ow inner: each (mt, ni, oh, ict) weight tile is
+// loaded from DDR once and reused across all out_w spatial positions in the
+// row, cutting weight DDR traffic by an out_w factor versus the previous
+// per-tile compute.
 //
-// Initial accumulator values are sourced from bias_stream (produced by
-// produce_bias in the caller); acc[] is a private, fully-partitioned scratch
-// buffer.
+// Phases:
+//   1. init_y_row_from_bias  — read m_valid from bias_stream, replicate to all out_w
+//   2. ic_tile loop:
+//        load_standard_weights(mt, ict)   once per (mt, ni, oh, ict)
+//        for ow: load_standard_patch + accumulate_standard_into_row(ow)
 //
-// INLINE to preserve the array partitioning of `patch` declared in ConvKernel.
+// INLINE to preserve the array partitioning of `patch` and `y_row` declared
+// in ConvKernel.
 // ---------------------------------------------------------------------------
-static void compute_standard_conv_tile(
+static void compute_standard_conv_row(
     const Data_t*           x,
     const Data_t*           weight,
     Data_t                  patch[kTileIC][kMaxKH][kMaxKW],
+    AccData_t               y_row[kMaxOutW][kTileM],
     hls::stream<AccData_t>& bias_stream,
-    hls::stream<AccData_t>& acc_stream,
     unsigned                ni,
     unsigned                m_off,
     unsigned                m_valid,
     unsigned                oh,
-    unsigned                ow,
     unsigned                in_ch,
     unsigned                in_h,
     unsigned                in_w,
+    unsigned                out_w,
     unsigned                kh,
     unsigned                kw,
     unsigned                stride_h,
@@ -318,31 +328,29 @@ static void compute_standard_conv_tile(
 ) {
     #pragma HLS INLINE
 
-    AccData_t acc[kTileM];
-    #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
-
     Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
 
-    init_accumulators(acc, bias_stream, m_valid);
+    init_y_row_from_bias(y_row, bias_stream, out_w, m_valid);
 
     for (unsigned ict = 0; ict < ic_tiles; ict++) {
         const unsigned ic_off   = ict * kTileIC;
         const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-        load_standard_patch(x, patch,
-                            ni, oh, ow, ic_off, ic_valid,
-                            in_ch, in_h, in_w, kh, kw,
-                            stride_h, stride_w, dilation_h, dilation_w,
-                            pad_top, pad_left);
-
         load_standard_weights(weight, w_buf,
                               m_off, m_valid, ic_off, ic_valid,
                               in_ch, kh, kw);
 
-        accumulate_standard(patch, w_buf, acc, ic_valid, kh, kw);
-    }
+        for (unsigned ow = 0; ow < out_w; ow++) {
+            load_standard_patch(x, patch,
+                                ni, oh, ow, ic_off, ic_valid,
+                                in_ch, in_h, in_w, kh, kw,
+                                stride_h, stride_w, dilation_h, dilation_w,
+                                pad_top, pad_left);
 
-    drain_acc_to_stream(acc, acc_stream, m_valid);
+            accumulate_standard_into_row(patch, w_buf, y_row, ow,
+                                         ic_valid, kh, kw);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,16 +434,18 @@ static void load_depthwise_weights(
 }
 
 // ---------------------------------------------------------------------------
-// Depthwise: II=1 kH×kW reduction with kTileM lanes.
+// Depthwise: II=1 kH×kW reduction with kTileM lanes, accumulating into one
+// column of the row-stationary y_row buffer.
 //
 // ri runs 0 .. kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles through
-// lanes; acc[m1] is written every kTileM cycles, so the RAW dependence
-// distance ≥ MAC latency.
+// lanes; y_row[ow][m1] is written every kTileM cycles for fixed ow, so the
+// RAW dependence distance for the same lane is kTileM ≥ MAC latency.
 // ---------------------------------------------------------------------------
-static void accumulate_depthwise(
+static void accumulate_depthwise_into_row(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
     const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
-    AccData_t    acc[kTileM],
+    AccData_t    y_row[kMaxOutW][kTileM],
+    unsigned     ow,
     unsigned     kh,
     unsigned     kw
 ) {
@@ -446,7 +456,7 @@ static void accumulate_depthwise(
     for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
         #pragma HLS PIPELINE II=1
         const unsigned m1 = ri & (kTileM - 1);
-        acc[m1] +=
+        y_row[ow][m1] +=
             AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
             AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
 
@@ -460,32 +470,37 @@ static void accumulate_depthwise(
 }
 
 // ---------------------------------------------------------------------------
-// Depthwise convolution path (group=in_ch).
+// Depthwise convolution path (group=in_ch) — row-stationary.
 //
-// Each output channel m is convolved with only its corresponding input
-// channel c=m.  No ic_tile loop.  Phases: init acc (from bias_stream) → patch
-// load → weight load → accumulate → drain to acc_stream.
+// Produces one full output row of m_valid lanes for (mt, ni, oh) in y_row.
+// Depthwise weights depend only on mt (no ic dimension), so w_buf is loaded
+// once per call and reused across all out_w spatial positions in the row,
+// cutting weight DDR traffic by an out_w factor versus the previous per-tile
+// compute.
 //
-// Initial accumulator values are sourced from bias_stream (produced by
-// produce_bias in the caller); acc[] is a private, fully-partitioned scratch
-// buffer.
+// Phases:
+//   1. init_y_row_from_bias        — read m_valid from bias_stream, replicate
+//   2. load_depthwise_weights(mt)  once per (mt, ni, oh)
+//   3. for ow:
+//        load_depthwise_patch + accumulate_depthwise_into_row(ow)
 //
-// INLINE to preserve the array partitioning of `patch` declared in ConvKernel.
+// INLINE to preserve the array partitioning of `patch` and `y_row` declared
+// in ConvKernel.
 // ---------------------------------------------------------------------------
-static void compute_depthwise_conv_tile(
+static void compute_depthwise_conv_row(
     const Data_t*           x,
     const Data_t*           weight,
     Data_t                  patch[kTileIC][kMaxKH][kMaxKW],
+    AccData_t               y_row[kMaxOutW][kTileM],
     hls::stream<AccData_t>& bias_stream,
-    hls::stream<AccData_t>& acc_stream,
     unsigned                ni,
     unsigned                m_off,
     unsigned                m_valid,
     unsigned                oh,
-    unsigned                ow,
     unsigned                in_ch,
     unsigned                in_h,
     unsigned                in_w,
+    unsigned                out_w,
     unsigned                kh,
     unsigned                kw,
     unsigned                stride_h,
@@ -497,52 +512,122 @@ static void compute_depthwise_conv_tile(
 ) {
     #pragma HLS INLINE
 
-    AccData_t acc[kTileM];
-    #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
-
     Data_t w_buf[kTileM][kMaxKH][kMaxKW];
 
-    init_accumulators(acc, bias_stream, m_valid);
-
-    load_depthwise_patch(x, patch,
-                         ni, m_off, m_valid, oh, ow,
-                         in_ch, in_h, in_w, kh, kw,
-                         stride_h, stride_w, dilation_h, dilation_w,
-                         pad_top, pad_left);
+    init_y_row_from_bias(y_row, bias_stream, out_w, m_valid);
 
     load_depthwise_weights(weight, w_buf, m_off, m_valid, kh, kw);
 
-    accumulate_depthwise(patch, w_buf, acc, kh, kw);
+    for (unsigned ow = 0; ow < out_w; ow++) {
+        load_depthwise_patch(x, patch,
+                             ni, m_off, m_valid, oh, ow,
+                             in_ch, in_h, in_w, kh, kw,
+                             stride_h, stride_w, dilation_h, dilation_w,
+                             pad_top, pad_left);
 
-    drain_acc_to_stream(acc, acc_stream, m_valid);
+        accumulate_depthwise_into_row(patch, w_buf, y_row, ow, kh, kw);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Write one output tile (m_valid lanes drained from acc_stream) to DDR.
+// Write one output row (m_valid lanes × out_w positions) to DDR from y_row.
 //
-// Each of the m_valid output channels writes to a non-contiguous DDR address
-// (stride = out_h*out_w elements).  y_addr is advanced by ohw each iteration
-// using a counter to avoid a multiplier inside the pipeline.
+// Iterates lane-major (m1 outer, ow inner) so the addresses written by each
+// lane advance contiguously across (oh, ow's, ow=0..out_w-1), enabling HLS
+// to infer a per-lane AXI burst on gmem3.  Across the m_valid lanes the base
+// address jumps by ohw = out_h*out_w elements (next output channel).
+// y_row is partitioned on dim=2 so each lane reads from an independent BRAM.
 // ---------------------------------------------------------------------------
-static void write_output_tile(
-    Data_t*                 y,
-    hls::stream<AccData_t>& acc_stream,
-    unsigned                m_valid,
-    unsigned                ni,
-    unsigned                out_ch,
-    unsigned                m_off,
-    unsigned                oh,
-    unsigned                ow,
-    unsigned                out_h,
-    unsigned                out_w
+static void write_output_row(
+    Data_t*         y,
+    const AccData_t y_row[kMaxOutW][kTileM],
+    unsigned        m_valid,
+    unsigned        ni,
+    unsigned        out_ch,
+    unsigned        m_off,
+    unsigned        oh,
+    unsigned        out_h,
+    unsigned        out_w
 ) {
-    const unsigned ohw    = out_h * out_w;
-    unsigned       y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
+    const unsigned ohw = out_h * out_w;
     for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        #pragma HLS PIPELINE II=1
-        y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
-        y_addr += ohw;
+        const unsigned y_base = (ni * out_ch + m_off + m1) * ohw + oh * out_w;
+        for (unsigned ow = 0; ow < out_w; ow++) {
+            #pragma HLS PIPELINE II=1
+            y[y_base + ow] = saturate_cast<Data_t>(y_row[ow][m1]);
+        }
     }
+}
+
+void conv_kernel_processing(
+    const Data_t* x,
+    const Data_t* weight,
+    hls::stream<AccData_t>& bias_stream,
+    Data_t*       y,
+    unsigned      batch,
+    unsigned      in_ch,
+    unsigned      in_h,
+    unsigned      in_w,
+    unsigned      out_ch,
+    unsigned      out_h,
+    unsigned      out_w,
+    unsigned      kh,
+    unsigned      kw,
+    unsigned      stride_h,
+    unsigned      stride_w,
+    unsigned      dilation_h,
+    unsigned      dilation_w,
+    unsigned      pad_top,
+    unsigned      pad_left,
+    unsigned      has_bias,
+    unsigned      is_depthwise
+) {
+    static Data_t patch[kTileIC][kMaxKH][kMaxKW];
+    #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+
+    static AccData_t y_row[kMaxOutW][kTileM];
+    #pragma HLS ARRAY_PARTITION variable=y_row complete dim=2
+
+    hls::stream<AccData_t> bias_stream;
+    #pragma HLS STREAM variable=bias_stream depth=kTileM
+
+    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
+    const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
+
+    // Loop order: mt → ni → oh.  m_tile is hoisted outermost so the bias
+    // slice is fetched from DDR once per tile.  The ow loop has been pushed
+    // inside compute_*_conv_row so that each (mt, ni, oh, ict) weight tile
+    // is loaded once and reused across all out_w positions of the row, and
+    // so that y writes within a lane are contiguous (AXI-burstable).
+    for (unsigned mt = 0; mt < m_tiles; mt++) {
+        const unsigned m_off   = mt * kTileM;
+        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+        for (unsigned ni = 0; ni < batch; ni++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+
+                if (!is_depthwise) {
+                    compute_standard_conv_row(
+                        x, weight, patch, y_row, bias_stream,
+                        ni, m_off, m_valid, oh,
+                        in_ch, in_h, in_w, out_w, kh, kw,
+                        stride_h, stride_w, dilation_h, dilation_w,
+                        pad_top, pad_left, ic_tiles);
+                } else {
+                    compute_depthwise_conv_row(
+                        x, weight, patch, y_row, bias_stream,
+                        ni, m_off, m_valid, oh,
+                        in_ch, in_h, in_w, out_w, kh, kw,
+                        stride_h, stride_w, dilation_h, dilation_w,
+                        pad_top, pad_left);
+                }
+
+                write_output_row(y, y_row, m_valid,
+                                 ni, out_ch, m_off, oh, out_h, out_w);
+
+            } // oh loop
+        } // batch loop
+    } // m_tile loop
 }
 
 void ConvKernel(
@@ -624,25 +709,29 @@ void ConvKernel(
     // bias_buf [kTileM]
     //   On-chip cache of the bias slice for the current m_tile.  Loaded once
     //   per m_tile by load_bias_tile (one DDR read on gmem2 of m_valid Data_t
-    //   elements) and reused across the entire (ni, oh, ow) sweep, so total
-    //   bias DDR traffic is m_tiles · m_valid elements instead of
+    //   elements) and reused across the entire (ni, oh) sweep, so total bias
+    //   DDR traffic is m_tiles · m_valid elements instead of
     //   m_tiles · batch · out_h · out_w · m_valid.  ARRAY_PARTITION complete
     //   dim=0 → independent registers per lane.  When has_bias=0 the buffer
     //   is never written or read.
     //
     // bias_stream
     //   FIFO carrying m_valid AccData_t initial accumulator values from
-    //   produce_bias (sourced from bias_buf, not DDR) to the compute-tile
-    //   consumer (init_accumulators).  When has_bias=0 the producer emits
-    //   zeros.  Depth = kTileM matches the per-tile push/pop count.
+    //   produce_bias (sourced from bias_buf, not DDR) to the row-compute
+    //   consumer (init_y_row_from_bias).  When has_bias=0 the producer emits
+    //   zeros.  Depth = kTileM matches the per-row push/pop count.
     //
-    // acc_stream
-    //   FIFO carrying m_valid AccData_t lanes from the compute-tile producer
-    //   to write_output_tile.  Depth = kTileM is enough to absorb a full tile
-    //   without backpressure when the producer and consumer run sequentially;
-    //   it also leaves head-room for a future DATAFLOW overlap.  The local
-    //   acc[kTileM] scratch buffer (with ARRAY_PARTITION complete dim=0) lives
-    //   inside the compute-tile functions.
+    // y_row [kMaxOutW][kTileM]
+    //   Row-stationary output accumulator buffer.  Holds the partial sums for
+    //   one output row (mt, ni, oh) across all out_w positions.  ic_tile loop
+    //   inside compute_standard_conv_row sweeps over the full ic dimension
+    //   while accumulating into y_row[ow][m1], so each (mt, ni, oh, ict)
+    //   weight tile is loaded from DDR once and reused for out_w positions
+    //   (an out_w-fold reduction in weight DDR traffic vs the previous
+    //   per-(ni,oh,ow) compute).  ARRAY_PARTITION complete dim=2 → kTileM
+    //   independent banks so the II=1 reduction can hit acc[m1] every cycle
+    //   and write_output_row can stream one lane at a time.  Requires
+    //   out_w ≤ kMaxOutW (caller-enforced).
     // -----------------------------------------------------------------------
     static_assert(kTileM <= kTileIC,
                   "depthwise mode reuses patch[kTileIC] for TILE_M lanes: "
@@ -651,21 +740,23 @@ void ConvKernel(
     static Data_t patch[kTileIC][kMaxKH][kMaxKW];
     #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
 
+    static AccData_t y_row[kMaxOutW][kTileM];
+    #pragma HLS ARRAY_PARTITION variable=y_row complete dim=2
+
     Data_t bias_buf[kTileM];
     #pragma HLS ARRAY_PARTITION variable=bias_buf complete dim=0
 
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
-    hls::stream<AccData_t> acc_stream;
-    #pragma HLS STREAM variable=acc_stream depth=kTileM
-
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
-    // Loop order: mt → ni → oh → ow.  m_tile is hoisted outermost so the bias
-    // slice for each tile is fetched from DDR once (load_bias_tile) and reused
-    // across the entire (ni, oh, ow) sweep.  Inner loop body is unchanged.
+    // Loop order: mt → ni → oh.  m_tile is hoisted outermost so the bias
+    // slice is fetched from DDR once per tile.  The ow loop has been pushed
+    // inside compute_*_conv_row so that each (mt, ni, oh, ict) weight tile
+    // is loaded once and reused across all out_w positions of the row, and
+    // so that y writes within a lane are contiguous (AXI-burstable).
     for (unsigned mt = 0; mt < m_tiles; mt++) {
         const unsigned m_off   = mt * kTileM;
         const unsigned m_valid = std::min(kTileM, out_ch - m_off);
@@ -674,30 +765,28 @@ void ConvKernel(
 
         for (unsigned ni = 0; ni < batch; ni++) {
             for (unsigned oh = 0; oh < out_h; oh++) {
-                for (unsigned ow = 0; ow < out_w; ow++) {
 
-                    produce_bias(bias_buf, bias_stream, m_valid, has_bias);
+                produce_bias(bias_buf, bias_stream, m_valid, has_bias);
 
-                    if (!is_depthwise) {
-                        compute_standard_conv_tile(
-                            x, weight, patch, bias_stream, acc_stream,
-                            ni, m_off, m_valid, oh, ow,
-                            in_ch, in_h, in_w, kh, kw,
-                            stride_h, stride_w, dilation_h, dilation_w,
-                            pad_top, pad_left, ic_tiles);
-                    } else {
-                        compute_depthwise_conv_tile(
-                            x, weight, patch, bias_stream, acc_stream,
-                            ni, m_off, m_valid, oh, ow,
-                            in_ch, in_h, in_w, kh, kw,
-                            stride_h, stride_w, dilation_h, dilation_w,
-                            pad_top, pad_left);
-                    }
+                if (!is_depthwise) {
+                    compute_standard_conv_row(
+                        x, weight, patch, y_row, bias_stream,
+                        ni, m_off, m_valid, oh,
+                        in_ch, in_h, in_w, out_w, kh, kw,
+                        stride_h, stride_w, dilation_h, dilation_w,
+                        pad_top, pad_left, ic_tiles);
+                } else {
+                    compute_depthwise_conv_row(
+                        x, weight, patch, y_row, bias_stream,
+                        ni, m_off, m_valid, oh,
+                        in_ch, in_h, in_w, out_w, kh, kw,
+                        stride_h, stride_w, dilation_h, dilation_w,
+                        pad_top, pad_left);
+                }
 
-                    write_output_tile(y, acc_stream, m_valid,
-                                      ni, out_ch, m_off, oh, ow, out_h, out_w);
+                write_output_row(y, y_row, m_valid,
+                                 ni, out_ch, m_off, oh, out_h, out_w);
 
-                } // ow loop
             } // oh loop
         } // batch loop
     } // m_tile loop
