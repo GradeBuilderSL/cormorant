@@ -476,22 +476,31 @@ static void compute_depthwise_conv_tile(
 static void write_output_tile(
     Data_t*                 y,
     hls::stream<AccData_t>& acc_stream,
-    unsigned                m_valid,
-    unsigned                ni,
     unsigned                out_ch,
-    unsigned                m_off,
-    unsigned                oh,
-    unsigned                ow,
     unsigned                out_h,
-    unsigned                out_w
+    unsigned                out_w,
+    unsigned                batch
 ) {
-    const unsigned ohw    = out_h * out_w;
-    unsigned       y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        #pragma HLS PIPELINE II=1
-        y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
-        y_addr += ohw;
-    }
+    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
+
+    for (unsigned mt = 0; mt < m_tiles; mt++) {
+        const unsigned m_off   = mt * kTileM;
+        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+        for (unsigned ni = 0; ni < batch; ni++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned ow = 0; ow < out_w; ow++) {
+                    const unsigned ohw    = out_h * out_w;
+                    unsigned       y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
+                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        #pragma HLS PIPELINE II=1
+                        y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
+                        y_addr += ohw;
+                    }
+                } // ow loop
+            } // oh loop
+        } // batch loop
+    } // m_tile loop
 }
 
 // ---------------------------------------------------------------------------
@@ -545,23 +554,11 @@ static void bias_producer(
     }
 }
 
-// ---------------------------------------------------------------------------
-// process_conv_kernel_tile — DATAFLOW consumer.
-//
-// Iterates over m_tile, batch, output spatial position.  Each inner
-// iteration: pop m_valid bias values from bias_stream (filled by the
-// concurrent bias_producer) into the accumulator, run the per-tile compute
-// (standard or depthwise), stream m_valid output lanes through acc_stream
-// → DDR via write_output_tile.
-//
-// `patch` and `acc_stream` are local scratch — the only externally-visible
-// streaming dependency is bias_stream (input) and y (output via DDR).
-// ---------------------------------------------------------------------------
-static void process_conv_kernel_tile(
+static void input_patch_producer(
     const Data_t*           x,
     const Data_t*           weight,
     hls::stream<AccData_t>& bias_stream,
-    Data_t*                 y,
+    hls::stream<AccData_t>& acc_stream,
     unsigned                batch,
     unsigned                in_ch,
     unsigned                in_h,
@@ -582,8 +579,105 @@ static void process_conv_kernel_tile(
     Data_t patch[kTileIC][kMaxKH][kMaxKW];
     #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
 
-    hls::stream<AccData_t> acc_stream;
-    #pragma HLS STREAM variable=acc_stream depth=kTileM
+    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
+    const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
+
+    for (unsigned mt = 0; mt < m_tiles; mt++) {
+        const unsigned m_off   = mt * kTileM;
+        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+        for (unsigned ni = 0; ni < batch; ni++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned ow = 0; ow < out_w; ow++) {
+
+                    if (!is_depthwise) {
+                        for (unsigned ict = 0; ict < ic_tiles; ict++) {
+                            const unsigned ic_off   = ict * kTileIC;
+                            const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+
+                            for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+                                for (unsigned khi = 0; khi < kh; khi++) {
+                                    const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                                - (int)pad_top;
+                                    const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                                    const unsigned x_row = (ni * in_ch + ic_off + ic_l)
+                                                        * in_h * in_w
+                                                        + (ih_ok ? (unsigned)ih * in_w : 0u);
+                                    for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                        #pragma HLS PIPELINE II=1
+                                        const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                                    - (int)pad_left;
+                                        patch[ic_l][khi][kwi] =
+                                            (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                                            ? x[x_row + (unsigned)iw]
+                                            : Data_t(0);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                            for (unsigned khi = 0; khi < kh; khi++) {
+                                const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                            - (int)pad_top;
+                                const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                                const unsigned x_row = (ni * in_ch + m_off + m1)
+                                                    * in_h * in_w
+                                                    + (ih_ok ? (unsigned)ih * in_w : 0u);
+                                for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                    #pragma HLS PIPELINE II=1
+                                    const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                                - (int)pad_left;
+                                    patch[m1][khi][kwi] =
+                                        (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                                        ? x[x_row + (unsigned)iw]
+                                        : Data_t(0);
+                                }
+                            }
+                        }
+                    }
+                } // ow loop
+            } // oh loop
+        } // batch loop
+    } // m_tile loop
+}
+
+// ---------------------------------------------------------------------------
+// process_conv_kernel_tile — DATAFLOW consumer.
+//
+// Iterates over m_tile, batch, output spatial position.  Each inner
+// iteration: pop m_valid bias values from bias_stream (filled by the
+// concurrent bias_producer) into the accumulator, run the per-tile compute
+// (standard or depthwise), stream m_valid output lanes through acc_stream
+// → DDR via write_output_tile.
+//
+// `patch` and `acc_stream` are local scratch — the only externally-visible
+// streaming dependency is bias_stream (input) and y (output via DDR).
+// ---------------------------------------------------------------------------
+static void process_conv_kernel_tile(
+    const Data_t*           x,
+    const Data_t*           weight,
+    hls::stream<AccData_t>& bias_stream,
+    hls::stream<AccData_t>& acc_stream,
+    unsigned                batch,
+    unsigned                in_ch,
+    unsigned                in_h,
+    unsigned                in_w,
+    unsigned                out_ch,
+    unsigned                out_h,
+    unsigned                out_w,
+    unsigned                kh,
+    unsigned                kw,
+    unsigned                stride_h,
+    unsigned                stride_w,
+    unsigned                dilation_h,
+    unsigned                dilation_w,
+    unsigned                pad_top,
+    unsigned                pad_left,
+    unsigned                is_depthwise
+) {
+    Data_t patch[kTileIC][kMaxKH][kMaxKW];
+    #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
 
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
@@ -611,10 +705,6 @@ static void process_conv_kernel_tile(
                             stride_h, stride_w, dilation_h, dilation_w,
                             pad_top, pad_left);
                     }
-
-                    write_output_tile(y, acc_stream, m_valid,
-                                      ni, out_ch, m_off, oh, ow, out_h, out_w);
-
                 } // ow loop
             } // oh loop
         } // batch loop
@@ -701,12 +791,17 @@ void ConvKernel(
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
+    hls::stream<AccData_t> acc_stream;
+    #pragma HLS STREAM variable=acc_stream depth=kTileM
+
     bias_producer(bias, bias_stream,
                   out_ch, rep_count, has_bias);
 
     process_conv_kernel_tile(
-        x, weight, bias_stream, y,
+        x, weight, bias_stream, acc_stream,
         batch, in_ch, in_h, in_w, out_ch, out_h, out_w,
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise);
+
+    write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch);
 }
