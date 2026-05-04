@@ -59,6 +59,15 @@
 
 #include "ConvKernel.h"
 
+#ifndef __SYNTHESIS__
+#define DEBUG_LOAD_DATA_CACHING
+#endif
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+#include <map>
+#include <iostream>
+#endif /* DEBUG_LOAD_DATA_CACHING */
+
 // ---------------------------------------------------------------------------
 // Initialise the accumulator tile from bias_stream.
 //
@@ -554,28 +563,24 @@ static void bias_producer(
     }
 }
 
-#include <map>
-#include <iostream>
-
-static void input_patch_producer(
-    const Data_t*           x,
+static void input_patch_producer_standard(
+    const Data_t*        x,
     hls::stream<Data_t>& patch_stream,
-    unsigned                batch,
-    unsigned                in_ch,
-    unsigned                in_h,
-    unsigned                in_w,
-    unsigned                out_ch,
-    unsigned                out_h,
-    unsigned                out_w,
-    unsigned                kh,
-    unsigned                kw,
-    unsigned                stride_h,
-    unsigned                stride_w,
-    unsigned                dilation_h,
-    unsigned                dilation_w,
-    unsigned                pad_top,
-    unsigned                pad_left,
-    unsigned                is_depthwise
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             in_h,
+    unsigned             in_w,
+    unsigned             out_ch,
+    unsigned             out_h,
+    unsigned             out_w,
+    unsigned             kh,
+    unsigned             kw,
+    unsigned             stride_h,
+    unsigned             stride_w,
+    unsigned             dilation_h,
+    unsigned             dilation_w,
+    unsigned             pad_top,
+    unsigned             pad_left
 ) {
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
@@ -583,78 +588,37 @@ static void input_patch_producer(
     std::map<size_t, int> read_addresses;
 
     for (unsigned mt = 0; mt < m_tiles; mt++) {
-        const unsigned m_off   = mt * kTileM;
-        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-
         for (unsigned ni = 0; ni < batch; ni++) {
             for (unsigned oh = 0; oh < out_h; oh++) {
                 for (unsigned ow = 0; ow < out_w; ow++) {
+                    for (unsigned ict = 0; ict < ic_tiles; ict++) {
+                        const unsigned ic_off   = ict * kTileIC;
+                        const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-                    if (!is_depthwise) {
-                        for (unsigned ict = 0; ict < ic_tiles; ict++) {
-                            const unsigned ic_off   = ict * kTileIC;
-                            const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
-
-                            for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-                                for (unsigned khi = 0; khi < kh; khi++) {
-                                    const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                                - (int)pad_top;
-                                    const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                                    const unsigned x_row = (ni * in_ch + ic_off + ic_l)
-                                                        * in_h * in_w
-                                                        + (ih_ok ? (unsigned)ih * in_w : 0u);
-                                    for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                        #pragma HLS PIPELINE II=1
-                                        const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                                    - (int)pad_left;
-                                        // patch[ic_l][khi][kwi] =
-                                        //     (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                        //     ? x[x_row + (unsigned)iw]
-                                        //     : Data_t(0);
-                                        if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
-                                            size_t read_addr = x_row + (unsigned)iw;
-                                            if (read_addresses.find(read_addr) != read_addresses.end()) {
-//                                                std::cout << "Address " << read_addr << " was already readed" << std::endl;
-                                                read_addresses[read_addr] += 1;
-                                            } else {
-                                                read_addresses.insert(std::make_pair(read_addr, 0));
-                                            }
-                                        }
-                                        patch_stream.write(
-                                            (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                            ? x[x_row + (unsigned)iw]
-                                            : Data_t(0)
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
                             for (unsigned khi = 0; khi < kh; khi++) {
                                 const int ih = (int)(oh * stride_h + khi * dilation_h)
                                             - (int)pad_top;
                                 const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                                const unsigned x_row = (ni * in_ch + m_off + m1)
+                                const unsigned x_row = (ni * in_ch + ic_off + ic_l)
                                                     * in_h * in_w
                                                     + (ih_ok ? (unsigned)ih * in_w : 0u);
                                 for (unsigned kwi = 0; kwi < kw; kwi++) {
                                     #pragma HLS PIPELINE II=1
                                     const int iw = (int)(ow * stride_w + kwi * dilation_w)
                                                 - (int)pad_left;
-                                    // patch[m1][khi][kwi] =
-                                    //     (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                    //     ? x[x_row + (unsigned)iw]
-                                    //     : Data_t(0);
+
+#ifdef DEBUG_LOAD_DATA_CACHING                                                
                                     if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
                                         size_t read_addr = x_row + (unsigned)iw;
                                         if (read_addresses.find(read_addr) != read_addresses.end()) {
-                                            //std::cout << "Address " << read_addr << " was already readed" << std::endl;
                                             read_addresses[read_addr] += 1;
                                         } else {
                                             read_addresses.insert(std::make_pair(read_addr, 0));
                                         }
                                     }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+
                                     patch_stream.write(
                                         (ih_ok && iw >= 0 && (unsigned)iw < in_w)
                                         ? x[x_row + (unsigned)iw]
@@ -669,10 +633,123 @@ static void input_patch_producer(
         } // batch loop
     } // m_tile loop
 
+#ifdef DEBUG_LOAD_DATA_CACHING                                            
     for (auto it : read_addresses) {
         if (it.second) {
             std::cout << it.first << " --> " << it.second << std::endl;
         }
+    }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+}
+
+static void input_patch_producer_depthwise(
+    const Data_t*        x,
+    hls::stream<Data_t>& patch_stream,
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             in_h,
+    unsigned             in_w,
+    unsigned             out_ch,
+    unsigned             out_h,
+    unsigned             out_w,
+    unsigned             kh,
+    unsigned             kw,
+    unsigned             stride_h,
+    unsigned             stride_w,
+    unsigned             dilation_h,
+    unsigned             dilation_w,
+    unsigned             pad_top,
+    unsigned             pad_left
+) {
+    const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
+
+    std::map<size_t, int> read_addresses;
+
+    for (unsigned mt = 0; mt < m_tiles; mt++) {
+        const unsigned m_off   = mt * kTileM;
+        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+        for (unsigned ni = 0; ni < batch; ni++) {
+            for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned ow = 0; ow < out_w; ow++) {
+                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                        - (int)pad_top;
+                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                            const unsigned x_row = (ni * in_ch + m_off + m1)
+                                                * in_h * in_w
+                                                + (ih_ok ? (unsigned)ih * in_w : 0u);
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                            - (int)pad_left;
+
+#ifdef DEBUG_LOAD_DATA_CACHING                                            
+                                if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
+                                    size_t read_addr = x_row + (unsigned)iw;
+                                    if (read_addresses.find(read_addr) != read_addresses.end()) {
+                                        read_addresses[read_addr] += 1;
+                                    } else {
+                                        read_addresses.insert(std::make_pair(read_addr, 0));
+                                    }
+                                }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+
+                                patch_stream.write(
+                                    (ih_ok && iw >= 0 && (unsigned)iw < in_w)
+                                    ? x[x_row + (unsigned)iw]
+                                    : Data_t(0)
+                                );
+                            }
+                        }
+                    }
+                } // ow loop
+            } // oh loop
+        } // batch loop
+    } // m_tile loop
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    for (auto it : read_addresses) {
+        if (it.second) {
+            std::cout << it.first << " --> " << it.second << std::endl;
+        }
+    }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+}
+
+static void input_patch_producer(
+    const Data_t*        x,
+    hls::stream<Data_t>& patch_stream,
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             in_h,
+    unsigned             in_w,
+    unsigned             out_ch,
+    unsigned             out_h,
+    unsigned             out_w,
+    unsigned             kh,
+    unsigned             kw,
+    unsigned             stride_h,
+    unsigned             stride_w,
+    unsigned             dilation_h,
+    unsigned             dilation_w,
+    unsigned             pad_top,
+    unsigned             pad_left,
+    unsigned             is_depthwise
+) {
+    if (!is_depthwise) {
+        input_patch_producer_standard(
+            x, patch_stream, batch, in_ch, in_h, in_w,
+            out_ch, out_h, out_w, kh, kw,
+            stride_h, stride_w, dilation_h, dilation_w,
+            pad_top, pad_left);
+    } else {
+        input_patch_producer_depthwise(
+            x, patch_stream, batch, in_ch, in_h, in_w,
+            out_ch, out_h, out_w, kh, kw,
+            stride_h, stride_w, dilation_h, dilation_w,
+            pad_top, pad_left);
     }
 }
 
