@@ -32,8 +32,24 @@ demo/mnist/
 │   └── models/                     — ONNX files from Google Drive
 └── build/                          — generator output and results.json
     ├── projects/<model>/           — generated CMake project per model
+    │   ├── CMakeLists.txt          —   patched to build bench_mnist
+    │   ├── include/inference.h     —   from inference-scheduler
+    │   ├── src/inference*.c        —   from inference-scheduler
+    │   ├── driver/                 —   HLS driver sources copied in
+    │   └── test/
+    │       ├── bench_mnist.c       —   copied from demo/mnist/src/
+    │       └── bench_glue.h        —   generated; per-model glue + macros
+    ├── logs/<model>.<step>.log     — per-step build/run output
     └── results.json                — final benchmark summary
 ```
+
+`test/bench_glue.h` is **generated per model** by `scripts/generate_project.py`
+— not committed in the repo.  Each copy bakes in the right
+`INFERENCE_<INPUT>_SIZE` / `INFERENCE_<OUTPUT>_SIZE` macros and a
+`bench_inference_init()` shim that calls `inference_init()` with the correct
+number of UIO arguments for the kernels that model actually uses (e.g. 3 for
+LeNet, 4 for the MNIST convnet).  That's why it's generated rather than
+static: the I/O names and active-kernel set differ per model.
 
 ## Prerequisites
 
