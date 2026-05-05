@@ -31,8 +31,96 @@ SCHED_DIR = REPO_ROOT / "inference-scheduler"
 sys.path.insert(0, str(SCHED_DIR))
 from src.remote import (   # noqa: E402
     _green, _red, _yellow, _bold, _dim,
-    RemoteSession,
+    RemoteSession, check_prerequisites,
 )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preflight checks
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Header files we expect under each project's driver/ directory once the
+# generate stage has run.  If any are missing, the on-board cmake will fail
+# with a fatal error, so we surface the problem here instead.
+_REQUIRED_DRIVER_HEADERS = {
+    "VectorOPKernel": ["xvectoropkernel.h", "xvectoropkernel_hw.h"],
+    "MatmulKernel":   ["xmatmulkernel.h",   "xmatmulkernel_hw.h"],
+    "ConvKernel":     ["xconvkernel.h",     "xconvkernel_hw.h"],
+    "PoolKernel":     ["xpoolingkernel.h",  "xpoolingkernel_hw.h"],
+}
+
+
+def _check_label(label: str, ok: bool, detail: str = "") -> bool:
+    tag = _green("OK     ") if ok else _red("MISSING")
+    line = f"    {tag} {label}"
+    if detail:
+        line += f"  {_dim(detail)}"
+    print(line)
+    return ok
+
+
+def preflight_local(cfg: dict, projects: List[dict],
+                     data_dir: Path) -> bool:
+    """Verify the local working state needed to deploy and run.  No SSH yet."""
+    print(_bold("\nPreflight (local)"))
+    ok = True
+
+    # MNIST IDX files present?
+    for f in ("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte"):
+        p = data_dir / f
+        ok &= _check_label(f"data/{f}", p.exists(),
+                           f"{p.stat().st_size:,} B" if p.exists() else str(p))
+
+    # SSH config minimally populated?
+    ssh = cfg.get("ssh", {})
+    ok &= _check_label("ssh.host configured",
+                       bool(ssh.get("host")),
+                       ssh.get("host", "(missing)"))
+
+    # uio_devices map covers everything declared by `local.driver_dirs` so we
+    # can compile in the right runtime instance names later.
+    uio = cfg.get("remote", {}).get("uio_devices", {})
+
+    # Each generated project must have its driver headers in place.
+    for proj in projects:
+        name        = proj["model_name"]
+        proj_dir    = Path(proj["project_dir"])
+        active      = proj.get("active", [])
+        driver_dir  = proj_dir / "driver"
+
+        ok &= _check_label(f"project '{name}' on disk", proj_dir.is_dir(),
+                           str(proj_dir))
+        if not proj_dir.is_dir():
+            continue
+
+        for kernel in active:
+            for h in _REQUIRED_DRIVER_HEADERS.get(kernel, []):
+                hp = driver_dir / h
+                ok &= _check_label(f"  driver/{h}  ({kernel})",
+                                   hp.exists(), "" if hp.exists() else str(hp))
+            # UIO mapping for kernels actually used by this model.
+            ok &= _check_label(f"  uio_devices.{kernel}",
+                               kernel in uio,
+                               uio.get(kernel, "(missing — will fall back to "
+                                                f"{kernel}_0)"))
+
+    return ok
+
+
+def preflight_remote(session: RemoteSession, cfg: dict) -> bool:
+    """Verify the on-board environment is ready (cmake, gcc, XRT, UIO, sudo)."""
+    print(_bold("\nPreflight (remote)"))
+    ok = check_prerequisites(session, cfg, label_width=36)
+
+    # Additionally verify the work_dir parent is writable.
+    work_dir = cfg["remote"]["work_dir"].rstrip("/")
+    parent   = "/".join(work_dir.split("/")[:-1]) or "/"
+    out, _, rc = session.exec(
+        f"test -w {shlex.quote(parent)} && echo writable || echo NO",
+        timeout=10)
+    ok &= _check_label(f"work_dir parent writable ({parent})",
+                        rc == 0 and "writable" in out, work_dir)
+    return ok
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -286,6 +374,10 @@ def print_report(results: List[ModelResult]) -> None:
     print()
     print(_bold("  ── MNIST KV260 BENCHMARK ──"))
     print()
+    if not results:
+        print(_red("  no models were run — see preflight output above"))
+        print()
+        return
     rows = []
     for r in results:
         if r.metrics:
@@ -322,12 +414,32 @@ def _load_json(path: Path) -> dict:
 
 def deploy_models(cfg: dict, projects: List[dict],
                    data_dir: Path, *, log_dir: Path,
+                   check_only: bool = False,
                    verbose: bool = False) -> List[ModelResult]:
+    if not preflight_local(cfg, projects, data_dir):
+        print(_red("\npreflight: one or more local prerequisites missing"))
+        if not check_only:
+            return []
+
     session = RemoteSession(cfg["ssh"])
     print(f"\n{_bold('Connecting')} to "
           f"{cfg['ssh']['user']}@{cfg['ssh']['host']}:{cfg['ssh']['port']} …")
-    session.connect()
+    try:
+        session.connect()
+    except Exception as exc:
+        print(_red(f"  connection failed: {exc}"))
+        return []
     print(_green("  connected"))
+
+    if not preflight_remote(session, cfg):
+        print(_red("\npreflight: one or more remote prerequisites missing"))
+        if not check_only:
+            session.close()
+            return []
+    if check_only:
+        print(_green("\npreflight: all checks passed"))
+        session.close()
+        return []
 
     work_dir    = cfg["remote"]["work_dir"].rstrip("/")
     remote_data = f"{work_dir}/data"
@@ -407,6 +519,8 @@ def main(argv=None) -> int:
                    help="path to write the JSON results summary")
     p.add_argument("--no-cleanup", action="store_true",
                    help="leave the remote work_dir in place after the run")
+    p.add_argument("--check-only", action="store_true",
+                   help="run the local + remote preflight checks and exit")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
 
@@ -430,7 +544,11 @@ def main(argv=None) -> int:
 
     log_dir = Path(args.results).parent / "logs"
     results = deploy_models(cfg, projects, data_dir,
-                             log_dir=log_dir, verbose=args.verbose)
+                             log_dir=log_dir,
+                             check_only=args.check_only,
+                             verbose=args.verbose)
+    if args.check_only:
+        return 0
     if log_dir.exists():
         print(_dim(f"per-step logs written to {log_dir}"))
 

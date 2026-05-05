@@ -133,8 +133,27 @@ The full per-image numbers are also written to `build/results.json`.
 | `--skip-download` | reuse cached MNIST + ONNX files |
 | `--skip-deploy` | only regenerate the local CMake projects |
 | `--force-download` | re-fetch all assets |
+| `--check-only` | run preflight checks for every stage and exit (no SSH uploads, no inference) |
 | `--no-cleanup` (deploy script) | keep the remote work_dir for inspection |
 | `--verbose` | print full build / run output for failed steps |
+
+Each script also accepts `--check-only` on its own, useful for quickly
+verifying just one stage:
+
+```bash
+.venv/bin/python scripts/deploy_and_run.py --check-only
+# Preflight (local)
+#     OK   data/t10k-images-idx3-ubyte  7,840,016 B
+#     OK   project 'mnist_convnet' on disk
+#     OK     driver/xconvkernel.h  (ConvKernel)
+#     ...
+# Preflight (remote)
+#     OK   cmake                             cmake version 3.22.1
+#     OK   gcc                               gcc (Ubuntu 11.4.0) …
+#     OK   xrt headers                       xrt at /opt/xilinx/xrt
+#     OK   uio (VectorOPKernel: fabric_vecop) /dev/uio0
+#     ...
+```
 
 ## Tuning the run
 

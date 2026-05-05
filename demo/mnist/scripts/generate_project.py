@@ -292,6 +292,42 @@ def _load_config(path: Path) -> dict:
         return json.load(f)
 
 
+def _preflight(cfg: dict, *, models_filter: List[str] = None) -> bool:
+    """Validate the inputs needed to schedule each requested model."""
+    ok = True
+    drivers = cfg.get("local", {}).get("driver_dirs", {})
+    selected = set(models_filter or [])
+    bench_src = SRC_DIR / "bench_mnist.c"
+    if not bench_src.exists():
+        _log(f"error: {bench_src} missing")
+        ok = False
+
+    requested = [m for m in cfg.get("models", [])
+                 if not selected or m["name"] in selected]
+    if not requested:
+        _log("error: no models selected/configured")
+        return False
+
+    for m in requested:
+        name  = m["name"]
+        onnx  = ASSETS_DIR / "models" / m["drive_filename"]
+        if not onnx.exists():
+            _log(f"error: {onnx} not found — run download_assets.py first")
+            ok = False
+
+    if not drivers:
+        _log("warning: local.driver_dirs is empty — generated projects will "
+             "ship with empty driver/ folders and the on-board cmake will fail")
+    else:
+        for kernel, path in drivers.items():
+            src = (DEMO_DIR / path).resolve() if not Path(path).is_absolute() \
+                  else Path(path)
+            if not src.is_dir():
+                _log(f"warning: driver_dirs.{kernel}: {src} not found "
+                     "(run `make synthesize_kv260` from the repo root)")
+    return ok
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -300,9 +336,17 @@ def main(argv=None) -> int:
                    help="root for generated projects (one subdir per model)")
     p.add_argument("--models", nargs="+",
                    help="restrict to a subset of models from the config (by name)")
+    p.add_argument("--check-only", action="store_true",
+                   help="validate config + assets and exit without generating")
     args = p.parse_args(argv)
 
     cfg = _load_config(Path(args.config))
+    if not _preflight(cfg, models_filter=args.models):
+        return 1
+    if args.check_only:
+        _log("preflight: ok")
+        return 0
+
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 

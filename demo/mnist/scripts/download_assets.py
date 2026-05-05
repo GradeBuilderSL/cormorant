@@ -188,6 +188,24 @@ def _load_config(path: Path) -> dict:
         return json.load(f)
 
 
+def _preflight(cfg: dict, *, need_models: bool) -> bool:
+    """Validate inputs needed for the requested download stages."""
+    ok = True
+    # gdown is only required for the model-download path.
+    if need_models:
+        try:
+            import gdown  # noqa: F401
+        except ImportError:
+            _log("error: 'gdown' not installed — pip install -r requirements.txt")
+            ok = False
+        if not cfg.get("drive", {}).get("folder_url"):
+            _log("error: drive.folder_url missing in config")
+            ok = False
+        if not cfg.get("models"):
+            _log("warning: no models listed in config; nothing to download")
+    return ok
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -199,9 +217,16 @@ def main(argv=None) -> int:
                    help="only fetch the MNIST dataset")
     p.add_argument("--skip-data", action="store_true",
                    help="only fetch the ONNX models")
+    p.add_argument("--check-only", action="store_true",
+                   help="validate config + tools and exit without downloading")
     args = p.parse_args(argv)
 
     cfg = _load_config(Path(args.config))
+    if not _preflight(cfg, need_models=not args.skip_models):
+        return 1
+    if args.check_only:
+        _log("preflight: ok")
+        return 0
 
     if not args.skip_data:
         download_mnist(force=args.force)

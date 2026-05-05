@@ -44,6 +44,8 @@ def main(argv=None) -> int:
     p.add_argument("--skip-deploy",   action="store_true")
     p.add_argument("--force-download", action="store_true",
                    help="re-download even if cached files exist")
+    p.add_argument("--check-only", action="store_true",
+                   help="run preflight checks for every stage and exit")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
 
@@ -53,6 +55,8 @@ def main(argv=None) -> int:
         cmd = [py, str(SCRIPTS / "download_assets.py"), "--config", args.config]
         if args.force_download:
             cmd.append("--force")
+        if args.check_only:
+            cmd.append("--check-only")
         rc = _run("download_assets", cmd)
         if rc != 0:
             return rc
@@ -62,6 +66,8 @@ def main(argv=None) -> int:
                "--config", args.config]
         if args.models:
             cmd += ["--models", *args.models]
+        if args.check_only:
+            cmd.append("--check-only")
         rc = _run("generate_project", cmd)
         if rc != 0:
             return rc
@@ -70,6 +76,8 @@ def main(argv=None) -> int:
         cmd = [py, str(SCRIPTS / "deploy_and_run.py"), "--config", args.config]
         if args.verbose:
             cmd.append("--verbose")
+        if args.check_only:
+            cmd.append("--check-only")
         rc = _run("deploy_and_run", cmd)
         if rc != 0:
             return rc
