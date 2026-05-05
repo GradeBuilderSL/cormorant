@@ -103,8 +103,7 @@ Sample output:
 
   Model           Status         Acc  mean(ms)   p50(ms)   p99(ms)        IPS
   ─────────────────────────────────────────────────────────────────────────────
-  mnist_convnet   OK          98.61%     1.842     1.815     2.101       543.0
-  lenet           OK          99.07%     6.214     6.180     7.022       160.9
+  mnist_convnet   OK          98.92%    21.287    21.286    21.309       47.0
 ```
 
 The full per-image numbers are also written to `build/results.json`.
