@@ -115,6 +115,24 @@ $EDITOR remote_config.json   # set ssh.host and local.driver_dirs
 .venv/bin/python run_remote_tests.py --config remote_config.json
 ```
 
+### 7. Run the end-to-end MNIST demo
+
+Downloads the MNIST test split + two ONNX models (MNIST convnet and LeNet),
+generates a benchmark project per model, deploys to the KV260, and reports
+top-1 accuracy and per-image latency.
+
+```bash
+cd demo/mnist
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+cp mnist_config.json.example mnist_config.json
+$EDITOR mnist_config.json    # set ssh.host, key_file, uio_devices
+
+.venv/bin/python run_demo.py
+```
+
+See **[demo/mnist/README.md](demo/mnist/README.md)** for full details.
+
 ---
 
 ## Dependencies
@@ -604,6 +622,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 | `inference-scheduler/doc/INFERENCE_SCHEDULER.md` | Full inference scheduler technical reference |
 | `inference-scheduler/doc/REMOTE_TESTING.md` | SSH remote testing and performance benchmarking |
 | `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
+| `demo/mnist/README.md` | End-to-end MNIST inference demo (download → generate → deploy → benchmark) |
 | `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
 | `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
 | `doc/POOLING_KERNEL.md` | PoolingKernel architecture |

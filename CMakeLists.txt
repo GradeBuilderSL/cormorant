@@ -34,10 +34,38 @@ if(NOT AXI_PLATFORM_FILES)
     message(WARNING "axi_kernels: no platform JSON files found in platforms/")
 endif()
 
+# Enable CTest at the top level so `ctest` from the build root discovers tests
+# registered by every kernel subdirectory.
+enable_testing()
+
 add_subdirectory(kernels/vectorop)
 add_subdirectory(kernels/conv)
 add_subdirectory(kernels/matmul)
 add_subdirectory(kernels/pool)
+
+# ---------------------------------------------------------------------------
+# run_tests — build every C-simulation test executable, then run ctest.
+# `make test` (CTest's built-in target) only runs the tests; it does not
+# rebuild their executables.  This aggregate target does both.
+# ---------------------------------------------------------------------------
+set(_AXI_TEST_TARGETS
+    TestSimulation
+    TestConvRef
+    TestMatmulRef
+    TestPoolingSim
+)
+if(TARGET TestMatmulBlas)
+    list(APPEND _AXI_TEST_TARGETS TestMatmulBlas)
+endif()
+
+add_custom_target(run_tests
+    COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    DEPENDS ${_AXI_TEST_TARGETS}
+    COMMENT "Running all C-simulation tests"
+    USES_TERMINAL
+)
+message(STATUS "axi_kernels: target 'run_tests' (${_AXI_TEST_TARGETS})")
 
 # ---------------------------------------------------------------------------
 # dtc — device tree compiler (required for dtbo targets)
