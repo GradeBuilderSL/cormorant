@@ -7,10 +7,11 @@ KV260 inference project for each model with `inference-scheduler`, copies
 in the HLS driver sources, builds the project on the board over SSH, and
 runs a benchmark that reports top-1 accuracy and per-image latency.
 
-```
-download_assets.py   →   generate_project.py   →   deploy_and_run.py
-   MNIST + .onnx           per-model CMake             SSH upload, build,
-                           project + bench_glue        run bench_mnist
+```mermaid
+flowchart LR
+    A["download_assets.py<br/>MNIST + .onnx"]
+      --> B["generate_project.py<br/>per-model CMake project<br/>+ bench_glue.h"]
+      --> C["deploy_and_run.py<br/>SSH upload, build,<br/>run bench_mnist"]
 ```
 
 ## Layout
