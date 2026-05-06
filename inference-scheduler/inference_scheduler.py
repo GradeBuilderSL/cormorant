@@ -213,6 +213,20 @@ def main(argv=None):
     _write(os.path.join(out_dir, "test",    "test_inference.c"), test_src)
 
     # ---------------------------------------------------------------- #
+    # 5a. Runtime helper sources (static templates copied verbatim)     #
+    # ---------------------------------------------------------------- #
+    runtime_src = os.path.join(os.path.dirname(__file__), "runtime")
+    runtime_files = [
+        ("inference_prof.h", os.path.join("include", "inference_prof.h")),
+        ("inference_prof.c", os.path.join("src",     "inference_prof.c")),
+    ]
+    for src_name, rel_dst in runtime_files:
+        sp = os.path.join(runtime_src, src_name)
+        dp = os.path.join(out_dir,    rel_dst)
+        os.makedirs(os.path.dirname(dp), exist_ok=True)
+        shutil.copy2(sp, dp)
+
+    # ---------------------------------------------------------------- #
     # 5b. External weight .dat files (large tensors)                    #
     # ---------------------------------------------------------------- #
     large_weights = gen.large_weight_tensors
@@ -292,8 +306,10 @@ def main(argv=None):
     report_items = [
         "CMakeLists.txt",
         "include/inference.h",
+        "include/inference_prof.h",
         "src/inference.c",
         "src/inference_buf.c",
+        "src/inference_prof.c",
         "test/test_inference.c",
         "scripts/check_inference_setup.sh",
         "driver/",

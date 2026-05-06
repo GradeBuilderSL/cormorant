@@ -538,6 +538,31 @@ class _CoreMixin:
         """True when the graph contains at least one VectorOP ScheduledNode."""
         return any(isinstance(sn, ScheduledNode) for sn in self._graph.nodes)
 
+    def _layer_display_names(self) -> List[str]:
+        """One human-readable name per scheduled node, suitable for the
+        per-layer profiler.
+
+        Prefers the ONNX node name when present; falls back to ``op_type_index``
+        when empty.  After that, any duplicates are disambiguated by suffixing
+        every collider with ``_<index>`` so each name is unique and stable.
+        """
+        nodes = self._graph.nodes
+        candidates: List[str] = []
+        for sn in nodes:
+            raw = (sn.onnx_node.name or "").strip()
+            if not raw:
+                raw = f"{sn.onnx_node.op_type}_{sn.index}"
+            candidates.append(raw)
+
+        counts: dict = {}
+        for n in candidates:
+            counts[n] = counts.get(n, 0) + 1
+
+        return [
+            (f"{n}_{sn.index}" if counts[n] > 1 else n)
+            for sn, n in zip(nodes, candidates)
+        ]
+
     @property
     def _driver_prefix(self) -> str:
         """Driver prefix for the first active kernel — kept for backward compat."""

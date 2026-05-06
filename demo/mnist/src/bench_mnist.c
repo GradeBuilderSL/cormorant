@@ -40,6 +40,7 @@
 #include <time.h>
 
 #include "inference.h"
+#include "inference_prof.h"
 #include "bench_glue.h"
 
 #ifndef BENCH_DATA_DIR
@@ -250,6 +251,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#if INFERENCE_PROFILING
+    /*
+     * Per-layer profiler — opt-in at compile time
+     * (cmake -DINFERENCE_PROFILING=ON).  Counters are zeroed once now and
+     * again after the warmup window so only timed iterations are reported.
+     */
+    if (inference_prof_init(inference_num_layers(),
+                            inference_layer_names_ptr()) != 0) {
+        fprintf(stderr, "warning: inference_prof_init failed; "
+                        "continuing without per-layer stats\n");
+    } else {
+        fprintf(stderr,
+                "bench_mnist: per-layer profiling ENABLED (%u layers)\n",
+                inference_num_layers());
+    }
+#endif
+
     inference_buf_t *in_buf  = inference_buf_alloc(BENCH_INPUT_NUMEL);
     inference_buf_t *out_buf = inference_buf_alloc(BENCH_OUTPUT_NUMEL);
     if (!in_buf || !out_buf) {
@@ -285,6 +303,8 @@ int main(int argc, char **argv) {
         const uint8_t *pix = imgs.pixels + (size_t)i * BENCH_IMAGE_BYTES;
         encode_image(pix, in_ptr);
 
+        if (i == warmup) t_timed_start = now_ms();
+
         double t0 = now_ms();
         bench_inference_run(in_buf, out_buf);
         double dt = now_ms() - t0;
@@ -292,7 +312,11 @@ int main(int argc, char **argv) {
         unsigned pred = argmax_class(out_ptr);
         if (pred == lbls.labels[i]) correct++;
 
-        if (i == warmup) t_timed_start = now_ms();
+        /* Per-layer counters cover EVERY kernel call (warmup included) so
+         * each layer's `calls` field equals want_iters — i.e. one bump per
+         * input sample.  Per-image latency stats below still exclude the
+         * warmup window so mean/p50/p99 reflect steady-state behaviour. */
+
         if (i >= warmup) {
             latencies[timed_n++] = dt;
             t_total += dt;
@@ -336,6 +360,13 @@ int main(int argc, char **argv) {
         "\"throughput_ips\":%.2f}\n",
         BENCH_MODEL_NAME, want_iters, warmup, timed_n,
         correct, acc, mean_ms, p50_ms, p99_ms, tput);
+
+#if INFERENCE_PROFILING
+    /* Second JSON line, prefixed "LAYERS_JSON: " — the host parser keys
+     * off this marker to associate the stats with the model summary above. */
+    inference_prof_dump_json(stdout);
+    inference_prof_deinit();
+#endif
 
     free(latencies);
     free(imgs.pixels);

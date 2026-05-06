@@ -203,12 +203,18 @@ def configure_and_build(session: RemoteSession, cfg: dict,
             macro = _UIO_CMAKE_DEFINE[k]
             uio_defs.append(f'-D{macro}={shlex.quote(name)}')
 
+    # Per-layer profiling: when enabled, the inference target compiles
+    # inference_prof.c and bench_mnist's #if INFERENCE_PROFILING blocks.
+    profile_def = ""
+    if cfg["run"].get("profile_layers", False):
+        profile_def = "-DINFERENCE_PROFILING=ON"
+
     cmake_cmd = (
         f"cmake -S {shlex.quote(remote_proj)} -B {shlex.quote(build_dir)} "
         f"-DCMAKE_BUILD_TYPE=Release "
         f"-DINFERENCE_TARGET=LINUX "
         f"-DBENCH_DATA_DIR={shlex.quote(remote_data)} "
-        f"{' '.join(uio_defs)} {extra} 2>&1"
+        f"{profile_def} {' '.join(uio_defs)} {extra} 2>&1"
     )
 
     t0 = time.monotonic()
@@ -323,10 +329,14 @@ def run_benchmark(session: RemoteSession, cfg: dict,
     if rc != 0:
         return StepLog("run", False, duration, (out + err).strip()), None
 
-    # Find the JSON line emitted by bench_mnist (allow stderr noise on stdout).
+    # Find the summary JSON line emitted by bench_mnist (allow stderr noise
+    # on stdout).  Skip the per-layer profile line ("LAYERS_JSON: {…}") here
+    # — it's parsed separately below.
     metrics = None
     for line in reversed(out.splitlines()):
         line = line.strip()
+        if line.startswith("LAYERS_JSON:"):
+            continue
         if line.startswith("{") and line.endswith("}"):
             try:
                 metrics = json.loads(line)
@@ -336,6 +346,19 @@ def run_benchmark(session: RemoteSession, cfg: dict,
     if metrics is None:
         return StepLog("run", False, duration,
                        f"could not parse JSON output\n{out}{err}"), None
+
+    # Optional per-layer stats: bench_mnist prints exactly one
+    # "LAYERS_JSON: {...}" line when INFERENCE_PROFILING is on.
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("LAYERS_JSON:"):
+            payload = line[len("LAYERS_JSON:"):].strip()
+            try:
+                metrics["layer_stats"] = json.loads(payload)
+            except json.JSONDecodeError:
+                metrics["layer_stats"] = {"_parse_error": payload}
+            break
+
     full_log = "STDOUT:\n" + out.rstrip() + "\nSTDERR:\n" + err.rstrip()
     return StepLog("run", True, duration, full_log), metrics
 
@@ -368,6 +391,24 @@ def _save_log(log_dir: Path, model: str, step: StepLog) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{model}.{step.name}.log"
     path.write_text(step.output)
+
+
+def _print_top_layers(layer_stats: Optional[dict], top_n: int = 5) -> None:
+    """Echo the slowest-by-mean layers to stderr.  No-op when profiling
+    was disabled (layer_stats is None or empty)."""
+    if not layer_stats:
+        return
+    layers = layer_stats.get("layers") or []
+    if not layers:
+        return
+    ranked = sorted(layers, key=lambda L: L.get("mean_us", 0.0), reverse=True)
+    print(f"    per-layer (top {min(top_n, len(ranked))} by mean):")
+    for L in ranked[:top_n]:
+        print(f"      [{L['i']:>3}] {L['name'][:32]:<32} "
+              f"calls={L['calls']:<6} "
+              f"mean={L['mean_us']:>9.2f}us  "
+              f"min={L['min_us']:>9.2f}us  "
+              f"max={L['max_us']:>9.2f}us")
 
 
 def print_report(results: List[ModelResult]) -> None:
@@ -493,6 +534,7 @@ def deploy_models(cfg: dict, projects: List[dict],
                 print(f"    accuracy = {metrics['accuracy_pct']:.2f}%   "
                       f"mean = {metrics['mean_ms']:.3f} ms   "
                       f"throughput = {metrics['throughput_ips']:.1f} img/s")
+                _print_top_layers(metrics.get("layer_stats"))
             results.append(res)
 
         if cfg.get("cleanup", True):
@@ -521,12 +563,17 @@ def main(argv=None) -> int:
                    help="leave the remote work_dir in place after the run")
     p.add_argument("--check-only", action="store_true",
                    help="run the local + remote preflight checks and exit")
+    p.add_argument("--profile-layers", action="store_true",
+                   help="enable per-layer wall-clock profiling "
+                        "(overrides run.profile_layers in the config)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
 
     cfg = _load_json(Path(args.config))
     if args.no_cleanup:
         cfg["cleanup"] = False
+    if args.profile_layers:
+        cfg.setdefault("run", {})["profile_layers"] = True
 
     projects_summary = Path(args.projects_dir) / "projects.json"
     if not projects_summary.exists():

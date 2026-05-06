@@ -24,6 +24,7 @@ class _SourceMixin:
             self._weight_arrays(),
             self._buffer_declarations(),
             self._kernel_instance(),
+            self._layer_names_table(),
             self._run_op_helper(),
             self._init_function(),
             self._inference_function(),
@@ -40,6 +41,8 @@ class _SourceMixin:
         return (
             _banner("Includes") +
             '#include "inference.h"\n'
+            '#include "inference_prof.h"  /* INFERENCE_PROF_BEGIN/END (no-ops unless'
+            ' INFERENCE_PROFILING is set) */\n'
             f'{kernel_headers}'
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
@@ -129,6 +132,58 @@ class _SourceMixin:
         for kd in self._active_kernels:
             lines.append(f"static {kd.c_type} {kd.c_var};")
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _c_string_escape(s: str) -> str:
+        """Escape a Python string for use as a C string literal body."""
+        out = []
+        for ch in s:
+            o = ord(ch)
+            if ch == '\\':   out.append('\\\\')
+            elif ch == '"':  out.append('\\"')
+            elif ch == '\n': out.append('\\n')
+            elif ch == '\r': out.append('\\r')
+            elif ch == '\t': out.append('\\t')
+            elif o < 0x20 or o == 0x7f:
+                out.append(f"\\x{o:02x}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def _layer_names_table(self) -> str:
+        """Emit the static name table consumed by inference_prof and the
+        accessors declared in inference.h.  Always emitted, even when
+        profiling is off — the table is tiny and gives host code a stable
+        way to introspect the graph."""
+        names = self._layer_display_names()
+        n     = len(names)
+
+        parts = [_banner("Per-layer name table (used by inference_prof)")]
+        if n > 0:
+            parts.append(
+                f"static const char *const inference_layer_names[{n}] = {{"
+            )
+            for i, name in enumerate(names):
+                parts.append(f'    "{self._c_string_escape(name)}",'
+                             f"  /* [{i}] */")
+            parts.append("};")
+        else:
+            parts.append("/* (no scheduled nodes — layer-name table is empty) */")
+        parts.append("")
+        parts.append("unsigned inference_num_layers(void)")
+        parts.append("{")
+        parts.append(f"    return {n}u;")
+        parts.append("}")
+        parts.append("")
+        parts.append("const char *const *inference_layer_names_ptr(void)")
+        parts.append("{")
+        if n > 0:
+            parts.append("    return inference_layer_names;")
+        else:
+            parts.append("    return (const char *const *)0;")
+        parts.append("}")
+        parts.append("")
+        return "\n".join(parts)
 
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
@@ -680,7 +735,17 @@ class _SourceMixin:
         body_lines = []
         for sn in graph.nodes:
             body_lines.append(sn.emit_comment())
-            body_lines.append(sn.emit_call(self._layouts))
+            call = sn.emit_call(self._layouts)
+            # Wrap non-empty kernel calls with profiler hooks so each layer
+            # gets its own wall-clock counters.  Reshape aliases (empty call)
+            # have no kernel work to time, so we skip the wrap to keep the
+            # generated source clean.
+            if call.strip():
+                body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
+                body_lines.append(call)
+                body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")
+            else:
+                body_lines.append(call)
             body_lines.append("")
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
