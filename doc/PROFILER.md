@@ -23,35 +23,19 @@ independently into any host application that uses the generated
 
 ## Architecture
 
-```
-                       ┌──────────────────────────────┐
-host program           │ bench_mnist.c   (any host)   │
-                       │   inference_prof_init / dump │
-                       │   inference_ddr_init  / dump │
-                       └──────────────┬───────────────┘
-                                      │ public API
-                                      ▼
-generated  inference.h  ──────────────┐
-project    inference.c (wrapped node calls with INFERENCE_PROF_BEGIN/END)
-           inference_prof.h           │
-           inference_prof.c           │  copied verbatim from
-           inference_ddr.h            │  inference-scheduler/runtime/
-           inference_ddr.c            │  by inference_scheduler.py
-           inference_ddr_backend.h    │
-           ddr/zuplus_apm.c           ┘
-                                      │ vtable
-                                      ▼
-                       ┌──────────────────────────────┐
-                       │ DDR backend (per-platform)   │
-                       │   probe()                    │
-                       │   start() / sample() / stop()│
-                       │   read_counts()              │
-                       │   describe()                 │
-                       └──────────────────────────────┘
-                                      │ /dev/mem mmap
-                                      ▼
-                          ZU+ DDR APM at 0xFD490000
-                          (or any other Xilinx APM IP)
+```mermaid
+flowchart TB
+    Host["<b>Host program</b> (bench_mnist.c, or any host)<br/>inference_prof_init / dump_json<br/>inference_ddr_init / start / sample / stop / dump_json"]
+
+    Project["<b>Generated project</b><br/>(copied verbatim from inference-scheduler/runtime/<br/>by inference_scheduler.py)<br/>inference.{h,c} — wrapped node calls (PROF_BEGIN/END)<br/>inference_prof.{h,c} · inference_ddr.{h,c}<br/>inference_ddr_backend.h<br/>ddr/zuplus_apm.c"]
+
+    Backend["<b>DDR backend</b> (per-platform)<br/>probe() · start() · sample() · stop()<br/>read_counts() · describe() · last_error() · deinit()"]
+
+    HW["<b>ZU+ DDR APM @ 0xFD490000</b><br/>(or any other Xilinx APM IP)"]
+
+    Host -->|"public API"| Project
+    Project -->|"vtable"| Backend
+    Backend -->|"/dev/mem mmap"| HW
 ```
 
 Three pieces:
