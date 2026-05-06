@@ -54,6 +54,14 @@ set(CONV_MAX_KH  7  CACHE STRING
     "Compile-time kernel height limit; Conv nodes with kH > MAX_KH are rejected at scheduling")
 set(CONV_MAX_KW  7  CACHE STRING
     "Compile-time kernel width limit; Conv nodes with kW > MAX_KW are rejected at scheduling")
+set(CONV_MAX_IN_CH  512 CACHE STRING
+    "Compile-time input-channel limit; sizes patch_buf and the channel dim of line_buf")
+set(CONV_MAX_OUT_CH 512 CACHE STRING
+    "Compile-time output-channel limit; sizes bias_buf in bias_producer")
+set(CONV_MAX_IN_W   64  CACHE STRING
+    "Compile-time input-width limit; sizes the column dim of line_buf in input_patch_producer_standard")
+set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
+    "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory

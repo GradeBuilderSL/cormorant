@@ -9,35 +9,37 @@
 // Top-level dataflow (HLS DATAFLOW):
 //
 //   ConvKernel
-//     bias_producer            ──bias_stream──► process_conv_kernel_tile
-//                                                        │
-//     bias (DDR/gmem2)                                   └──► y (DDR/gmem3)
+//     bias_producer           ──bias_stream──►  process_conv_kernel_tile
+//     input_patch_producer    ──patch_stream──►        │
+//                                                      └──acc_stream──► write_output_tile
+//                                                                              │
+//     x/bias (DDR gmem0/2)                                                     ▼
+//                                                                       y (DDR gmem3)
 //
-// bias_producer iterates over every m_tile, fetches the m_valid bias values
-// for the tile from DDR once on gmem2, then streams that slice batch*out_h*
-// out_w times to bias_stream — exactly the rate the consumer expects.  When
-// has_bias=0 no DDR transactions are issued; the producer pushes
-// AccData_t(0) directly.
-//
-// process_conv_kernel_tile contains the m_tile/ni/oh/ow loop nest.  Each
-// inner iteration: pop m_valid bias values into the accumulator, run the
-// per-tile compute (standard or depthwise), push m_valid output lanes
-// through acc_stream → DDR via write_output_tile.
+// mt-hoist (the m_tile loop is INSIDE the spatial nest):
+//   * input_patch_producer_standard reads each unique x[] pixel from DDR
+//     exactly once per (ni, oh, ow), buffers the patch on-chip, then
+//     broadcasts it m_tiles times into patch_stream — eliminating the
+//     m_tiles× DDR re-read of x.
+//   * bias_producer loads the entire bias vector once into bias_buf and
+//     streams it in (r, mt, m1) order to match the consumer's new nest.
+//   * process_conv_kernel_tile iterates (ni, oh, ow, mt) — same patch is
+//     consumed by every output-channel tile back-to-back.
+//   * write_output_tile drains acc_stream in (ni, oh, ow, mt, m1) order.
 //
 // Loop structure — standard conv (is_depthwise=0):
 //
-//   m_tile loop      — tiles the output channel dimension (TILE_M)
-//     batch loop     — iterates over input images
-//       oh / ow loops — slide over output spatial positions
-//         compute tile (producer):
-//           [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
-//           ic_tile loop — tiles the input channel dimension (TILE_IC)
-//             load patch  — current (oh,ow) input patch to on-chip BRAM
-//             load w_buf  — weight tile for (m_tile, ic_tile) to on-chip BRAM
-//             accumulate  — II=1 K-reduction over ic×kH×kW with TILE_M lanes
-//           drain        — push m_valid lanes of acc[] to acc_stream
-//         write output (consumer):
-//           saturate_cast acc_stream → DDR y
+//   batch / oh / ow loops    — iterate over output spatial positions
+//     m_tile loop            — tiles the output channel dimension (TILE_M)
+//       compute tile (producer):
+//         [acc init]   — zero acc[], overlay m_valid lanes from bias_stream
+//         ic_tile loop — tiles the input channel dimension (TILE_IC)
+//           load patch  — current (oh,ow) input patch to on-chip BRAM
+//           load w_buf  — weight tile for (m_tile, ic_tile) to on-chip BRAM
+//           accumulate  — II=1 K-reduction over ic×kH×kW with TILE_M lanes
+//         drain        — push m_valid lanes of acc[] to acc_stream
+//       write output (consumer):
+//         saturate_cast acc_stream → DDR y
 //
 // Loop structure — depthwise conv (is_depthwise=1): same outer nest, the
 // per-tile compute swaps in compute_depthwise_conv_tile (no ic_tile loop,
@@ -65,7 +67,35 @@
 
 #ifdef DEBUG_LOAD_DATA_CACHING
 #include <map>
+#include <list>
 #include <iostream>
+
+struct CycleCounters {
+    unsigned mt;
+    unsigned ni;
+    unsigned oh;
+    unsigned ow;
+    unsigned ict;
+    unsigned ic_l;
+    unsigned khi;
+    unsigned kwi;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const CycleCounters& c) {
+    os << "{mt=" << c.mt
+       << " ni=" << c.ni
+       << " oh=" << c.oh
+       << " ow=" << c.ow
+       << " ict=" << c.ict
+       << " ic_l=" << c.ic_l
+       << " khi=" << c.khi
+       << " kwi=" << c.kwi
+       << "}";
+    return os;
+}
+
+typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
+
 #endif /* DEBUG_LOAD_DATA_CACHING */
 
 // ---------------------------------------------------------------------------
@@ -476,11 +506,11 @@ static void compute_depthwise_conv_tile(
 }
 
 // ---------------------------------------------------------------------------
-// Write one output tile (m_valid lanes drained from acc_stream) to DDR.
+// Write outputs to DDR.
 //
-// Each of the m_valid output channels writes to a non-contiguous DDR address
-// (stride = out_h*out_w elements).  y_addr is advanced by ohw each iteration
-// using a counter to avoid a multiplier inside the pipeline.
+// Loop nest matches the new consumer's drain order — (ni, oh, ow, mt, m1).
+// For each (ni, oh, ow) the m_tiles × m_valid lanes are written in
+// channel-major order; y_addr advances by ohw between m1 lanes.
 // ---------------------------------------------------------------------------
 static void write_output_tile(
     Data_t*                 y,
@@ -490,44 +520,43 @@ static void write_output_tile(
     unsigned                out_w,
     unsigned                batch
 ) {
-    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
+    const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
+    const unsigned ohw     = out_h * out_w;
 
-    for (unsigned mt = 0; mt < m_tiles; mt++) {
-        const unsigned m_off   = mt * kTileM;
-        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-
-        for (unsigned ni = 0; ni < batch; ni++) {
-            for (unsigned oh = 0; oh < out_h; oh++) {
-                for (unsigned ow = 0; ow < out_w; ow++) {
-                    const unsigned ohw    = out_h * out_w;
-                    unsigned       y_addr = (ni * out_ch + m_off) * ohw + oh * out_w + ow;
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned oh = 0; oh < out_h; oh++) {
+            for (unsigned ow = 0; ow < out_w; ow++) {
+                const unsigned base = ni * out_ch * ohw + oh * out_w + ow;
+                for (unsigned mt = 0; mt < m_tiles; mt++) {
+                    const unsigned m_off   = mt * kTileM;
+                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+                    unsigned       y_addr  = base + m_off * ohw;
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
                         y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
                         y_addr += ohw;
                     }
-                } // ow loop
-            } // oh loop
-        } // batch loop
-    } // m_tile loop
+                } // m_tile loop
+            } // ow loop
+        } // oh loop
+    } // batch loop
 }
 
 // ---------------------------------------------------------------------------
 // Bias producer (DATAFLOW source).
 //
-// Loops over every m_tile.  For each tile:
-//   1. fetches m_valid bias values from DDR into a small on-chip buffer
-//      (one DDR transaction per tile on gmem2);
-//   2. streams that slice `reps` times to bias_stream — one push-cycle of
-//      m_valid items per (ni, oh, ow) inner iteration of the consumer.
+// Streams bias values to process_conv_kernel_tile in the order the consumer
+// reads them after the mt-hoist optimisation:
 //
-// Total pushes per tile = m_valid * reps.  Total bias DDR reads per tile =
-// m_valid (when has_bias=1).  When has_bias=0 no DDR transactions are
-// issued and the producer pushes AccData_t(0) directly.
+//     for (r in batch*out_h*out_w):
+//         for (mt in m_tiles):
+//             for (m1 in m_valid): write(bias[m_off+m1])
 //
-// Designed to run concurrently with process_conv_kernel_tile under HLS
-// DATAFLOW: while the consumer is still computing the tail of tile mt the
-// producer can already be fetching bias for tile mt+1.
+// Because the consumer's mt loop now lives INSIDE the spatial nest, the
+// producer needs all m_tiles' bias slices available simultaneously per
+// `r` iteration.  The entire bias vector is therefore loaded once into
+// bias_buf[kMaxOutCh] and replayed `reps` times.  When has_bias=0 no DDR
+// transactions are issued and the producer pushes AccData_t(0) directly.
 // ---------------------------------------------------------------------------
 static void bias_producer(
     const Data_t*           bias,
@@ -536,33 +565,61 @@ static void bias_producer(
     unsigned                reps,
     unsigned                has_bias
 ) {
-    Data_t bias_buf[kTileM];
-    #pragma HLS ARRAY_PARTITION variable=bias_buf complete dim=0
+    Data_t bias_buf[kMaxOutCh];
+
+    if (has_bias) {
+        for (unsigned m = 0; m < out_ch; m++) {
+            #pragma HLS PIPELINE II=1
+            bias_buf[m] = bias[m];
+        }
+    }
 
     const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
 
-    for (unsigned mt = 0; mt < m_tiles; mt++) {
-        const unsigned m_off   = mt * kTileM;
-        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-
-        if (has_bias) {
-            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                #pragma HLS PIPELINE II=1
-                bias_buf[m1] = bias[m_off + m1];
-            }
-        }
-
-        for (unsigned r = 0; r < reps; r++) {
+    for (unsigned r = 0; r < reps; r++) {
+        for (unsigned mt = 0; mt < m_tiles; mt++) {
+            const unsigned m_off   = mt * kTileM;
+            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
             for (unsigned m1 = 0; m1 < m_valid; m1++) {
                 #pragma HLS PIPELINE II=1
                 bias_stream.write(has_bias
-                                  ? AccData_t(bias_buf[m1])
+                                  ? AccData_t(bias_buf[m_off + m1])
                                   : AccData_t(0));
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Standard-conv input patch ASSEMBLER (DATAFLOW source).
+//
+// Combines a per-channel sliding line buffer with on-the-fly streaming
+// of patch values into patch_pipe.  Each unique x[] pixel is fetched from
+// DDR exactly once per (ni) iteration:
+//
+//   line_buf[c][slot][iw] = x[(ni*in_ch + c)*in_h*in_w + ih*in_w + iw]
+//     where slot = ih & (kMaxLineBufRows - 1)
+//
+// The mt-broadcast (m_tiles× replay of every patch) is now done by the
+// downstream broadcast_patches stage so the assembler emits each patch
+// value exactly once into patch_pipe.  Under HLS DATAFLOW the assembler's
+// production for (ni, oh, ow=N+1) overlaps the broadcaster's m_tiles×
+// replay of (ni, oh, ow=N), hiding the assemble latency behind the
+// broadcast.
+//
+// Per (ni, oh):
+//   Phase 1 — load any new input rows for the current oh's kh-window into
+//             line_buf (one DDR read per pixel that just entered the
+//             window; rows already resident from earlier oh iterations
+//             are reused).
+// Per (ni, oh, ow):
+//   Phase 2 — assemble one in_ch*kh*kw patch from line_buf and write it
+//             into patch_pipe (no on-chip patch buffer in this stage —
+//             values flow straight to the downstream broadcaster).
+//
+// Constraints: in_ch <= kMaxInCh, in_w <= kMaxInW,
+//              (kh-1)*dilation_h + 1 <= kMaxLineBufRows.
+// ---------------------------------------------------------------------------
 static void input_patch_producer_standard(
     const Data_t*        x,
     hls::stream<Data_t>& patch_stream,
@@ -582,64 +639,160 @@ static void input_patch_producer_standard(
     unsigned             pad_top,
     unsigned             pad_left
 ) {
-    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
-    const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
+    (void)out_ch;  // m_tiles is computed in the broadcaster; not needed here.
 
-    std::map<size_t, int> read_addresses;
+    const unsigned ic_tiles = (in_ch + kTileIC - 1) / kTileIC;
+    const unsigned in_hw    = in_h * in_w;
 
-    for (unsigned mt = 0; mt < m_tiles; mt++) {
-        for (unsigned ni = 0; ni < batch; ni++) {
-            for (unsigned oh = 0; oh < out_h; oh++) {
-                for (unsigned ow = 0; ow < out_w; ow++) {
-                    for (unsigned ict = 0; ict < ic_tiles; ict++) {
-                        const unsigned ic_off   = ict * kTileIC;
-                        const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+    Data_t line_buf[kMaxInCh][kMaxLineBufRows][kMaxInW];
 
-                        for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                            - (int)pad_top;
-                                const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                                const unsigned x_row = (ni * in_ch + ic_off + ic_l)
-                                                    * in_h * in_w
-                                                    + (ih_ok ? (unsigned)ih * in_w : 0u);
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                                - (int)pad_left;
+#ifdef DEBUG_LOAD_DATA_CACHING
+    AddressMap_t read_addresses;
+#endif
 
-#ifdef DEBUG_LOAD_DATA_CACHING                                                
-                                    if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
-                                        size_t read_addr = x_row + (unsigned)iw;
-                                        if (read_addresses.find(read_addr) != read_addresses.end()) {
-                                            read_addresses[read_addr] += 1;
-                                        } else {
-                                            read_addresses.insert(std::make_pair(read_addr, 0));
-                                        }
-                                    }
+    for (unsigned ni = 0; ni < batch; ni++) {
+        // Highest absolute input row currently resident in line_buf.
+        // Reset per ni since x[] is offset by ni*in_ch*in_hw.
+        int last_loaded_row = -1;
+
+        for (unsigned oh = 0; oh < out_h; oh++) {
+            const int ih_window_max = (int)(oh * stride_h)
+                                    - (int)pad_top
+                                    + (int)((kh - 1) * dilation_h);
+
+            // -------------------------------------------------------
+            // Phase 1: load any rows the current oh-window needs that
+            // are not yet in line_buf.  Rows are loaded in increasing
+            // ih order so the circular buffer evicts only obsolete
+            // rows (those outside the largest possible window we'll
+            // see while these slots stay live).
+            // -------------------------------------------------------
+            int load_start = last_loaded_row + 1;
+            if (load_start < 0) load_start = 0;
+            int load_end = ih_window_max;
+            if (load_end >= (int)in_h) load_end = (int)in_h - 1;
+
+            for (int ih = load_start; ih <= load_end; ih++) {
+                const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
+                for (unsigned c = 0; c < in_ch; c++) {
+                    const unsigned x_row = (ni * in_ch + c) * in_hw
+                                         + (unsigned)ih * in_w;
+                    for (unsigned iw = 0; iw < in_w; iw++) {
+                        #pragma HLS PIPELINE II=1
+                        const size_t addr = x_row + iw;
+                        line_buf[c][slot][iw] = x[addr];
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+                        CycleCounters counters;
+                        counters.mt   = 0;
+                        counters.ni   = ni;
+                        counters.ict  = c / kTileIC;
+                        counters.ic_l = c % kTileIC;
+                        counters.oh   = oh;
+                        counters.ow   = 0;
+                        counters.khi  = (unsigned)ih;
+                        counters.kwi  = iw;
+                        read_addresses[addr].push_back(counters);
 #endif /* DEBUG_LOAD_DATA_CACHING */
+                    }
+                }
+            }
+            if (load_end > last_loaded_row) {
+                last_loaded_row = load_end;
+            }
 
-                                    patch_stream.write(
-                                        (ih_ok && iw >= 0 && (unsigned)iw < in_w)
-                                        ? x[x_row + (unsigned)iw]
-                                        : Data_t(0)
-                                    );
-                                }
+            for (unsigned ow = 0; ow < out_w; ow++) {
+
+                // ---------------------------------------------------
+                // Phase 2: stream patch values straight from the line
+                // buffer to patch_pipe — no intermediate patch_buf.
+                // ---------------------------------------------------
+                for (unsigned ict = 0; ict < ic_tiles; ict++) {
+                    const unsigned ic_off   = ict * kTileIC;
+                    const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+
+                    for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                        - (int)pad_top;
+                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                            const unsigned slot = ih_ok
+                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                                : 0u;
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                            - (int)pad_left;
+                                const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
+                                patch_stream.write((ih_ok && iw_ok)
+                                    ? line_buf[ic_off + ic_l][slot][(unsigned)iw]
+                                    : Data_t(0));
                             }
                         }
                     }
-                } // ow loop
-            } // oh loop
-        } // batch loop
-    } // m_tile loop
+                }
+            } // ow loop
+        } // oh loop
+    } // batch loop
 
-#ifdef DEBUG_LOAD_DATA_CACHING                                            
+#ifdef DEBUG_LOAD_DATA_CACHING
     for (auto it : read_addresses) {
-        if (it.second) {
-            std::cout << it.first << " --> " << it.second << std::endl;
+        if (it.second.size() > 1) {
+            std::cout << it.first << " --> " << std::endl;
+
+            for (auto l_item : it.second) {
+                std::cout << "\t" << l_item << std::endl;
+            }
         }
     }
 #endif /* DEBUG_LOAD_DATA_CACHING */
+}
+
+// ---------------------------------------------------------------------------
+// broadcast_patches — DATAFLOW stage between input_patch_producer and
+// process_conv_kernel_tile.
+//
+// Per outer iteration (one (ni, oh, ow)):
+//   First pass:   read input_per_iter values from patch_pipe into local_buf
+//                 AND simultaneously forward them to patch_stream.  This
+//                 single II=1 pipeline absorbs the assembler's output and
+//                 emits the first broadcast copy with no extra cycle.
+//   Subsequent:   write (broadcast_factor - 1) more copies of local_buf to
+//                 patch_stream, flattened into one continuous II=1 pipeline
+//                 (no per-mt drain — saves the loop-restart cycle that
+//                 the previous nested mt/i loops paid m_tiles times).
+//
+// broadcast_factor = m_tiles for the standard path, = 1 for depthwise
+// (the depthwise producer already emits per-(mt,m1) data, so this stage
+// degenerates to a passthrough).
+// ---------------------------------------------------------------------------
+static void broadcast_patches(
+    hls::stream<Data_t>& patch_pipe,
+    hls::stream<Data_t>& patch_stream,
+    unsigned             outer_iters,
+    unsigned             input_per_iter,
+    unsigned             broadcast_factor
+) {
+    Data_t local_buf[kMaxInCh * kMaxKH * kMaxKW];
+
+    for (unsigned r = 0; r < outer_iters; r++) {
+        for (unsigned i = 0; i < input_per_iter; i++) {
+            #pragma HLS PIPELINE II=1
+            const Data_t val = patch_pipe.read();
+            local_buf[i] = val;
+            patch_stream.write(val);
+        }
+
+        const unsigned subsequent = (broadcast_factor > 0
+                                     ? broadcast_factor - 1
+                                     : 0) * input_per_iter;
+        unsigned i = 0;
+        for (unsigned k = 0; k < subsequent; k++) {
+            #pragma HLS PIPELINE II=1
+            patch_stream.write(local_buf[i]);
+            i = (i + 1 == input_per_iter) ? 0u : i + 1;
+        }
+    }
 }
 
 static void input_patch_producer_depthwise(
@@ -663,15 +816,20 @@ static void input_patch_producer_depthwise(
 ) {
     const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
 
-    std::map<size_t, int> read_addresses;
+#ifdef DEBUG_LOAD_DATA_CACHING
+    AddressMap_t read_addresses;
+#endif
 
-    for (unsigned mt = 0; mt < m_tiles; mt++) {
-        const unsigned m_off   = mt * kTileM;
-        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+    // Loop order matches the new consumer: (ni, oh, ow, mt, m1, khi, kwi).
+    // Depthwise lanes read disjoint input channels, so no broadcast buffer
+    // is required — only the loop nest is reshuffled.
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned oh = 0; oh < out_h; oh++) {
+            for (unsigned ow = 0; ow < out_w; ow++) {
+                for (unsigned mt = 0; mt < m_tiles; mt++) {
+                    const unsigned m_off   = mt * kTileM;
+                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-        for (unsigned ni = 0; ni < batch; ni++) {
-            for (unsigned oh = 0; oh < out_h; oh++) {
-                for (unsigned ow = 0; ow < out_w; ow++) {
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         for (unsigned khi = 0; khi < kh; khi++) {
                             const int ih = (int)(oh * stride_h + khi * dilation_h)
@@ -685,14 +843,20 @@ static void input_patch_producer_depthwise(
                                 const int iw = (int)(ow * stride_w + kwi * dilation_w)
                                             - (int)pad_left;
 
-#ifdef DEBUG_LOAD_DATA_CACHING                                            
+#ifdef DEBUG_LOAD_DATA_CACHING
                                 if (ih_ok && iw >= 0 && (unsigned)iw < in_w) {
                                     size_t read_addr = x_row + (unsigned)iw;
-                                    if (read_addresses.find(read_addr) != read_addresses.end()) {
-                                        read_addresses[read_addr] += 1;
-                                    } else {
-                                        read_addresses.insert(std::make_pair(read_addr, 0));
-                                    }
+
+                                    CycleCounters counters;
+                                    counters.mt   = mt;
+                                    counters.ni   = ni;
+                                    counters.ict  = -1;
+                                    counters.ic_l = m1;
+                                    counters.oh   = oh;
+                                    counters.ow   = ow;
+                                    counters.khi  = khi;
+                                    counters.kwi  = kwi;
+                                    read_addresses[read_addr].push_back(counters);
                                 }
 #endif /* DEBUG_LOAD_DATA_CACHING */
 
@@ -704,15 +868,19 @@ static void input_patch_producer_depthwise(
                             }
                         }
                     }
-                } // ow loop
-            } // oh loop
-        } // batch loop
-    } // m_tile loop
+                }
+            } // ow loop
+        } // oh loop
+    } // batch loop
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     for (auto it : read_addresses) {
-        if (it.second) {
-            std::cout << it.first << " --> " << it.second << std::endl;
+        if (it.second.size() > 1) {
+            std::cout << it.first << " --> " << std::endl;
+
+            for (auto l_item : it.second) {
+                std::cout << "\t" << l_item << std::endl;
+            }
         }
     }
 #endif /* DEBUG_LOAD_DATA_CACHING */
@@ -756,14 +924,13 @@ static void input_patch_producer(
 // ---------------------------------------------------------------------------
 // process_conv_kernel_tile — DATAFLOW consumer.
 //
-// Iterates over m_tile, batch, output spatial position.  Each inner
-// iteration: pop m_valid bias values from bias_stream (filled by the
-// concurrent bias_producer) into the accumulator, run the per-tile compute
-// (standard or depthwise), stream m_valid output lanes through acc_stream
-// → DDR via write_output_tile.
+// Iterates over (ni, oh, ow, mt) — mt is INSIDE the spatial nest so each
+// (ni, oh, ow) patch produced by input_patch_producer_standard is consumed
+// by every m_tile back-to-back, eliminating the m_tiles× re-read of x[].
 //
-// `patch` and `acc_stream` are local scratch — the only externally-visible
-// streaming dependency is bias_stream (input) and y (output via DDR).
+// Each inner iteration: pop m_valid bias values from bias_stream into the
+// accumulator, run the per-tile compute (standard or depthwise), and push
+// m_valid output lanes through acc_stream → DDR via write_output_tile.
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<Data_t>&    patch_stream,
@@ -790,13 +957,12 @@ static void process_conv_kernel_tile(
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
-    for (unsigned mt = 0; mt < m_tiles; mt++) {
-        const unsigned m_off   = mt * kTileM;
-        const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-
-        for (unsigned ni = 0; ni < batch; ni++) {
-            for (unsigned oh = 0; oh < out_h; oh++) {
-                for (unsigned ow = 0; ow < out_w; ow++) {
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned oh = 0; oh < out_h; oh++) {
+            for (unsigned ow = 0; ow < out_w; ow++) {
+                for (unsigned mt = 0; mt < m_tiles; mt++) {
+                    const unsigned m_off   = mt * kTileM;
+                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
                     if (!is_depthwise) {
                         compute_standard_conv_tile(
@@ -813,10 +979,10 @@ static void process_conv_kernel_tile(
                             stride_h, stride_w, dilation_h, dilation_w,
                             pad_top, pad_left);
                     }
-                } // ow loop
-            } // oh loop
-        } // batch loop
-    } // m_tile loop
+                } // m_tile loop
+            } // ow loop
+        } // oh loop
+    } // batch loop
 }
 
 void ConvKernel(
@@ -894,10 +1060,18 @@ void ConvKernel(
     // while the consumer is still in the previous iteration's compute.
     // -----------------------------------------------------------------------
     #pragma HLS DATAFLOW
-    unsigned rep_count = batch * out_h * out_w;
+    const unsigned rep_count        = batch * out_h * out_w;
+    const unsigned m_tiles          = (out_ch + kTileM - 1) / kTileM;
+    const unsigned input_per_iter   = (is_depthwise ? out_ch : in_ch) * kh * kw;
+    const unsigned broadcast_factor = is_depthwise ? 1u : m_tiles;
 
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
+
+    // patch_pipe carries each unique patch value once from the assembler;
+    // patch_stream carries the m_tiles× broadcast copy to the consumer.
+    hls::stream<Data_t> patch_pipe;
+    #pragma HLS STREAM variable=patch_pipe depth=kMaxInCh*kMaxKH*kMaxKW
 
     hls::stream<Data_t> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kTileIC
@@ -907,10 +1081,14 @@ void ConvKernel(
 
     bias_producer(bias, bias_stream,
                   out_ch, rep_count, has_bias);
-    input_patch_producer(x, patch_stream, batch, in_ch, in_h, in_w,
+
+    input_patch_producer(x, patch_pipe, batch, in_ch, in_h, in_w,
         out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
         dilation_w, pad_top, pad_left, is_depthwise
     );
+
+    broadcast_patches(patch_pipe, patch_stream,
+                      rep_count, input_per_iter, broadcast_factor);
 
     process_conv_kernel_tile(
         patch_stream, weight, bias_stream, acc_stream,

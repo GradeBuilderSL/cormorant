@@ -40,9 +40,44 @@ using AccData_t = @CONV_ACC_DATA_TYPE@;
 //          Models with kH > kMaxKH or kW > kMaxKW are rejected by the
 //          inference scheduler at validation time.
 // ---------------------------------------------------------------------------
-static constexpr unsigned kTileM  = @CONV_TILE_M@;
-static constexpr unsigned kTileIC = @CONV_TILE_IC@;
-static constexpr unsigned kMaxKH  = @CONV_MAX_KH@;
-static constexpr unsigned kMaxKW  = @CONV_MAX_KW@;
+static constexpr unsigned kTileM   = @CONV_TILE_M@;
+static constexpr unsigned kTileIC  = @CONV_TILE_IC@;
+static constexpr unsigned kMaxKH   = @CONV_MAX_KH@;
+static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 
-static constexpr unsigned kSeed   = 42;
+// ---------------------------------------------------------------------------
+// kMaxInCh / kMaxOutCh / kMaxInW / kMaxLineBufRows
+//
+// Compile-time upper bounds for the on-chip buffers introduced by the
+// optimisations in input_patch_producer_standard / bias_producer:
+//
+//   * patch_buf  — sized kMaxInCh * kMaxKH * kMaxKW.  Holds one full
+//                  (ni,oh,ow) patch which is broadcast m_tiles times into
+//                  patch_stream (mt-hoist optimisation).
+//   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
+//                  replayed in (r,mt,m1) order (mt-hoist optimisation).
+//   * line_buf   — sized kMaxInCh * kMaxLineBufRows * kMaxInW.  Per-channel
+//                  circular row buffer that caches the kh-row sliding
+//                  window so each input pixel is fetched from DDR exactly
+//                  once per (ni, channel) iteration (line-buffer
+//                  optimisation).
+//
+// Constraints (validated by the inference scheduler):
+//   in_ch    <= kMaxInCh
+//   out_ch   <= kMaxOutCh
+//   in_w     <= kMaxInW
+//   (kh-1)*dilation_h + 1 <= kMaxLineBufRows
+//
+// kMaxLineBufRows must be a power of 2 (bitmask is used in place of modulo).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxInCh        = @CONV_MAX_IN_CH@;
+static constexpr unsigned kMaxOutCh       = @CONV_MAX_OUT_CH@;
+static constexpr unsigned kMaxInW         = @CONV_MAX_IN_W@;
+static constexpr unsigned kMaxLineBufRows = @CONV_MAX_LINE_BUF_ROWS@;
+
+static_assert(
+    (kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0,
+    "kMaxLineBufRows must be a power of 2 (it is used as a bitmask)"
+);
+
+static constexpr unsigned kSeed    = 42;
