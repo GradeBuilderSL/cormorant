@@ -217,8 +217,13 @@ def main(argv=None):
     # ---------------------------------------------------------------- #
     runtime_src = os.path.join(os.path.dirname(__file__), "runtime")
     runtime_files = [
-        ("inference_prof.h", os.path.join("include", "inference_prof.h")),
-        ("inference_prof.c", os.path.join("src",     "inference_prof.c")),
+        ("inference_prof.h",         os.path.join("include", "inference_prof.h")),
+        ("inference_prof.c",         os.path.join("src",     "inference_prof.c")),
+        ("inference_ddr.h",          os.path.join("include", "inference_ddr.h")),
+        ("inference_ddr.c",          os.path.join("src",     "inference_ddr.c")),
+        ("inference_ddr_backend.h",  os.path.join("src",     "inference_ddr_backend.h")),
+        # DDR backends — one .c per platform under src/ddr/.
+        ("ddr/zuplus_apm.c",         os.path.join("src", "ddr", "zuplus_apm.c")),
     ]
     for src_name, rel_dst in runtime_files:
         sp = os.path.join(runtime_src, src_name)
@@ -307,9 +312,12 @@ def main(argv=None):
         "CMakeLists.txt",
         "include/inference.h",
         "include/inference_prof.h",
+        "include/inference_ddr.h",
         "src/inference.c",
         "src/inference_buf.c",
         "src/inference_prof.c",
+        "src/inference_ddr.c",
+        "src/ddr/",
         "test/test_inference.c",
         "scripts/check_inference_setup.sh",
         "driver/",
