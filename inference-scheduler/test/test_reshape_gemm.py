@@ -134,6 +134,98 @@ class TestGemmPreprocess(unittest.TestCase):
             OnnxGraph._preprocess_model(model)
         self.assertIn("transA=1", str(cm.exception))
 
+    def test_gemm_transB_constant_is_transposed_offline(self):
+        """transB=1 with a constant B → a "<B>_T" initializer is appended
+        whose data equals B^T, and the rewritten MatMul reads the new
+        initializer."""
+        # Use a non-square, non-symmetric W so the transpose is observable.
+        W = np.arange(8, dtype=np.float32).reshape(2, 4)   # [out=2, in=4]
+        init = nph.from_array(W, name="W")
+        node = oh.make_node(
+            "Gemm", inputs=["X", "W"], outputs=["Y"], transB=1,
+        )
+        graph = oh.make_graph(
+            [node], "transB",
+            inputs=[oh.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            outputs=[oh.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=[init],
+        )
+        model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+        model  = shape_inference.infer_shapes(model)
+        result = OnnxGraph._preprocess_model(model)
+
+        # 1. The rewritten graph contains exactly one MatMul, no Gemm.
+        ops = [n.op_type for n in result.graph.node]
+        self.assertEqual(ops, ["MatMul"])
+
+        # 2. A new "<B>_T" initializer was appended.
+        names = {init.name for init in result.graph.initializer}
+        self.assertIn("W_T", names)
+        self.assertIn("W", names)   # original is preserved for any other consumer
+
+        # 3. The transposed initializer is numerically W^T.
+        wt = next(init for init in result.graph.initializer if init.name == "W_T")
+        np.testing.assert_array_equal(nph.to_array(wt), W.T)
+
+        # 4. The MatMul reads the transposed copy, not the original.
+        matmul = next(n for n in result.graph.node if n.op_type == "MatMul")
+        self.assertEqual(list(matmul.input), ["X", "W_T"])
+
+    def test_gemm_transB_runtime_B_raises(self):
+        """transB=1 with a non-constant B is an error — we can't transpose
+        a runtime tensor offline."""
+        node = oh.make_node(
+            "Gemm", inputs=["X", "W"], outputs=["Y"], transB=1,
+        )
+        graph = oh.make_graph(
+            [node], "transB_runtime",
+            inputs=[
+                oh.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4]),
+                oh.make_tensor_value_info("W", TensorProto.FLOAT, [2, 4]),
+            ],
+            outputs=[oh.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            # No initializer — W is a runtime input.
+        )
+        model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+        model = shape_inference.infer_shapes(model)
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph._preprocess_model(model)
+        msg = str(cm.exception)
+        self.assertIn("transB=1", msg)
+        self.assertIn("constant initializer", msg)
+
+    def test_gemm_transB_invalid_value_raises(self):
+        """transB outside {0, 1} is rejected explicitly."""
+        model = self._make_gemm_model(with_bias=False, transB=2)
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph._preprocess_model(model)
+        self.assertIn("transB=2", str(cm.exception))
+
+    def test_gemm_transB_shared_B_reuses_transposed_initializer(self):
+        """Two Gemms that share the same B with transB=1 should produce
+        a single transposed initializer, not two."""
+        W = np.arange(8, dtype=np.float32).reshape(2, 4)
+        init = nph.from_array(W, name="W")
+        n1 = oh.make_node("Gemm", inputs=["X1", "W"], outputs=["Y1"], transB=1)
+        n2 = oh.make_node("Gemm", inputs=["X2", "W"], outputs=["Y2"], transB=1)
+        graph = oh.make_graph(
+            [n1, n2], "transB_shared",
+            inputs=[
+                oh.make_tensor_value_info("X1", TensorProto.FLOAT, [1, 4]),
+                oh.make_tensor_value_info("X2", TensorProto.FLOAT, [1, 4]),
+            ],
+            outputs=[
+                oh.make_tensor_value_info("Y1", TensorProto.FLOAT, [1, 2]),
+                oh.make_tensor_value_info("Y2", TensorProto.FLOAT, [1, 2]),
+            ],
+            initializer=[init],
+        )
+        model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
+        model  = shape_inference.infer_shapes(model)
+        result = OnnxGraph._preprocess_model(model)
+        wt_count = sum(1 for i in result.graph.initializer if i.name == "W_T")
+        self.assertEqual(wt_count, 1)
+
     def test_gemm_alpha_raises(self):
         model = self._make_gemm_model(with_bias=True, alpha=2.0)
         with self.assertRaises(SchedulerError) as cm:
@@ -865,3 +957,64 @@ class TestDropoutSimulate(unittest.TestCase):
         x_q = gen._dtype.quantize(-np.ones((1, 8), dtype=np.float64))
         y   = gen.simulate({"X": x_q})["Y"]
         np.testing.assert_array_equal(y, np.zeros((1, 8)))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Flatten — handled as a buffer alias (ReshapeNode)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestFlattenAsReshape(unittest.TestCase):
+    """Flatten with any axis is a pure shape reinterpretation (numel
+    preserved), so it dispatches to ReshapeNode and emits no kernel
+    call.  The two test methods cover the common cases:
+      axis=1 → [N, C, H, W] → [N, C*H*W]   (canonical "flatten for FC")
+      axis=0 → [d0, d1, …]  → [1, prod(dims)] (full flatten)
+    """
+
+    def _schedule_flatten(self, *, axis: int,
+                            in_shape: list, out_shape: list) -> OnnxGraph:
+        """Build an in-memory model with one Flatten node and schedule it."""
+        import tempfile
+        node = oh.make_node("Flatten", inputs=["X"], outputs=["Y"], axis=axis)
+        graph = oh.make_graph(
+            [node], "flatten_only",
+            inputs =[oh.make_tensor_value_info("X", TensorProto.FLOAT, in_shape)],
+            outputs=[oh.make_tensor_value_info("Y", TensorProto.FLOAT, out_shape)],
+        )
+        model = oh.make_model(graph,
+                               opset_imports=[oh.make_opsetid("", 13)],
+                               ir_version=7)
+        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
+            onnx.save(model, f.name)
+            path = f.name
+        try:
+            return OnnxGraph(path)
+        finally:
+            os.unlink(path)
+
+    def test_flatten_axis1_dispatches_to_reshape_node(self):
+        g = self._schedule_flatten(axis=1,
+                                   in_shape =[1, 4, 2, 2],
+                                   out_shape=[1, 16])
+        self.assertEqual(len(g.nodes), 1)
+        self.assertIs(g.nodes[0].__class__, ReshapeNode)
+        self.assertEqual(g.nodes[0].onnx_node.op_type, "Flatten")
+
+    def test_flatten_emits_no_kernel_call(self):
+        g  = self._schedule_flatten(axis=1,
+                                    in_shape =[1, 4, 2, 2],
+                                    out_shape=[1, 16])
+        self.assertEqual(g.nodes[0].emit_call({}), "")
+
+    def test_flatten_axis0_full_flatten(self):
+        g = self._schedule_flatten(axis=0,
+                                   in_shape =[2, 3, 4],
+                                   out_shape=[1, 24])
+        self.assertEqual(len(g.nodes), 1)
+        self.assertIs(g.nodes[0].__class__, ReshapeNode)
+
+    def test_flatten_in_supported_op_set(self):
+        """RESHAPE_OP_TYPES is the single source of truth — Flatten must
+        appear there (and the dispatch in graph.py reuses the frozenset)."""
+        from src.nodes import RESHAPE_OP_TYPES
+        self.assertIn("Flatten", RESHAPE_OP_TYPES)

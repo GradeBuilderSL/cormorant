@@ -107,7 +107,13 @@ _ONNX_OP_MAP = {
 
 # Public sets used by graph.py to build a comprehensive "supported ops" list.
 VECTOROP_OP_TYPES: frozenset = frozenset(_ONNX_OP_MAP)
-RESHAPE_OP_TYPES: frozenset = frozenset({"Reshape", "Squeeze", "Unsqueeze", "Dropout"})
+RESHAPE_OP_TYPES: frozenset = frozenset({
+    "Reshape",
+    "Squeeze",
+    "Unsqueeze",
+    "Dropout",
+    "Flatten",   # axis-N split is irrelevant for a buffer alias — same numel
+})
 
 # ------------------------------------------------------------------ #
 # Alignment constants                                                 #

@@ -84,8 +84,13 @@ class OnnxGraph:
         """
         Simplify the ONNX graph before scheduling:
 
-          1. Decompose Gemm (alpha=1, beta=1, transA=0, transB=0) into
-             MatMul + Add so existing MatmulNode / ScheduledNode handle it.
+          1. Decompose Gemm (alpha=1, beta=1, transA=0) into MatMul + Add
+             so existing MatmulNode / ScheduledNode handle it.  When
+             transB=1, the constant B initializer is transposed offline
+             and a new "<B>_T" initializer is appended so the rewritten
+             MatMul can read it as a row-major tensor (transB=0
+             semantics).  transB=1 with a non-constant B is rejected
+             — runtime transpose is not supported.
 
         Requires that shape inference has already been run on the model
         so that intermediate shapes are available for the new MatMul output.
@@ -125,16 +130,51 @@ class OnnxGraph:
                     f"Gemm node '{node.name}': alpha={alpha}, beta={beta}. "
                     f"Only alpha=1, beta=1 is supported."
                 )
-            if transA != 0 or transB != 0:
+            if transA != 0:
                 raise SchedulerError(
-                    f"Gemm node '{node.name}': transA={transA}, transB={transB}. "
-                    f"Only transA=0, transB=0 is supported."
+                    f"Gemm node '{node.name}': transA={transA}. "
+                    f"Only transA=0 is supported (A is a runtime tensor; "
+                    f"offline transpose is not feasible)."
+                )
+            if transB not in (0, 1):
+                raise SchedulerError(
+                    f"Gemm node '{node.name}': transB={transB}. "
+                    f"Must be 0 or 1."
                 )
 
             A = node.input[0]
             B = node.input[1]
             C = node.input[2] if len(node.input) >= 3 and node.input[2] else None
             Y = node.output[0]
+
+            # transB=1: transpose the constant B initializer offline so the
+            # rewritten MatMul reads it row-major.  We append a new
+            # "<B>_T" initializer rather than mutating B in place so any
+            # other consumer of the original tensor is left untouched.
+            if transB == 1:
+                b_init = next(
+                    (init for init in graph.initializer if init.name == B),
+                    None,
+                )
+                if b_init is None:
+                    raise SchedulerError(
+                        f"Gemm node '{node.name}': transB=1 requires B '{B}' "
+                        f"to be a constant initializer; runtime transpose is "
+                        f"not supported."
+                    )
+                arr = nph.to_array(b_init)
+                if arr.ndim != 2:
+                    raise SchedulerError(
+                        f"Gemm node '{node.name}': transB=1 with non-2D B "
+                        f"(shape={list(arr.shape)}) is not supported."
+                    )
+                new_B = f"{B}_T"
+                if not any(init.name == new_B for init in graph.initializer):
+                    graph.initializer.append(
+                        nph.from_array(arr.T.copy(), name=new_B)
+                    )
+                    shape_map[new_B] = list(arr.T.shape)
+                B = new_B
 
             gemm_counter[0] += 1
             n = gemm_counter[0]
@@ -285,7 +325,7 @@ class OnnxGraph:
                 sn = ConvNode.from_onnx_node(node, self._tensors, idx, align_elems)
             elif node.op_type in POOL_OP_TYPES:
                 sn = PoolNode.from_onnx_node(node, self._tensors, idx, align_elems)
-            elif node.op_type in ("Reshape", "Squeeze", "Unsqueeze", "Dropout"):
+            elif node.op_type in RESHAPE_OP_TYPES:
                 sn = ReshapeNode.from_onnx_node(node, self._tensors, idx, align_elems)
             else:
                 if node.op_type not in VECTOROP_OP_TYPES:
