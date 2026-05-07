@@ -624,6 +624,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 | `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
 | `demo/mnist/README.md` | End-to-end MNIST inference demo (download → generate → deploy → benchmark) |
 | `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
+| `doc/PROFILER.md` | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
 | `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
 | `doc/POOLING_KERNEL.md` | PoolingKernel architecture |
 | `doc/SIMULATION_ISSUES.md` | PS VIP simulation quirks and workarounds |
