@@ -65,17 +65,24 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
 //                  replayed in (r,mt,m1) order.
 //   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds
-//                  out_h*out_w*out_ch AccData_t accumulators that
-//                  survive across ic-tiles in the consumer; initialised
-//                  from bias once per ni and drained to acc_stream after
-//                  the ict loop.
+//                  group_size*out_h*out_w*out_ch AccData_t accumulators
+//                  that survive across the (ict, mt) outer loop within
+//                  one batch group, where
+//                    group_size = min(batch, kMaxAccPersistEntries
+//                                            / (out_h*out_w*out_ch))
+//                  When batch * out_h * out_w * out_ch fits the buffer
+//                  the kernel runs with num_groups=1 and each weight is
+//                  read from DDR exactly once.  Otherwise ni is split
+//                  into num_groups groups; weights are reread once per
+//                  group (the relaxation that lets large-batch cases
+//                  run at the cost of duplicate DDR weight reads).
 //
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh
 //   out_ch   <= kMaxOutCh
 //   in_w     <= kMaxInW
 //   (kh-1)*dilation_h + 1 <= kMaxLineBufRows
-//   out_h * out_w * out_ch <= kMaxAccPersistEntries
+//   out_h * out_w * out_ch <= kMaxAccPersistEntries  (one ni must fit)
 //
 // kMaxLineBufRows must be a power of 2 (bitmask is used in place of modulo).
 // ---------------------------------------------------------------------------

@@ -313,10 +313,15 @@ static void dump_test_data(const std::string&         dir,
 #endif
 }
 
+// Set expected_dup_reads > 0 for tests that deliberately exceed the
+// partial_outputs budget (batch * out_h * out_w * out_ch >
+// kMaxAccPersistEntries) — the kernel splits ni into groups and re-reads
+// weights once per group, so some duplicates are expected by design.
 static int run_test(const char* name, const ConvParams& p,
                     const std::vector<Data_t>& x_data,
                     const std::vector<Data_t>& w_data,
-                    const std::vector<Data_t>& b_data)
+                    const std::vector<Data_t>& b_data,
+                    unsigned expected_dup_reads = 0)
 {
     if (!g_dump_dir.empty()) {
         dump_test_data(g_dump_dir, g_test_idx++, name, p,
@@ -385,18 +390,25 @@ static int run_test(const char* name, const ConvParams& p,
         }
     }
 
-    const bool failed = (mismatches != 0) || (dup_reads != 0);
+    const unsigned unexpected_dups =
+        (dup_reads > expected_dup_reads) ? (dup_reads - expected_dup_reads) : 0u;
+    const bool failed = (mismatches != 0) || (unexpected_dups != 0);
     const char* status = failed ? "FAIL" : "PASS";
     printf("%-55s %s", name, status);
     if (mismatches > 0) printf("  (%d mismatches)", mismatches);
-    if (dup_reads > 0)  printf("  (%u duplicate DDR read(s))", dup_reads);
+    if (unexpected_dups > 0) {
+        printf("  (%u unexpected duplicate DDR read(s))", unexpected_dups);
+    } else if (dup_reads > 0) {
+        printf("  (%u expected duplicate DDR read(s) — group split)",
+               dup_reads);
+    }
     printf("  [%s batch=%u C=%u H=%u W=%u M=%u kH=%u kW=%u s=%u,%u d=%u,%u p=%u,%u out=%ux%u]\n",
            p.is_depthwise ? "DW" : "STD",
            p.batch, p.in_ch, p.in_h, p.in_w, p.out_ch,
            p.kh, p.kw, p.stride_h, p.stride_w,
            p.dilation_h, p.dilation_w, p.pad_top, p.pad_left,
            out_h, out_w);
-    return mismatches + (int)dup_reads;
+    return mismatches + (int)unexpected_dups;
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +791,31 @@ int main(int argc, char** argv)
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
         total_failures += run_test("batch=3, C=TILE_IC M=TILE_M stride=2 (ResNet-style)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 32: relaxation — batch >1 with batch*out_h*out_w*out_ch
+    // exceeding kMaxAccPersistEntries.  ohw*M = 12*12*64 = 9216 fits one ni
+    // (≤ 16384), but batch*ohw*M = 18432 > 16384 → group_size = 1,
+    // num_groups = 2.  Weights are reread once per group; the test
+    // tolerates exactly that many duplicate addresses (= total unique
+    // weight count = out_ch*in_ch*kh*kw = 64*8*9 = 4608) and verifies the
+    // result is still bit-exact against the oracle.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=2; p.in_ch=8; p.in_h=12; p.in_w=12; p.out_ch=64;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.1f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        const unsigned expected_dups = p.out_ch * p.in_ch * p.kh * p.kw;
+        total_failures += run_test(
+            "relaxation: batch=2 ohw*M>budget → 2 groups (weights reread)",
+            p, x, w, b, expected_dups);
     }
 
     // -----------------------------------------------------------------------
