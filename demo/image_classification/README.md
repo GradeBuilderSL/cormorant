@@ -1,0 +1,161 @@
+# Image classification KV260 demo
+
+End-to-end ImageNet classification demo for the KV260 FPGA platform using
+**MobileNetV1 1.0/224**.  Drop a few JPG/PNG files into `assets/images/`,
+run the orchestrator, and the demo will
+
+  1. download the ONNX model from a shared Google Drive folder,
+  2. fetch the ImageNet 1001-class label list,
+  3. preprocess each image to NCHW `ap_fixed<16,8>` on the host,
+  4. generate a self-contained KV260 inference project with
+     `inference-scheduler`,
+  5. build the project on the board over SSH,
+  6. run `classify_images`, which prints the top-5 predictions per image
+     and reports per-image latency.
+
+```mermaid
+flowchart LR
+    A["download_assets.py<br/>ONNX + labels<br/>+ preprocess images"]
+      --> B["generate_project.py<br/>schedule MobileNetV1<br/>+ bench_glue.h"]
+      --> C["deploy_and_run.py<br/>SSH upload, build,<br/>run classify_images"]
+```
+
+## Layout
+
+```
+demo/image_classification/
+├── README.md
+├── requirements.txt
+├── image_classification_config.json.example
+├── run_demo.py                             — one-shot orchestrator
+├── scripts/
+│   ├── download_assets.py                  — fetch ONNX + labels, preprocess images
+│   ├── generate_project.py                 — schedule the model into a CMake project
+│   └── deploy_and_run.py                   — upload, build, classify on KV260
+├── src/
+│   └── classify_images.c                   — board-side host (compiled on the board)
+├── assets/                                 — populated by you + download_assets.py
+│   ├── images/                             — drop JPG/PNG inputs here
+│   ├── labels/imagenet_1001_labels.txt     — derived from imagenet_class_index.json
+│   ├── models/                             — ONNX downloads
+│   └── preprocessed/                       — images.bin + manifest.txt
+└── build/
+    ├── projects/<model>/                   — generated CMake project per model
+    │   ├── driver/                         —   HLS driver sources copied in
+    │   └── test/
+    │       ├── classify_images.c           —   copied from demo/image_classification/src/
+    │       └── bench_glue.h                —   generated; per-model glue + macros
+    ├── logs/<model>.<step>.log             — per-step build/run output
+    └── results.json                        — final summary (top-5 + latency per image)
+```
+
+## Prerequisites
+
+### Host
+
+* Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx).
+* HLS-generated driver sources for the four kernels:
+
+  ```bash
+  # from the repo root
+  mkdir -p build && cd build
+  cmake -DAXI_BUS_WIDTH=128 ..
+  make synthesize_kv260
+  ```
+
+  Override `local.driver_dirs` if you keep the build tree elsewhere.
+
+### KV260 board
+
+* Linux with the cormorant overlay loaded (so `/dev/uio*` exposes
+  `fabric_vecop` / `fabric_matmul` / `fabric_conv` / `fabric_pool`).
+* `gcc`, `cmake ≥ 3.19`, `make`.
+* XRT runtime via `pkg-config xrt` or `/opt/xilinx/xrt`.
+* Passwordless `sudo` for the SSH user (XRT requires root for buffer allocation).
+
+## First-time setup
+
+```bash
+cd demo/image_classification
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+cp image_classification_config.json.example image_classification_config.json
+$EDITOR image_classification_config.json    # set ssh.host, key_file, etc.
+
+# Drop a few JPG/PNG files into assets/images/
+cp ~/Pictures/cat.jpg assets/images/
+cp ~/Pictures/dog.jpg assets/images/
+```
+
+## Run the demo
+
+```bash
+.venv/bin/python run_demo.py
+```
+
+Or step-by-step (lets you iterate without re-downloading):
+
+```bash
+.venv/bin/python scripts/download_assets.py
+.venv/bin/python scripts/generate_project.py
+.venv/bin/python scripts/deploy_and_run.py --verbose
+```
+
+Sample output:
+
+```
+  ── IMAGE CLASSIFICATION KV260 ──
+
+  cat.jpg                                   (212.4 ms)
+    1) [ 282] tabby                            prob= 78.41%  logit=  3120
+    2) [ 285] Egyptian_cat                     prob= 12.06%  logit=  2641
+    3) [ 283] tiger_cat                        prob=  4.97%  logit=  2413
+    4) [ 287] lynx                             prob=  1.21%  logit=  2052
+    5) [ 284] Persian_cat                      prob=  0.83%  logit=  1956
+  dog.jpg                                   (211.8 ms)
+    1) [ 208] golden_retriever                 prob= 64.30%  logit=  2987
+    ...
+
+  Model        Status   Images   mean(ms)   p50(ms)   p99(ms)        IPS
+  ─────────────────────────────────────────────────────────────────────────
+  mobilenet_v1  OK         12     211.6     211.5     213.0       4.7
+```
+
+The full per-image top-K table is also written to `build/results.json`.
+
+## Useful options
+
+| Flag | Effect |
+|------|--------|
+| `--skip-download` | reuse cached ONNX + preprocessed images |
+| `--skip-deploy` | only regenerate the local CMake project |
+| `--force-download` | re-fetch ONNX, labels, and rebuild `images.bin` |
+| `--check-only` | run preflight checks for every stage and exit |
+| `--profile-layers` | enable per-layer wall-clock profiling on the board |
+| `--no-cleanup` (deploy) | leave the remote work_dir for inspection |
+| `--verbose` | print full build / run output for failed steps |
+
+## Tuning the run
+
+Edit `image_classification_config.json`:
+
+* **`preprocess.normalize`** — `tf` for TF-style MobileNet inputs (`(p/127.5)-1`),
+  `unit` for Keras-style (`p/255`), `none` for raw bytes (`p/256`).  TF is the
+  default and matches the published MobileNetV1 weights.
+* **`run.top_k`** — how many predictions to print per image.
+* **`run.warmup`** — inferences run before timing starts.
+
+## Troubleshooting
+
+* **`assets/images/` is empty** — drop at least one JPG/PNG into that
+  folder before running `download_assets.py`.
+* **`gdown failed`** — Google Drive sometimes throttles.  Run
+  `python3 -m gdown --folder <url> -O assets/models/` manually, or download
+  the `.onnx` file via a browser and place it in `assets/models/`.
+* **`Driver file not found: driver/xconvkernel.h`** during cmake — the HLS
+  driver sources weren't on this host.  Run `make synthesize_kv260` from
+  the repo root, or point `local.driver_dirs` at an existing build output.
+* **All images classified as "background"** — the input encoding is wrong.
+  Set `preprocess.normalize` to `tf` (most likely) and re-run the download
+  stage with `--force` to rebuild `images.bin`.

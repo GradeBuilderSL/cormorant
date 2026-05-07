@@ -1,0 +1,6 @@
+gdown>=5.1.0
+numpy>=1.24
+onnx>=1.16
+onnxsim>=0.4
+paramiko>=3.4
+Pillow>=10.0

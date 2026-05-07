@@ -1,0 +1,87 @@
+{
+  "_comment": "Copy to image_classification_config.json and edit. Paths are relative to demo/image_classification/.",
+
+  "ssh": {
+    "host": "kv260.local",
+    "user": "root",
+    "port": 22,
+
+    "key_file": "~/.ssh/id_rsa",
+    "_key_file_note": "Path to SSH private key; null for password auth.",
+
+    "password": null,
+    "connect_timeout": 15
+  },
+
+  "remote": {
+    "work_dir": "/tmp/image_classification_demo",
+    "_work_dir_note": "Per-run scratch directory on the board. Created if missing.",
+
+    "uio_devices": {
+      "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel":   "fabric_matmul",
+      "ConvKernel":     "fabric_conv",
+      "PoolKernel":     "fabric_pool"
+    },
+    "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name",
+
+    "cmake_args": []
+  },
+
+  "local": {
+    "driver_dirs": {
+      "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/solution1/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/solution1/impl/ip/drivers/ConvKernel_v1_0/src",
+      "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/solution1/impl/ip/drivers/PoolingKernel_v1_0/src"
+    },
+    "_driver_dirs_note": "Per-kernel HLS-generated driver sources, copied into the project before upload."
+  },
+
+  "build": {
+    "jobs": 4,
+    "timeout": 600
+  },
+
+  "run": {
+    "timeout": 900,
+    "use_sudo": true,
+    "warmup": 1,
+    "top_k": 5,
+    "_top_k_note": "Number of top predictions to print per image.",
+    "profile_layers": false,
+
+    "env": {
+      "_comment": "Per-run environment variables forwarded to classify_images on the board."
+    }
+  },
+
+  "preprocess": {
+    "input_size": 224,
+    "_input_size_note": "Square edge length the input is resized to. MobileNetV1 1.0 expects 224.",
+    "normalize":  "tf",
+    "_normalize_note": "'tf' = (pixel/127.5) - 1.0 (TF MobileNet); 'unit' = pixel/255 (Keras-style); 'none' = pixel/256 (raw bytes).",
+    "resize":     "bilinear",
+    "_resize_note": "PIL resampling mode: 'bilinear', 'bicubic', 'lanczos', 'nearest'."
+  },
+
+  "models": [
+    {
+      "name": "mobilenet_v1",
+      "drive_filename": "mobilenet_v1_1.0_224_no_softmax.onnx",
+      "_drive_filename_note": "File name inside the Google Drive folder. The Softmax tail is already stripped in this variant; argmax over the 1001 logits is identical."
+    }
+  ],
+
+  "drive": {
+    "folder_url": "https://drive.google.com/drive/folders/1sPOCW7-wAs8nOWQwPh7UGjnrWKPkAmiF",
+    "_folder_url_note": "Google Drive folder containing the ONNX models. Downloaded with `gdown --folder`."
+  },
+
+  "labels": {
+    "url": "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json",
+    "_url_note": "Standard ImageNet 1000-class index. Class 0 (background) is prepended locally to match MobileNetV1's 1001-class output."
+  },
+
+  "cleanup": true
+}
