@@ -46,34 +46,44 @@ static constexpr unsigned kMaxKH   = @CONV_MAX_KH@;
 static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 
 // ---------------------------------------------------------------------------
-// kMaxInCh / kMaxOutCh / kMaxInW / kMaxLineBufRows
+// kMaxInCh / kMaxOutCh / kMaxInW / kMaxLineBufRows / kMaxAccPersistEntries
 //
-// Compile-time upper bounds for the on-chip buffers introduced by the
-// optimisations in input_patch_producer_standard / bias_producer:
+// Compile-time upper bounds for the on-chip buffers in the standard-conv
+// path.  The Option-A IC-tiling design shrinks the per-channel buffers
+// (line_buf, broadcast local_buf, w_buf) from kMaxInCh to kTileIC channels
+// at the cost of keeping a persistent partial-output buffer of
+// kMaxAccPersistEntries elements that survives across ic-tiles.
 //
-//   * patch_buf  — sized kMaxInCh * kMaxKH * kMaxKW.  Holds one full
-//                  (ni,oh,ow) patch which is broadcast m_tiles times into
-//                  patch_stream (mt-hoist optimisation).
-//   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
-//                  replayed in (r,mt,m1) order (mt-hoist optimisation).
-//   * line_buf   — sized kMaxInCh * kMaxLineBufRows * kMaxInW.  Per-channel
+//   * line_buf   — sized kTileIC * kMaxLineBufRows * kMaxInW.  Per-channel
 //                  circular row buffer that caches the kh-row sliding
-//                  window so each input pixel is fetched from DDR exactly
-//                  once per (ni, channel) iteration (line-buffer
-//                  optimisation).
+//                  window for the CURRENT ic-tile.  Each input pixel is
+//                  still fetched from DDR exactly once per (ni, channel)
+//                  because the producer's ict loop is OUTER of oh, so
+//                  rows persist across oh iterations within the same
+//                  ic-tile (line_buf is overwritten only when ict
+//                  advances).
+//   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
+//                  replayed in (r,mt,m1) order.
+//   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds
+//                  out_h*out_w*out_ch AccData_t accumulators that
+//                  survive across ic-tiles in the consumer; initialised
+//                  from bias once per ni and drained to acc_stream after
+//                  the ict loop.
 //
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh
 //   out_ch   <= kMaxOutCh
 //   in_w     <= kMaxInW
 //   (kh-1)*dilation_h + 1 <= kMaxLineBufRows
+//   out_h * out_w * out_ch <= kMaxAccPersistEntries
 //
 // kMaxLineBufRows must be a power of 2 (bitmask is used in place of modulo).
 // ---------------------------------------------------------------------------
-static constexpr unsigned kMaxInCh        = @CONV_MAX_IN_CH@;
-static constexpr unsigned kMaxOutCh       = @CONV_MAX_OUT_CH@;
-static constexpr unsigned kMaxInW         = @CONV_MAX_IN_W@;
-static constexpr unsigned kMaxLineBufRows = @CONV_MAX_LINE_BUF_ROWS@;
+static constexpr unsigned kMaxInCh             = @CONV_MAX_IN_CH@;
+static constexpr unsigned kMaxOutCh            = @CONV_MAX_OUT_CH@;
+static constexpr unsigned kMaxInW              = @CONV_MAX_IN_W@;
+static constexpr unsigned kMaxLineBufRows      = @CONV_MAX_LINE_BUF_ROWS@;
+static constexpr unsigned kMaxAccPersistEntries = @CONV_MAX_ACC_PERSIST_ENTRIES@;
 
 static_assert(
     (kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0,
