@@ -60,10 +60,29 @@
 #include "hls_stream.h"
 
 #include "ConvKernel.h"
+#include "ConvKernelDebug.h"
 
 #ifndef __SYNTHESIS__
 #define DEBUG_LOAD_DATA_CACHING
 #endif
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+static unsigned g_conv_debug_duplicate_reads = 0;
+#endif
+
+void conv_debug_reset_duplicate_reads() {
+#ifdef DEBUG_LOAD_DATA_CACHING
+    g_conv_debug_duplicate_reads = 0;
+#endif
+}
+
+unsigned conv_debug_duplicate_read_count() {
+#ifdef DEBUG_LOAD_DATA_CACHING
+    return g_conv_debug_duplicate_reads;
+#else
+    return 0;
+#endif
+}
 
 #ifdef DEBUG_LOAD_DATA_CACHING
 #include <map>
@@ -96,47 +115,13 @@ inline std::ostream& operator<<(std::ostream& os, const CycleCounters& c) {
 
 typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
 
+// Weight DDR reads are tracked across one ConvKernel invocation by the
+// weight_producer; the file-scope map is reset on entry and dumped on exit
+// (after duplicates increment g_conv_debug_duplicate_reads).  ConvKernel
+// runs serially so a single static is safe.
+static AddressMap_t g_weight_read_addresses;
+
 #endif /* DEBUG_LOAD_DATA_CACHING */
-
-// ---------------------------------------------------------------------------
-// Standard: load weight tile for (m_tile, ic_tile).
-//
-// Weight layout: [out_ch][in_ch][kh][kw].  Per lane offset:
-//   (m_off+m1)*in_ch*kh*kw + ic_off*kh*kw
-// w_buf is the local 4-D buffer owned by the standard tile compute.
-// ---------------------------------------------------------------------------
-static void load_standard_weights(
-    const Data_t* weight,
-    Data_t        w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
-    unsigned      m_off,
-    unsigned      m_valid,
-    unsigned      ic_off,
-    unsigned      ic_valid,
-    unsigned      in_ch,
-    unsigned      kh,
-    unsigned      kw
-) {
-    #pragma HLS INLINE
-
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        const Data_t* w_ptr = weight
-            + (m_off + m1) * in_ch * kh * kw
-            + ic_off * kh * kw;
-        unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
-        const unsigned wt_len = ic_valid * kh * kw;
-        for (unsigned r = 0; r < wt_len; r++) {
-            #pragma HLS PIPELINE II=1
-            w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
-            if (++kwi_l == kw) {
-                kwi_l = 0;
-                if (++khi_l == kh) {
-                    khi_l = 0;
-                    ++ic_l;
-                }
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM.
@@ -171,36 +156,6 @@ static void accumulate_standard(
                     khi_cnt = 0;
                     ++ic_cnt;
                 }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Depthwise: load per-lane weight slices.
-//
-// Weight layout: [out_ch][1][kh][kw].  Offset for lane m: (m_off+m1)*kh*kw.
-// w_buf is the local 3-D buffer owned by the depthwise tile compute.
-// ---------------------------------------------------------------------------
-static void load_depthwise_weights(
-    const Data_t* weight,
-    Data_t        w_buf[kTileM][kMaxKH][kMaxKW],
-    unsigned      m_off,
-    unsigned      m_valid,
-    unsigned      kh,
-    unsigned      kw
-) {
-    #pragma HLS INLINE
-
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
-        unsigned khi_l = 0, kwi_l = 0;
-        for (unsigned r = 0; r < kh * kw; r++) {
-            #pragma HLS PIPELINE II=1
-            w_buf[m1][khi_l][kwi_l] = w_ptr[r];
-            if (++kwi_l == kw) {
-                kwi_l = 0;
-                ++khi_l;
             }
         }
     }
@@ -475,6 +430,7 @@ static void input_patch_producer_standard(
 #ifdef DEBUG_LOAD_DATA_CACHING
     for (auto it : read_addresses) {
         if (it.second.size() > 1) {
+            ++g_conv_debug_duplicate_reads;
             std::cout << it.first << " --> " << std::endl;
 
             for (auto l_item : it.second) {
@@ -665,6 +621,7 @@ static void input_patch_producer_depthwise(
 #ifdef DEBUG_LOAD_DATA_CACHING
     for (auto it : read_addresses) {
         if (it.second.size() > 1) {
+            ++g_conv_debug_duplicate_reads;
             std::cout << it.first << " --> " << std::endl;
 
             for (auto l_item : it.second) {
@@ -711,6 +668,206 @@ static void input_patch_producer(
 }
 
 // ---------------------------------------------------------------------------
+// Weight DDR ASSEMBLER (DATAFLOW source) — standard path.
+//
+// Iterates (ni, ict, mt) and emits one zero-padded weight tile of
+// kTileM * kTileIC * kh * kw values into weight_pipe per outer iteration.
+// Each weight DDR address is read exactly ONCE per (ni, ict): when the
+// producer's mt loop finishes for a given (ni, ict), every weight in that
+// ic-slab has been read once.  The downstream broadcaster caches the slab
+// and replays it out_h*out_w times in (oh, ow, mt) order, eliminating the
+// (oh, ow) re-read present in the previous in-place load_standard_weights
+// design.
+//
+// Lanes m1 >= m_valid and ic_l >= ic_valid are zero-padded so the
+// broadcaster operates with a compile-time-fixed input_per_iter
+// (= kTileM * kTileIC * kh * kw); the consumer's accumulate uses
+// (m_valid, ic_valid) bounds and ignores the padding.
+// ---------------------------------------------------------------------------
+static void weight_producer_standard(
+    const Data_t*        weight,
+    hls::stream<Data_t>& weight_pipe,
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             out_ch,
+    unsigned             kh,
+    unsigned             kw
+) {
+    const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
+    const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned ict = 0; ict < ic_tiles; ict++) {
+            const unsigned ic_off   = ict * kTileIC;
+            const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+
+            for (unsigned mt = 0; mt < m_tiles; mt++) {
+                const unsigned m_off   = mt * kTileM;
+                const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    const bool m_ok = (m1 < m_valid);
+                    for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                        const bool ic_ok = (ic_l < ic_valid);
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const size_t addr =
+                                    (m_off + m1) * in_ch * kh * kw
+                                  + (ic_off + ic_l) * kh * kw
+                                  + khi * kw + kwi;
+                                const bool valid_lane = m_ok && ic_ok;
+                                weight_pipe.write(valid_lane
+                                    ? weight[addr]
+                                    : Data_t(0));
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+                                if (valid_lane) {
+                                    CycleCounters c;
+                                    c.mt   = mt;
+                                    c.ni   = ni;
+                                    c.oh   = 0;
+                                    c.ow   = 0;
+                                    c.ict  = ict;
+                                    c.ic_l = ic_l;
+                                    c.khi  = khi;
+                                    c.kwi  = kwi;
+                                    g_weight_read_addresses[addr]
+                                        .push_back(c);
+                                }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Weight DDR ASSEMBLER (DATAFLOW source) — depthwise path.
+//
+// Iterates (ni, mt) and emits one kTileM * kh * kw zero-padded tile per
+// outer iteration.  Each weight DDR address is read exactly ONCE per ni —
+// no (oh, ow) re-read.  The broadcaster forwards each tile passthrough
+// (replay_iters=1); the consumer caches it locally for the (oh, ow) sweep.
+// Lanes m1 >= m_valid are zero-padded.
+// ---------------------------------------------------------------------------
+static void weight_producer_depthwise(
+    const Data_t*        weight,
+    hls::stream<Data_t>& weight_pipe,
+    unsigned             batch,
+    unsigned             out_ch,
+    unsigned             kh,
+    unsigned             kw
+) {
+    const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned mt = 0; mt < m_tiles; mt++) {
+            const unsigned m_off   = mt * kTileM;
+            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                const bool m_ok = (m1 < m_valid);
+                for (unsigned khi = 0; khi < kh; khi++) {
+                    for (unsigned kwi = 0; kwi < kw; kwi++) {
+                        #pragma HLS PIPELINE II=1
+                        const size_t addr = (m_off + m1) * kh * kw
+                                          + khi * kw + kwi;
+                        weight_pipe.write(m_ok ? weight[addr] : Data_t(0));
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+                        if (m_ok) {
+                            CycleCounters c;
+                            c.mt   = mt;
+                            c.ni   = ni;
+                            c.oh   = 0;
+                            c.ow   = 0;
+                            c.ict  = 0;
+                            c.ic_l = m1;
+                            c.khi  = khi;
+                            c.kwi  = kwi;
+                            g_weight_read_addresses[addr].push_back(c);
+                        }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void weight_producer(
+    const Data_t*        weight,
+    hls::stream<Data_t>& weight_pipe,
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             out_ch,
+    unsigned             kh,
+    unsigned             kw,
+    unsigned             is_depthwise
+) {
+    if (!is_depthwise) {
+        weight_producer_standard(weight, weight_pipe,
+                                 batch, in_ch, out_ch, kh, kw);
+    } else {
+        weight_producer_depthwise(weight, weight_pipe,
+                                  batch, out_ch, kh, kw);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// broadcast_weights — DATAFLOW stage between weight_producer and
+// process_conv_kernel_tile.
+//
+// Per outer iteration (standard: one (ni, ict); depthwise: one (ni, mt)):
+//   Phase 1: drain `cache_len` values from weight_pipe into local cache,
+//            simultaneously emitting the first replay copy to weight_stream
+//            (II=1, mirrors broadcast_patches' read-and-forward trick).
+//   Phase 2: emit `replay_iters - 1` more copies of the cache.
+//
+// Standard (replay_iters = out_h * out_w, cache_len = m_tiles * kTileM *
+// kTileIC * kh * kw): every weight in the (ni, ict) slab is read from DDR
+// once and reused across all (oh, ow, mt) consumer iterations.
+//
+// Depthwise (replay_iters = 1, cache_len = kTileM * kh * kw): the cache is
+// effectively passthrough — the consumer holds the tile in its own w_buf
+// for the full (oh, ow) sweep.
+//
+// Memory: cache size <= kMaxWeightCacheEntries (validated by scheduler).
+// ---------------------------------------------------------------------------
+static void broadcast_weights(
+    hls::stream<Data_t>& weight_pipe,
+    hls::stream<Data_t>& weight_stream,
+    unsigned             outer_iters,
+    unsigned             cache_len,
+    unsigned             replay_iters
+) {
+    Data_t cache[kMaxWeightCacheEntries];
+
+    for (unsigned o = 0; o < outer_iters; o++) {
+        for (unsigned i = 0; i < cache_len; i++) {
+            #pragma HLS PIPELINE II=1
+            const Data_t v = weight_pipe.read();
+            cache[i] = v;
+            weight_stream.write(v);
+        }
+
+        const unsigned subsequent = (replay_iters > 0
+                                     ? replay_iters - 1
+                                     : 0) * cache_len;
+        unsigned i = 0;
+        for (unsigned k = 0; k < subsequent; k++) {
+            #pragma HLS PIPELINE II=1
+            weight_stream.write(cache[i]);
+            i = (i + 1 == cache_len) ? 0u : i + 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // process_conv_kernel_tile — DATAFLOW consumer.
 //
 // Both paths share a persistent partial-output accumulator that survives
@@ -721,25 +878,26 @@ static void input_patch_producer(
 //                      partial_outputs[] (BRAM-resident).
 //     Phase 2 (accum): standard   — for ict OUTER, (oh, ow, mt) inner;
 //                                   load patch[kTileIC][kh][kw],
-//                                   weight[kTileM][kTileIC][kh][kw],
+//                                   read kTileM*kTileIC*kh*kw weight values
+//                                   from weight_stream into w_buf,
 //                                   reduce ic_valid*kh*kw*kTileM at II=1.
 //                      depthwise  — for mt OUTER, (oh, ow) inner;
-//                                   load patch[kTileM][kh][kw],
-//                                   load w_buf[kTileM][kh][kw] ONCE per mt,
+//                                   read kTileM*kh*kw weight values from
+//                                   weight_stream into w_buf ONCE per mt,
 //                                   reduce kh*kw*kTileM at II=1.
 //     Phase 3 (drain): push partial_outputs to acc_stream in
 //                      (oh, ow, mt, m1) order.
 //
-//   Both producers read each x pixel from DDR exactly once per (ni, c):
-//   the standard producer's line_buf is retained across oh within a
-//   single ic-tile; the depthwise producer's line_buf is retained
-//   across oh within a single mt-tile.
+//   Both input producers read each x pixel from DDR exactly once per
+//   (ni, c).  The weight producer reads each weight from DDR exactly once
+//   per (ni, ict) [standard] or per ni [depthwise]; the broadcaster
+//   replays the cache to satisfy the consumer's (oh, ow, mt) iteration.
 //
 // Memory constraint: out_h*out_w*out_ch <= kMaxAccPersistEntries.
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<Data_t>&    patch_stream,
-    const Data_t*           weight,
+    hls::stream<Data_t>&    weight_stream,
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
     unsigned                batch,
@@ -813,10 +971,21 @@ static void process_conv_kernel_tile(
                                 }
                             }
 
-                            load_standard_weights(weight, w_buf,
-                                                  m_off, m_valid,
-                                                  ic_off, ic_valid,
-                                                  in_ch, kh, kw);
+                            // Read kTileM*kTileIC*kh*kw weight values from
+                            // weight_stream into w_buf.  The producer/
+                            // broadcaster zero-pad lanes m1>=m_valid and
+                            // ic_l>=ic_valid; accumulate ignores them.
+                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                                    for (unsigned khi = 0; khi < kh; khi++) {
+                                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                            #pragma HLS PIPELINE II=1
+                                            w_buf[m1][ic_l][khi][kwi]
+                                                = weight_stream.read();
+                                        }
+                                    }
+                                }
+                            }
 
                             const unsigned idx_base = (oh * out_w + ow) * out_ch
                                                       + m_off;
@@ -846,10 +1015,20 @@ static void process_conv_kernel_tile(
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-                // Load weights ONCE per mt (held in BRAM across the
-                // entire (oh, ow) sweep below).
+                // Drain kTileM*kh*kw weight values from weight_stream into
+                // w_buf ONCE per mt — the broadcaster delivers each tile in
+                // passthrough mode (replay_iters=1) and the consumer holds
+                // it in BRAM across the (oh, ow) sweep.  Lanes m1>=m_valid
+                // are zero-padded by the producer; accumulate ignores them.
                 Data_t w_buf[kTileM][kMaxKH][kMaxKW];
-                load_depthwise_weights(weight, w_buf, m_off, m_valid, kh, kw);
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    for (unsigned khi = 0; khi < kh; khi++) {
+                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                            #pragma HLS PIPELINE II=1
+                            w_buf[m1][khi][kwi] = weight_stream.read();
+                        }
+                    }
+                }
 
                 for (unsigned oh = 0; oh < out_h; oh++) {
                     for (unsigned ow = 0; ow < out_w; ow++) {
@@ -910,6 +1089,25 @@ static void process_conv_kernel_tile(
         }
     } // ni
 }
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+// C-sim-only: scan g_weight_read_addresses for any DDR weight address
+// touched more than once, increment the global duplicate counter, and
+// print the offending addresses with their access-context list.  Called
+// from ConvKernel after the dataflow region completes.
+static void dump_weight_duplicates() {
+    for (auto it : g_weight_read_addresses) {
+        if (it.second.size() > 1) {
+            ++g_conv_debug_duplicate_reads;
+            std::cout << "[weight] " << it.first << " --> " << std::endl;
+            for (auto l_item : it.second) {
+                std::cout << "\t" << l_item << std::endl;
+            }
+        }
+    }
+    g_weight_read_addresses.clear();
+}
+#endif /* DEBUG_LOAD_DATA_CACHING */
 
 void ConvKernel(
     const Data_t* x,
@@ -1001,6 +1199,22 @@ void ConvKernel(
         : (batch * ic_tiles * out_h * out_w);
     const unsigned broadcast_factor = is_depthwise ? 1u : m_tiles;
 
+    // Weight pipeline parameters (mirror of the input pipeline):
+    //   Standard:  outer = (ni, ict);  cache_len = m_tiles*kTileM*kTileIC*kh*kw
+    //              replay = out_h*out_w  (each (ni,ict) slab replayed across
+    //              all spatial positions; mt cycles inside the cache).
+    //   Depthwise: outer = (ni, mt);   cache_len = kTileM*kh*kw
+    //              replay = 1           (passthrough; consumer holds tile in
+    //              w_buf for the (oh, ow) sweep).
+    const unsigned weight_outer_iters =
+        is_depthwise ? (batch * m_tiles) : (batch * ic_tiles);
+    const unsigned weight_cache_len =
+        is_depthwise
+            ? (kTileM * kh * kw)
+            : (m_tiles * kTileM * kTileIC * kh * kw);
+    const unsigned weight_replay_iters =
+        is_depthwise ? 1u : (out_h * out_w);
+
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
@@ -1013,6 +1227,15 @@ void ConvKernel(
 
     hls::stream<Data_t> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kTileIC
+
+    // weight_pipe: each unique weight tile from DDR (one per (ni, ict, mt)
+    // standard or per (ni, mt) depthwise).  Sized for one full slab so the
+    // broadcaster can drain it under DATAFLOW.
+    hls::stream<Data_t> weight_pipe;
+    #pragma HLS STREAM variable=weight_pipe depth=kTileM*kTileIC*kMaxKH*kMaxKW
+
+    hls::stream<Data_t> weight_stream;
+    #pragma HLS STREAM variable=weight_stream depth=kTileM
 
     hls::stream<AccData_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
@@ -1028,11 +1251,26 @@ void ConvKernel(
     broadcast_patches(patch_pipe, patch_stream,
                       broadcast_iters, input_per_iter, broadcast_factor);
 
+#ifdef DEBUG_LOAD_DATA_CACHING
+    g_weight_read_addresses.clear();
+#endif
+
+    weight_producer(weight, weight_pipe,
+                    batch, in_ch, out_ch, kh, kw, is_depthwise);
+
+    broadcast_weights(weight_pipe, weight_stream,
+                      weight_outer_iters, weight_cache_len,
+                      weight_replay_iters);
+
     process_conv_kernel_tile(
-        patch_stream, weight, bias_stream, acc_stream,
+        patch_stream, weight_stream, bias_stream, acc_stream,
         batch, in_ch, in_h, in_w, out_ch, out_h, out_w,
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise);
 
     write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch);
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    dump_weight_duplicates();
+#endif
 }

@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "ConvKernel.h"
+#include "ConvKernelDebug.h"
 
 // ---------------------------------------------------------------------------
 // --dump-data <dir> mode: instead of running ConvKernel and comparing, dump
@@ -356,6 +357,8 @@ static int run_test(const char* name, const ConvParams& p,
                  p.has_bias ? 1u : 0u);
     }
 
+    conv_debug_reset_duplicate_reads();
+
     ConvKernel(x_data.data(), w_data.data(),
                b_data.data(),  // always a valid pointer (kernel guards by has_bias)
                y_got.data(),
@@ -367,6 +370,8 @@ static int run_test(const char* name, const ConvParams& p,
                p.pad_top, p.pad_left,
                p.has_bias ? 1u : 0u,
                p.is_depthwise ? 1u : 0u);
+
+    const unsigned dup_reads = conv_debug_duplicate_read_count();
 
     int mismatches = 0;
     for (unsigned i = 0; i < y_size; i++) {
@@ -380,16 +385,18 @@ static int run_test(const char* name, const ConvParams& p,
         }
     }
 
-    const char* status = (mismatches == 0) ? "PASS" : "FAIL";
+    const bool failed = (mismatches != 0) || (dup_reads != 0);
+    const char* status = failed ? "FAIL" : "PASS";
     printf("%-55s %s", name, status);
     if (mismatches > 0) printf("  (%d mismatches)", mismatches);
+    if (dup_reads > 0)  printf("  (%u duplicate DDR read(s))", dup_reads);
     printf("  [%s batch=%u C=%u H=%u W=%u M=%u kH=%u kW=%u s=%u,%u d=%u,%u p=%u,%u out=%ux%u]\n",
            p.is_depthwise ? "DW" : "STD",
            p.batch, p.in_ch, p.in_h, p.in_w, p.out_ch,
            p.kh, p.kw, p.stride_h, p.stride_w,
            p.dilation_h, p.dilation_w, p.pad_top, p.pad_left,
            out_h, out_w);
-    return mismatches;
+    return mismatches + (int)dup_reads;
 }
 
 // ---------------------------------------------------------------------------

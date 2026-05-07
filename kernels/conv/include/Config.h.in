@@ -85,6 +85,20 @@ static constexpr unsigned kMaxInW              = @CONV_MAX_IN_W@;
 static constexpr unsigned kMaxLineBufRows      = @CONV_MAX_LINE_BUF_ROWS@;
 static constexpr unsigned kMaxAccPersistEntries = @CONV_MAX_ACC_PERSIST_ENTRIES@;
 
+// ---------------------------------------------------------------------------
+// kMaxWeightCacheEntries — flat upper bound on the broadcaster's weight
+// cache.  The standard-conv broadcaster holds m_tiles tiles for the current
+// (ni, ict) and replays them out_h*out_w× in (oh, ow, mt) order so each
+// weight is read from DDR once per (ni, ict) instead of once per
+// (ni, ict, oh, ow).
+//
+// Constraints (validated by the inference scheduler):
+//   Standard:  m_tiles * kTileM * kTileIC * kh * kw <= kMaxWeightCacheEntries
+//              i.e.  out_ch * kTileIC * kh * kw <= kMaxWeightCacheEntries
+//   Depthwise: kTileM * kh * kw <= kMaxWeightCacheEntries  (always small)
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxWeightCacheEntries = @CONV_MAX_WEIGHT_CACHE_ENTRIES@;
+
 static_assert(
     (kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0,
     "kMaxLineBufRows must be a power of 2 (it is used as a bitmask)"

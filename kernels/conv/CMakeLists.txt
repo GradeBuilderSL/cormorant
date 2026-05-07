@@ -64,6 +64,8 @@ set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
     "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
 set(CONV_MAX_ACC_PERSIST_ENTRIES 16384 CACHE STRING
     "Compile-time bound on out_h*out_w*out_ch for the partial-output accumulator. Caps the on-chip buffer that survives across ic-tiles (Option-A tiling).")
+set(CONV_MAX_WEIGHT_CACHE_ENTRIES 16384 CACHE STRING
+    "Compile-time bound on out_ch*kTileIC*kh*kw for the weight broadcaster cache (standard conv) and out_ch*kh*kw (depthwise). Each (ni,ict) loads its m_tiles weight tiles into this cache once, then they are replayed out_h*out_w times in (oh,ow,mt) order — eliminating the (oh,ow) DDR re-read.")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
