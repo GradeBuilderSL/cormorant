@@ -66,6 +66,48 @@
 #define DEBUG_LOAD_DATA_CACHING
 #endif
 
+// ---------------------------------------------------------------------------
+// Bit-precise types for inner-loop counters.  HLS would otherwise infer
+// 32-bit adders/comparators for `unsigned`/`int` counters, putting paths
+// like `load → add(32) → icmp(32) → select → store` over the 2.4 ns budget
+// at 300 MHz.  Narrowing each counter to the minimum width that covers
+// (max value) + 1 (the post-increment exit value) drops each op below
+// 0.5 ns and closes timing without changing semantics.
+//
+// Width derivations (loop `for (T x = 0; x < BOUND; x++)` needs T to hold
+// BOUND, not just BOUND-1, since x is incremented to BOUND for the exit
+// compare):
+//   kwi/khi      bound ≤ kMaxKW/kMaxKH = 7        → ap_uint<3>  (holds 0..7)
+//   ic_l/ic_cnt  bound = kTileIC = 16             → ap_uint<5>  (holds 0..31)
+//   m1           bound = kTileM = 8               → ap_uint<4>  (holds 0..15)
+//   slot         bound = kMaxLineBufRows = 16     → ap_uint<5>
+//   iw_load      bound ≤ kMaxInW = 64             → ap_uint<7>  (holds 0..127)
+//   wrap_i       bound ≤ kMaxWeightCacheEntries   → ap_uint<15> (holds 0..32767)
+//   iw (signed)  ≈ -pad..in_w + (kw-1)*dilation_w → ap_int<11>
+//   ih (signed)  ≈ -pad..in_h + (kh-1)*dilation_h → ap_int<16>
+//
+// The typedefs fall back to plain integers in the float-only build (no
+// ap_fixed/ap_int available); the narrow types matter only for synthesis.
+#ifdef CONV_HAVE_APFIXED
+using KIdx_t       = ap_uint<3>;
+using ICTileIdx_t  = ap_uint<5>;
+using MTileIdx_t   = ap_uint<4>;
+using SlotIdx_t    = ap_uint<5>;
+using IwLoadIdx_t  = ap_uint<7>;
+using WrapIdx_t    = ap_uint<15>;
+using IwIdx_t      = ap_int<11>;
+using IhIdx_t      = ap_int<16>;
+#else
+using KIdx_t       = unsigned;
+using ICTileIdx_t  = unsigned;
+using MTileIdx_t   = unsigned;
+using SlotIdx_t    = unsigned;
+using IwLoadIdx_t  = unsigned;
+using WrapIdx_t    = unsigned;
+using IwIdx_t      = int;
+using IhIdx_t      = int;
+#endif
+
 #ifdef DEBUG_LOAD_DATA_CACHING
 static unsigned g_conv_debug_duplicate_reads = 0;
 #endif
@@ -146,22 +188,39 @@ static void accumulate_standard_streamed(
 ) {
     #pragma HLS INLINE
 
-    unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
+    // Narrow shadow copies of kw/kh so the wrap compares are 3-bit.  Pre-
+    // compute (bound - 1) so the wrap signals are an equality compare on
+    // the REGISTERED counter (running parallel with the increment), not a
+    // post-increment compare (which would serialise add → icmp → mux into
+    // the critical path — 2.486 ns at 300 MHz).
+    const KIdx_t kw_n   = (KIdx_t)kw;
+    const KIdx_t kh_n   = (KIdx_t)kh;
+    const KIdx_t kw_max = kw_n - 1;
+    const KIdx_t kh_max = kh_n - 1;
+
+    KIdx_t      kwi_cnt = 0, khi_cnt = 0;
+    ICTileIdx_t ic_cnt  = 0;
     const unsigned ri_bound = kTileIC * kh * kw * kTileM;
     for (unsigned ri = 0; ri < ri_bound; ri++) {
         #pragma HLS PIPELINE II=1
-        const unsigned m1 = ri & (kTileM - 1);
-        const Data_t   w  = weight_stream.read();
+        const MTileIdx_t m1 = ri & (kTileM - 1);
+        const Data_t     w  = weight_stream.read();
         acc[m1] +=
             AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
             AccData_t(w);
 
-        if ((ri & (kTileM - 1)) == kTileM - 1) {
-            if (++kwi_cnt == kw) {
-                kwi_cnt = 0;
-                if (++khi_cnt == kh) {
-                    khi_cnt = 0;
-                    ++ic_cnt;
+        // Registered-value wrap detection — runs in parallel with the
+        // counter increments so `cmp` and `add` no longer share a path.
+        const bool last_lane  = (m1       == MTileIdx_t(kTileM - 1));
+        const bool kwi_at_max = (kwi_cnt  == kw_max);
+        const bool khi_at_max = (khi_cnt  == kh_max);
+
+        if (last_lane) {
+            kwi_cnt = kwi_at_max ? KIdx_t(0) : KIdx_t(kwi_cnt + 1);
+            if (kwi_at_max) {
+                khi_cnt = khi_at_max ? KIdx_t(0) : KIdx_t(khi_cnt + 1);
+                if (khi_at_max) {
+                    ic_cnt = ICTileIdx_t(ic_cnt + 1);
                 }
             }
         }
@@ -185,19 +244,25 @@ static void accumulate_depthwise(
 ) {
     #pragma HLS INLINE
 
-    unsigned kwi_cnt = 0, khi_cnt = 0;
+    const KIdx_t kw_n   = (KIdx_t)kw;
+    const KIdx_t kw_max = kw_n - 1;
+
+    KIdx_t kwi_cnt = 0, khi_cnt = 0;
     const unsigned ri_bound_dw = kh * kw * kTileM;
     for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
         #pragma HLS PIPELINE II=1
-        const unsigned m1 = ri & (kTileM - 1);
-        //std::cout << "m1=" << m1 << " khi_cnt=" << khi_cnt << " kwi_cnt=" << kwi_cnt << std::endl;
+        const MTileIdx_t m1 = ri & (kTileM - 1);
         acc[m1] +=
             AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
             AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
 
-        if ((ri & (kTileM - 1)) == kTileM - 1) {
-            if (++kwi_cnt == kw) {
-                kwi_cnt = 0;
+        // Registered-value wrap detection — see accumulate_standard_streamed.
+        const bool last_lane  = (m1      == MTileIdx_t(kTileM - 1));
+        const bool kwi_at_max = (kwi_cnt == kw_max);
+
+        if (last_lane) {
+            kwi_cnt = kwi_at_max ? KIdx_t(0) : KIdx_t(kwi_cnt + 1);
+            if (kwi_at_max) {
                 ++khi_cnt;
             }
         }
@@ -230,7 +295,7 @@ static void write_output_tile(
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
                     unsigned       y_addr  = base + m_off * ohw;
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
                         y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
                         y_addr += ohw;
@@ -279,7 +344,7 @@ static void bias_producer(
         for (unsigned mt = 0; mt < m_tiles; mt++) {
             const unsigned m_off   = mt * kTileM;
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+            for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                 #pragma HLS PIPELINE II=1
                 bias_stream.write(has_bias
                                   ? AccData_t(bias_buf[m_off + m1])
@@ -340,11 +405,26 @@ static void input_patch_producer_standard(
     const unsigned ic_tiles = (in_ch + kTileIC - 1) / kTileIC;
     const unsigned in_hw    = in_h * in_w;
 
+    // line_buf:  kTileIC * kMaxLineBufRows * kMaxInW * sizeof(Data_t)
+    //         =      16  *       16        *    64   *      2       =  32 KB
+    // → 1 URAM block (each URAM holds 4096 × 72 b ≈ 36 KB).  RAM_S2P
+    // (one read port + one write port) is enough — Phase 1 only writes
+    // and Phase 2 only reads, never concurrently on the same address.
+    // latency=2 keeps URAM read/write timing comfortable at 300 MHz.
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxInW];
+    #pragma HLS BIND_STORAGE variable=line_buf type=RAM_S2P impl=URAM latency=2
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     AddressMap_t read_addresses;
 #endif
+
+    // Narrow shadow copies of the runtime loop bounds — using these in
+    // the inner loop headers makes the `iw < in_w_n` and `kwi < kw_n`
+    // comparisons happen at the counter's native width (7-bit / 3-bit)
+    // instead of zero-extending to 32-bit s_axilite width (~1.0 ns icmp).
+    const IwLoadIdx_t in_w_n = (IwLoadIdx_t)in_w;
+    const KIdx_t      kw_n   = (KIdx_t)kw;
+    const KIdx_t      kh_n   = (KIdx_t)kh;
 
     // Loop order: g OUTER of ict OUTER of ni — matches the consumer's
     // (g, ict, ni, oh, ow, mt) iteration so weights stream once per
@@ -377,12 +457,12 @@ static void input_patch_producer_standard(
                 if (load_end >= (int)in_h) load_end = (int)in_h - 1;
 
                 for (int ih = load_start; ih <= load_end; ih++) {
-                    const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
-                    for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+                    const SlotIdx_t slot = (unsigned)ih & (kMaxLineBufRows - 1);
+                    for (ICTileIdx_t ic_l = 0; ic_l < ic_valid; ic_l++) {
                         const unsigned c     = ic_off + ic_l;
                         const unsigned x_row = (ni * in_ch + c) * in_hw
                                              + (unsigned)ih * in_w;
-                        for (unsigned iw = 0; iw < in_w; iw++) {
+                        for (IwLoadIdx_t iw = 0; iw < in_w_n; iw++) {
                             #pragma HLS PIPELINE II=1
                             const size_t addr = x_row + iw;
                             line_buf[ic_l][slot][iw] = x[addr];
@@ -410,29 +490,39 @@ static void input_patch_producer_standard(
 
                     // ---------------------------------------------------
                     // Phase 2: stream a fixed kTileIC × kh × kw block of
-                    // patch values into patch_pipe.  Lanes ic_l >=
-                    // ic_valid are zero-padded so the broadcaster can
-                    // operate with a compile-time-fixed input_per_iter
-                    // (= kTileIC*kh*kw); the consumer's accumulate uses
-                    // ic_valid bound and ignores the padding lanes.
+                    // patch values into patch_pipe.  Flat loop over
+                    // (ic_l, khi, kwi) with registered-value wrap
+                    // detection — see weight_producer_standard.
                     // ---------------------------------------------------
-                    for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                    const unsigned p2_iters = kTileIC * kh_n * kw_n;
+                    const KIdx_t      kw_max_p2 = kw_n - 1;
+                    const KIdx_t      kh_max_p2 = kh_n - 1;
+                    ICTileIdx_t ic_l = 0;
+                    KIdx_t      khi  = 0;
+                    KIdx_t      kwi  = 0;
+                    for (unsigned i = 0; i < p2_iters; i++) {
+                        #pragma HLS PIPELINE II=1
                         const bool ic_ok = (ic_l < ic_valid);
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                        - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned slot = ih_ok
-                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
-                                : 0u;
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                            - (int)pad_left;
-                                const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                                patch_stream.write((ic_ok && ih_ok && iw_ok)
-                                    ? line_buf[ic_l][slot][(unsigned)iw]
-                                    : Data_t(0));
+                        const IhIdx_t ih = (IhIdx_t)(oh * stride_h + khi * dilation_h)
+                                         - (IhIdx_t)pad_top;
+                        const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                        const SlotIdx_t slot = ih_ok
+                            ? (SlotIdx_t)((unsigned)ih & (kMaxLineBufRows - 1))
+                            : SlotIdx_t(0);
+                        const IwIdx_t iw = (IwIdx_t)(ow * stride_w + kwi * dilation_w)
+                                         - (IwIdx_t)pad_left;
+                        const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
+                        patch_stream.write((ic_ok && ih_ok && iw_ok)
+                            ? line_buf[ic_l][slot][(unsigned)iw]
+                            : Data_t(0));
+
+                        const bool kwi_w = (kwi == kw_max_p2);
+                        const bool khi_w = (khi == kh_max_p2);
+                        kwi = kwi_w ? KIdx_t(0) : KIdx_t(kwi + 1);
+                        if (kwi_w) {
+                            khi = khi_w ? KIdx_t(0) : KIdx_t(khi + 1);
+                            if (khi_w) {
+                                ic_l = ICTileIdx_t(ic_l + 1);
                             }
                         }
                     }
@@ -484,6 +574,11 @@ static void broadcast_patches(
 ) {
     Data_t local_buf[kTileIC * kMaxKH * kMaxKW];
 
+    // Narrow shadow copy of input_per_iter so the i+1==input_per_iter
+    // wrap compare is at WrapIdx_t (15-bit) instead of 32-bit s_axilite
+    // width.
+    const WrapIdx_t input_per_iter_n = (WrapIdx_t)input_per_iter;
+
     for (unsigned r = 0; r < outer_iters; r++) {
         for (unsigned i = 0; i < input_per_iter; i++) {
             #pragma HLS PIPELINE II=1
@@ -495,11 +590,11 @@ static void broadcast_patches(
         const unsigned subsequent = (broadcast_factor > 0
                                      ? broadcast_factor - 1
                                      : 0) * input_per_iter;
-        unsigned i = 0;
+        WrapIdx_t i = 0;
         for (unsigned k = 0; k < subsequent; k++) {
             #pragma HLS PIPELINE II=1
             patch_stream.write(local_buf[i]);
-            i = (i + 1 == input_per_iter) ? 0u : i + 1;
+            i = (i + 1 == input_per_iter_n) ? WrapIdx_t(0) : WrapIdx_t(i + 1);
         }
     }
 }
@@ -557,6 +652,11 @@ static void input_patch_producer_depthwise(
     AddressMap_t read_addresses;
 #endif
 
+    // Narrow shadow copies of runtime bounds — see input_patch_producer_standard.
+    const IwLoadIdx_t in_w_n = (IwLoadIdx_t)in_w;
+    const KIdx_t      kw_n   = (KIdx_t)kw;
+    const KIdx_t      kh_n   = (KIdx_t)kh;
+
     // Loop order: g OUTER of mt OUTER of ni — matches the consumer's
     // (g, mt, ni, oh, ow) iteration.  line_buf is reset per (g, mt, ni);
     // each x is read once per (ni, c).
@@ -582,12 +682,12 @@ static void input_patch_producer_depthwise(
                 if (load_end >= (int)in_h) load_end = (int)in_h - 1;
 
                 for (int ih = load_start; ih <= load_end; ih++) {
-                    const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    const SlotIdx_t slot = (unsigned)ih & (kMaxLineBufRows - 1);
+                    for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                         const unsigned c     = m_off + m1;
                         const unsigned x_row = (ni * in_ch + c) * in_hw
                                              + (unsigned)ih * in_w;
-                        for (unsigned iw = 0; iw < in_w; iw++) {
+                        for (IwLoadIdx_t iw = 0; iw < in_w_n; iw++) {
                             #pragma HLS PIPELINE II=1
                             const size_t addr = x_row + iw;
                             line_buf[m1][slot][iw] = x[addr];
@@ -613,23 +713,37 @@ static void input_patch_producer_depthwise(
 
                 for (unsigned ow = 0; ow < out_w; ow++) {
                     // ----- Phase 2: stream kTileM × kh × kw values -----
-                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    // Flat loop over (m1, khi, kwi) with registered-value
+                    // wrap detection.
+                    const unsigned p2_iters = kTileM * kh_n * kw_n;
+                    const KIdx_t      kw_max_p2 = kw_n - 1;
+                    const KIdx_t      kh_max_p2 = kh_n - 1;
+                    MTileIdx_t m1  = 0;
+                    KIdx_t     khi = 0;
+                    KIdx_t     kwi = 0;
+                    for (unsigned i = 0; i < p2_iters; i++) {
+                        #pragma HLS PIPELINE II=1
                         const bool m_ok = (m1 < m_valid);
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                        - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned slot = ih_ok
-                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
-                                : 0u;
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                            - (int)pad_left;
-                                const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                                patch_stream.write((m_ok && ih_ok && iw_ok)
-                                    ? line_buf[m1][slot][(unsigned)iw]
-                                    : Data_t(0));
+                        const IhIdx_t ih = (IhIdx_t)(oh * stride_h + khi * dilation_h)
+                                         - (IhIdx_t)pad_top;
+                        const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                        const SlotIdx_t slot = ih_ok
+                            ? (SlotIdx_t)((unsigned)ih & (kMaxLineBufRows - 1))
+                            : SlotIdx_t(0);
+                        const IwIdx_t iw = (IwIdx_t)(ow * stride_w + kwi * dilation_w)
+                                         - (IwIdx_t)pad_left;
+                        const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
+                        patch_stream.write((m_ok && ih_ok && iw_ok)
+                            ? line_buf[m1][slot][(unsigned)iw]
+                            : Data_t(0));
+
+                        const bool kwi_w = (kwi == kw_max_p2);
+                        const bool khi_w = (khi == kh_max_p2);
+                        kwi = kwi_w ? KIdx_t(0) : KIdx_t(kwi + 1);
+                        if (kwi_w) {
+                            khi = khi_w ? KIdx_t(0) : KIdx_t(khi + 1);
+                            if (khi_w) {
+                                m1 = MTileIdx_t(m1 + 1);
                             }
                         }
                     }
@@ -729,6 +843,10 @@ static void weight_producer_standard(
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
 
+    // Narrow shadow copies of the runtime kernel bounds.
+    const KIdx_t kw_n = (KIdx_t)kw;
+    const KIdx_t kh_n = (KIdx_t)kh;
+
     // Per-tile transpose buffer.  Partition on dim=1 (m1) so Phase 2 can
     // read a different m1 each cycle at II=1.
     Data_t tile_cache[kTileM][kTileIC][kMaxKH][kMaxKW];
@@ -743,50 +861,88 @@ static void weight_producer_standard(
             const unsigned m_off   = mt * kTileM;
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-            // Phase 1: sequential DDR read per m1 lane.
-            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                const bool m_ok = (m1 < m_valid);
-                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                    const bool ic_ok = (ic_l < ic_valid);
-                    for (unsigned khi = 0; khi < kh; khi++) {
-                        for (unsigned kwi = 0; kwi < kw; kwi++) {
-                            #pragma HLS PIPELINE II=1
-                            const size_t addr =
-                                (m_off + m1) * in_ch * kh * kw
-                              + (ic_off + ic_l) * kh * kw
-                              + khi * kw + kwi;
-                            const bool valid_lane = m_ok && ic_ok;
-                            tile_cache[m1][ic_l][khi][kwi] =
-                                valid_lane ? weight[addr] : Data_t(0);
+            // Phase 1: sequential DDR read per m1 lane.  Flat loop with
+            // manual (m1, ic_l, khi, kwi) counters so HLS uses the same
+            // schedule as the auto-flattened nest, but the wrap signals
+            // are computed from REGISTERED counter values (parallel with
+            // the increment) instead of post-increment compares.  This
+            // collapses the `add → icmp → and → mux → store` cascade.
+            const unsigned phase1_iters = kTileM * kTileIC * kh_n * kw_n;
+            const KIdx_t      kw_max = kw_n - 1;
+            const KIdx_t      kh_max = kh_n - 1;
+            const ICTileIdx_t ic_max = ICTileIdx_t(kTileIC - 1);
+            MTileIdx_t  m1_p1   = 0;
+            ICTileIdx_t ic_l_p1 = 0;
+            KIdx_t      khi_p1  = 0;
+            KIdx_t      kwi_p1  = 0;
+            for (unsigned i = 0; i < phase1_iters; i++) {
+                #pragma HLS PIPELINE II=1
+                const bool m_ok  = (m1_p1   < m_valid);
+                const bool ic_ok = (ic_l_p1 < ic_valid);
+                const size_t addr =
+                    (m_off + m1_p1) * in_ch * kh * kw
+                  + (ic_off + ic_l_p1) * kh * kw
+                  + khi_p1 * kw + kwi_p1;
+                const bool valid_lane = m_ok && ic_ok;
+                tile_cache[m1_p1][ic_l_p1][khi_p1][kwi_p1] =
+                    valid_lane ? weight[addr] : Data_t(0);
 
 #ifdef DEBUG_LOAD_DATA_CACHING
-                            if (valid_lane) {
-                                CycleCounters c;
-                                c.mt   = mt;
-                                c.ni   = 0;
-                                c.oh   = 0;
-                                c.ow   = 0;
-                                c.ict  = ict;
-                                c.ic_l = ic_l;
-                                c.khi  = khi;
-                                c.kwi  = kwi;
-                                g_weight_read_addresses[addr]
-                                    .push_back(c);
-                            }
+                if (valid_lane) {
+                    CycleCounters c;
+                    c.mt   = mt;
+                    c.ni   = 0;
+                    c.oh   = 0;
+                    c.ow   = 0;
+                    c.ict  = ict;
+                    c.ic_l = ic_l_p1;
+                    c.khi  = khi_p1;
+                    c.kwi  = kwi_p1;
+                    g_weight_read_addresses[addr].push_back(c);
+                }
 #endif /* DEBUG_LOAD_DATA_CACHING */
+
+                // Registered-value wrap detection (kwi fastest).
+                const bool kwi_w = (kwi_p1  == kw_max);
+                const bool khi_w = (khi_p1  == kh_max);
+                const bool ic_w  = (ic_l_p1 == ic_max);
+                kwi_p1 = kwi_w ? KIdx_t(0) : KIdx_t(kwi_p1 + 1);
+                if (kwi_w) {
+                    khi_p1 = khi_w ? KIdx_t(0) : KIdx_t(khi_p1 + 1);
+                    if (khi_w) {
+                        ic_l_p1 = ic_w ? ICTileIdx_t(0)
+                                       : ICTileIdx_t(ic_l_p1 + 1);
+                        if (ic_w) {
+                            m1_p1 = MTileIdx_t(m1_p1 + 1);
                         }
                     }
                 }
             }
 
             // Phase 2: emit transposed (ic_l, khi, kwi, m1) — m1 fastest.
-            for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                for (unsigned khi = 0; khi < kh; khi++) {
-                    for (unsigned kwi = 0; kwi < kw; kwi++) {
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                            #pragma HLS PIPELINE II=1
-                            weight_pipe.write(
-                                tile_cache[m1][ic_l][khi][kwi]);
+            // Flat loop with manual counters; same registered-value wrap
+            // trick as Phase 1.
+            const unsigned phase2_iters = kTileIC * kh_n * kw_n * kTileM;
+            const MTileIdx_t  m1_max_p2 = MTileIdx_t(kTileM - 1);
+            ICTileIdx_t ic_l_p2 = 0;
+            KIdx_t      khi_p2  = 0;
+            KIdx_t      kwi_p2  = 0;
+            MTileIdx_t  m1_p2   = 0;
+            for (unsigned i = 0; i < phase2_iters; i++) {
+                #pragma HLS PIPELINE II=1
+                weight_pipe.write(
+                    tile_cache[m1_p2][ic_l_p2][khi_p2][kwi_p2]);
+
+                const bool m1_w  = (m1_p2  == m1_max_p2);
+                const bool kwi_w = (kwi_p2 == kw_max);
+                const bool khi_w = (khi_p2 == kh_max);
+                m1_p2 = m1_w ? MTileIdx_t(0) : MTileIdx_t(m1_p2 + 1);
+                if (m1_w) {
+                    kwi_p2 = kwi_w ? KIdx_t(0) : KIdx_t(kwi_p2 + 1);
+                    if (kwi_w) {
+                        khi_p2 = khi_w ? KIdx_t(0) : KIdx_t(khi_p2 + 1);
+                        if (khi_w) {
+                            ic_l_p2 = ICTileIdx_t(ic_l_p2 + 1);
                         }
                     }
                 }
@@ -816,35 +972,52 @@ static void weight_producer_depthwise(
     unsigned             kw
 ) {
     const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
+    const KIdx_t   kw_n    = (KIdx_t)kw;
+    const KIdx_t   kh_n    = (KIdx_t)kh;
+
+    const KIdx_t kw_max = kw_n - 1;
+    const KIdx_t kh_max = kh_n - 1;
 
     for (unsigned g = 0; g < num_groups; g++) {
     for (unsigned mt = 0; mt < m_tiles; mt++) {
         const unsigned m_off   = mt * kTileM;
         const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-            const bool m_ok = (m1 < m_valid);
-            for (unsigned khi = 0; khi < kh; khi++) {
-                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                    #pragma HLS PIPELINE II=1
-                    const size_t addr = (m_off + m1) * kh * kw
-                                      + khi * kw + kwi;
-                    weight_pipe.write(m_ok ? weight[addr] : Data_t(0));
+        // Flat loop with manual (m1, khi, kwi) counters and registered-
+        // value wrap detection — see weight_producer_standard.
+        const unsigned dw_iters = kTileM * kh_n * kw_n;
+        MTileIdx_t m1_dw  = 0;
+        KIdx_t     khi_dw = 0;
+        KIdx_t     kwi_dw = 0;
+        for (unsigned i = 0; i < dw_iters; i++) {
+            #pragma HLS PIPELINE II=1
+            const bool m_ok = (m1_dw < m_valid);
+            const size_t addr = (m_off + m1_dw) * kh * kw
+                              + khi_dw * kw + kwi_dw;
+            weight_pipe.write(m_ok ? weight[addr] : Data_t(0));
 
 #ifdef DEBUG_LOAD_DATA_CACHING
-                    if (m_ok) {
-                        CycleCounters c;
-                        c.mt   = mt;
-                        c.ni   = 0;
-                        c.oh   = 0;
-                        c.ow   = 0;
-                        c.ict  = 0;
-                        c.ic_l = m1;
-                        c.khi  = khi;
-                        c.kwi  = kwi;
-                        g_weight_read_addresses[addr].push_back(c);
-                    }
+            if (m_ok) {
+                CycleCounters c;
+                c.mt   = mt;
+                c.ni   = 0;
+                c.oh   = 0;
+                c.ow   = 0;
+                c.ict  = 0;
+                c.ic_l = m1_dw;
+                c.khi  = khi_dw;
+                c.kwi  = kwi_dw;
+                g_weight_read_addresses[addr].push_back(c);
+            }
 #endif /* DEBUG_LOAD_DATA_CACHING */
+
+            const bool kwi_w = (kwi_dw == kw_max);
+            const bool khi_w = (khi_dw == kh_max);
+            kwi_dw = kwi_w ? KIdx_t(0) : KIdx_t(kwi_dw + 1);
+            if (kwi_w) {
+                khi_dw = khi_w ? KIdx_t(0) : KIdx_t(khi_dw + 1);
+                if (khi_w) {
+                    m1_dw = MTileIdx_t(m1_dw + 1);
                 }
             }
         }
@@ -912,7 +1085,16 @@ static void broadcast_weights(
     unsigned             replay_per_ni,
     unsigned             replay_constant
 ) {
+    // cache: kMaxWeightCacheEntries * sizeof(Data_t) = 16384 * 2 = 32 KB
+    // → 1 URAM block.  RAM_S2P is enough — drain phase writes only,
+    // replay phase reads only (read-and-forward emits the first replay
+    // copy in the same iteration as the drain, but that's a write+stream-
+    // write, not a write+read on the same array).
     Data_t cache[kMaxWeightCacheEntries];
+    #pragma HLS BIND_STORAGE variable=cache type=RAM_S2P impl=URAM latency=2
+
+    // Narrow shadow copy of cache_len for the wrap compare.
+    const WrapIdx_t cache_len_n = (WrapIdx_t)cache_len;
 
     for (unsigned g = 0; g < num_groups; g++) {
         const unsigned ni_lo    = g * group_size;
@@ -930,11 +1112,11 @@ static void broadcast_weights(
             const unsigned subsequent = (replay_iters > 0
                                          ? replay_iters - 1
                                          : 0) * cache_len;
-            unsigned i = 0;
+            WrapIdx_t i = 0;
             for (unsigned k = 0; k < subsequent; k++) {
                 #pragma HLS PIPELINE II=1
                 weight_stream.write(cache[i]);
-                i = (i + 1 == cache_len) ? 0u : i + 1;
+                i = (i + 1 == cache_len_n) ? WrapIdx_t(0) : WrapIdx_t(i + 1);
             }
         }
     }
@@ -997,10 +1179,23 @@ static void process_conv_kernel_tile(
     const unsigned ohw      = out_h * out_w;
     const unsigned ohw_x_oc = ohw * out_ch;
 
+    // Narrow shadow copies for the inner triple-loop comparisons.
+    const KIdx_t kw_n = (KIdx_t)kw;
+    const KIdx_t kh_n = (KIdx_t)kh;
+
     // partial_outputs holds this_group_size * out_h * out_w * out_ch
     // accumulators for the current group.  Index uses ni_local (offset
     // within the group) so the buffer is reused across groups.
+    //
+    // kMaxAccPersistEntries * sizeof(AccData_t) = 16384 * 4 = 64 KB
+    // → 2 URAM blocks (each holds 4096 × 72 b ≈ 36 KB).  RAM_T2P (true
+    // dual-port) is needed because the read+accumulate+write loops in
+    // Phase 2 issue a read at idx_base+m1 and a write at idx_base+m1
+    // a few cycles apart — distinct ports keep II=1 even with URAM's
+    // multi-cycle access latency.  latency=2 covers URAM's registered
+    // output without forcing II>1 in the per-m1 pipeline.
     AccData_t partial_outputs[kMaxAccPersistEntries];
+    #pragma HLS BIND_STORAGE variable=partial_outputs type=RAM_T2P impl=URAM latency=2
 
     for (unsigned g = 0; g < num_groups; g++) {
     const unsigned ni_lo   = g * group_size;
@@ -1013,7 +1208,7 @@ static void process_conv_kernel_tile(
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
                         const unsigned idx = ni_local * ohw_x_oc
                                            + (oh * out_w + ow) * out_ch
@@ -1047,11 +1242,23 @@ static void process_conv_kernel_tile(
                             #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
                             // Read kTileIC*kh*kw patch values from stream.
-                            for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                for (unsigned khi = 0; khi < kh; khi++) {
-                                    for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                        #pragma HLS PIPELINE II=1
-                                        patch_stream.read(patch[ic_l][khi][kwi]);
+                            // Flat loop with registered-value wrap detection.
+                            const unsigned pr_iters = kTileIC * kh_n * kw_n;
+                            const KIdx_t kw_max_pr = kw_n - 1;
+                            const KIdx_t kh_max_pr = kh_n - 1;
+                            ICTileIdx_t ic_l_pr = 0;
+                            KIdx_t      khi_pr  = 0;
+                            KIdx_t      kwi_pr  = 0;
+                            for (unsigned i = 0; i < pr_iters; i++) {
+                                #pragma HLS PIPELINE II=1
+                                patch_stream.read(patch[ic_l_pr][khi_pr][kwi_pr]);
+                                const bool kwi_w = (kwi_pr == kw_max_pr);
+                                const bool khi_w = (khi_pr == kh_max_pr);
+                                kwi_pr = kwi_w ? KIdx_t(0) : KIdx_t(kwi_pr + 1);
+                                if (kwi_w) {
+                                    khi_pr = khi_w ? KIdx_t(0) : KIdx_t(khi_pr + 1);
+                                    if (khi_w) {
+                                        ic_l_pr = ICTileIdx_t(ic_l_pr + 1);
                                     }
                                 }
                             }
@@ -1059,11 +1266,11 @@ static void process_conv_kernel_tile(
                             const unsigned idx_base = ni_local * ohw_x_oc
                                                     + (oh * out_w + ow) * out_ch
                                                     + m_off;
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            for (MTileIdx_t m1 = 0; m1 < kTileM; m1++) {
                                 #pragma HLS UNROLL
                                 acc[m1] = AccData_t(0);
                             }
-                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                            for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                                 #pragma HLS PIPELINE II=1
                                 acc[m1] = partial_outputs[idx_base + m1];
                             }
@@ -1072,7 +1279,7 @@ static void process_conv_kernel_tile(
                             accumulate_standard_streamed(patch, weight_stream,
                                                          acc, kh, kw);
 
-                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                            for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                                 #pragma HLS PIPELINE II=1
                                 partial_outputs[idx_base + m1] = acc[m1];
                             }
@@ -1088,11 +1295,25 @@ static void process_conv_kernel_tile(
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
             Data_t w_buf[kTileM][kMaxKH][kMaxKW];
-            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                for (unsigned khi = 0; khi < kh; khi++) {
-                    for (unsigned kwi = 0; kwi < kw; kwi++) {
-                        #pragma HLS PIPELINE II=1
-                        w_buf[m1][khi][kwi] = weight_stream.read();
+            // Flat (m1, khi, kwi) drain.
+            {
+                const unsigned wb_iters = kTileM * kh_n * kw_n;
+                const KIdx_t kw_max_wb = kw_n - 1;
+                const KIdx_t kh_max_wb = kh_n - 1;
+                MTileIdx_t m1_wb  = 0;
+                KIdx_t     khi_wb = 0;
+                KIdx_t     kwi_wb = 0;
+                for (unsigned i = 0; i < wb_iters; i++) {
+                    #pragma HLS PIPELINE II=1
+                    w_buf[m1_wb][khi_wb][kwi_wb] = weight_stream.read();
+                    const bool kwi_w = (kwi_wb == kw_max_wb);
+                    const bool khi_w = (khi_wb == kh_max_wb);
+                    kwi_wb = kwi_w ? KIdx_t(0) : KIdx_t(kwi_wb + 1);
+                    if (kwi_w) {
+                        khi_wb = khi_w ? KIdx_t(0) : KIdx_t(khi_wb + 1);
+                        if (khi_w) {
+                            m1_wb = MTileIdx_t(m1_wb + 1);
+                        }
                     }
                 }
             }
@@ -1106,11 +1327,25 @@ static void process_conv_kernel_tile(
                         AccData_t acc[kTileM];
                         #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    patch_stream.read(patch[m1][khi][kwi]);
+                        // Flat (m1, khi, kwi) patch drain.
+                        {
+                            const unsigned dp_iters = kTileM * kh_n * kw_n;
+                            const KIdx_t kw_max_dp = kw_n - 1;
+                            const KIdx_t kh_max_dp = kh_n - 1;
+                            MTileIdx_t m1_dp  = 0;
+                            KIdx_t     khi_dp = 0;
+                            KIdx_t     kwi_dp = 0;
+                            for (unsigned i = 0; i < dp_iters; i++) {
+                                #pragma HLS PIPELINE II=1
+                                patch_stream.read(patch[m1_dp][khi_dp][kwi_dp]);
+                                const bool kwi_w = (kwi_dp == kw_max_dp);
+                                const bool khi_w = (khi_dp == kh_max_dp);
+                                kwi_dp = kwi_w ? KIdx_t(0) : KIdx_t(kwi_dp + 1);
+                                if (kwi_w) {
+                                    khi_dp = khi_w ? KIdx_t(0) : KIdx_t(khi_dp + 1);
+                                    if (khi_w) {
+                                        m1_dp = MTileIdx_t(m1_dp + 1);
+                                    }
                                 }
                             }
                         }
@@ -1118,18 +1353,18 @@ static void process_conv_kernel_tile(
                         const unsigned idx_base = ni_local * ohw_x_oc
                                                 + (oh * out_w + ow) * out_ch
                                                 + m_off;
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        for (MTileIdx_t m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
                             acc[m1] = AccData_t(0);
                         }
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                             #pragma HLS PIPELINE II=1
                             acc[m1] = partial_outputs[idx_base + m1];
                         }
 
                         accumulate_depthwise(patch, w_buf, acc, kh, kw);
 
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                             #pragma HLS PIPELINE II=1
                             partial_outputs[idx_base + m1] = acc[m1];
                         }
@@ -1147,7 +1382,7 @@ static void process_conv_kernel_tile(
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    for (MTileIdx_t m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
                         const unsigned idx = ni_local * ohw_x_oc
                                            + (oh * out_w + ow) * out_ch
@@ -1236,6 +1471,43 @@ void ConvKernel(
     #pragma HLS INTERFACE s_axilite port=has_bias     bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=is_depthwise bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return       bundle=ctrl
+
+    // -----------------------------------------------------------------------
+    // STABLE: read-only m_axi base pointers (x, weight, bias) and every
+    // s_axilite scalar are latched at ap_start and never written during
+    // the DATAFLOW region's execution.  Marking them STABLE tells HLS not
+    // to insert auto-generated Block_entry_proc_* synchronization stages
+    // or fan-out FIFOs (cond*_loc_channel) into the producers.  Without
+    // these, the HLS 200-1449 warnings ("has both a predecessor and reads
+    // an input from its caller — may lead to lower throughput") disappear,
+    // the auto-deepened cond*_loc_channel FIFOs (depth 3-7) collapse, and
+    // the producers are free to start at ap_start without waiting on a
+    // synthetic predecessor.
+    //
+    // `y` is intentionally NOT listed: write_output_tile writes through it
+    // during the dataflow region, so HLS must keep the output-side
+    // synchronization for the m_axi store path.
+    // -----------------------------------------------------------------------
+    #pragma HLS STABLE variable=x
+    #pragma HLS STABLE variable=weight
+    #pragma HLS STABLE variable=bias
+    #pragma HLS STABLE variable=batch
+    #pragma HLS STABLE variable=in_ch
+    #pragma HLS STABLE variable=in_h
+    #pragma HLS STABLE variable=in_w
+    #pragma HLS STABLE variable=out_ch
+    #pragma HLS STABLE variable=out_h
+    #pragma HLS STABLE variable=out_w
+    #pragma HLS STABLE variable=kh
+    #pragma HLS STABLE variable=kw
+    #pragma HLS STABLE variable=stride_h
+    #pragma HLS STABLE variable=stride_w
+    #pragma HLS STABLE variable=dilation_h
+    #pragma HLS STABLE variable=dilation_w
+    #pragma HLS STABLE variable=pad_top
+    #pragma HLS STABLE variable=pad_left
+    #pragma HLS STABLE variable=has_bias
+    #pragma HLS STABLE variable=is_depthwise
 
     static_assert(kTileM <= kTileIC,
                   "depthwise mode reuses patch[kTileIC] for TILE_M lanes: "
