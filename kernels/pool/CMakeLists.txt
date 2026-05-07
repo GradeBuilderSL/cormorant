@@ -231,8 +231,15 @@ if(POOL_VITIS_HLS)
             "${_p_build_dir}/synthesize_${_pname}.tcl"
             @ONLY)
 
+        # Clean stale HLS project + IP catalog so old Verilog from a prior
+        # run isn't re-exported into the IP archive (which then breaks
+        # downstream Vivado packaging when source files have been removed
+        # or renamed since the last synthesis).
         add_custom_target(
             "synthesize_pool_${_pname}"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                    "${_p_build_dir}/${POOL_HLS_PROJECT_NAME}"
+                    "${POOL_IP_OUTPUT_DIR}"
             COMMAND ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}
                     "${_p_build_dir}/synthesize_${_pname}.tcl"
             WORKING_DIRECTORY "${_p_build_dir}"

@@ -204,8 +204,15 @@ if(Vitis_HLS)
       configure_file(scripts/Synthesis.tcl.in
                      "${_p_build_dir}/synthesize_${_pname}.tcl")
 
+      # Clean stale HLS project + IP catalog so old Verilog from a prior
+      # run isn't re-exported into the IP archive (which then breaks
+      # downstream Vivado packaging when source files have been removed
+      # or renamed since the last synthesis).
       add_custom_target(
           "synthesize_vectorop_${_pname}"
+          COMMAND ${CMAKE_COMMAND} -E rm -rf
+                  "${_p_build_dir}/${VA_HLS_PROJECT_NAME}"
+                  "${VA_IP_OUTPUT_DIR}"
           COMMAND ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG} "${_p_build_dir}/synthesize_${_pname}.tcl"
           WORKING_DIRECTORY "${_p_build_dir}"
           COMMENT "HLS synthesis: VectorOPKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
