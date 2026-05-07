@@ -21,14 +21,29 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "ConvKernel.h"
+
+// ---------------------------------------------------------------------------
+// --dump-data <dir> mode: instead of running ConvKernel and comparing, dump
+// the per-test input/weight/bias tensors plus the naive-reference expected
+// y to hex files (one 16-bit value per line, suitable for $readmemh).  A
+// manifest.txt indexes every test with its geometry so an HDL testbench can
+// load the same fixtures.  RNG state is shared with verify mode (same seed,
+// same draw order), so the data is reproducible.
+// ---------------------------------------------------------------------------
+static std::string g_dump_dir;     // empty → verify mode (default)
+static int         g_test_idx = 0; // increments per call to run_test
+static FILE*       g_manifest = nullptr;
 
 // ---------------------------------------------------------------------------
 // Scalar limits derived via saturate_cast — works for both ap_fixed and float.
@@ -180,11 +195,130 @@ struct ConvParams {
     bool     is_depthwise;
 };
 
+// ---------------------------------------------------------------------------
+// Dump-mode helpers (only meaningful for fixed-point builds — the HDL
+// testbench reads 16-bit hex values one per line).
+// ---------------------------------------------------------------------------
+#ifdef CONV_HAVE_APFIXED
+static uint16_t data_to_raw16(const Data_t& v)
+{
+    // ap_fixed<16,8>::range() returns the underlying int as an ap_int.
+    return static_cast<uint16_t>(v.range().to_uint());
+}
+
+static void write_hex_file(const std::string&         path,
+                           const std::vector<Data_t>& vec)
+{
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        std::exit(1);
+    }
+    for (const auto& v : vec)
+        std::fprintf(f, "%04x\n", data_to_raw16(v));
+    std::fclose(f);
+}
+#endif
+
+static std::string sanitize_label(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '_' || c == '-')
+            out.push_back(c);
+        else
+            out.push_back('_');
+    }
+    return out;
+}
+
+// Compute y_ref via the naive oracle, then write x/w/b/y_ref hex files and
+// append a manifest line for one test case.
+static void dump_test_data(const std::string&         dir,
+                           int                        idx,
+                           const char*                label,
+                           const ConvParams&          p,
+                           const std::vector<Data_t>& x,
+                           const std::vector<Data_t>& w,
+                           const std::vector<Data_t>& b)
+{
+#ifndef CONV_HAVE_APFIXED
+    (void)dir; (void)idx; (void)label;
+    (void)p; (void)x; (void)w; (void)b;
+    std::fprintf(stderr, "--dump-data requires CONV_HAVE_APFIXED build\n");
+    std::exit(1);
+#else
+    const unsigned out_h = out_size(p.in_h, p.kh, p.stride_h, p.dilation_h,
+                                    p.pad_top,  p.pad_bottom);
+    const unsigned out_w = out_size(p.in_w, p.kw, p.stride_w, p.dilation_w,
+                                    p.pad_left, p.pad_right);
+    const unsigned y_size = p.batch * p.out_ch * out_h * out_w;
+
+    std::vector<Data_t> y_ref(y_size, Data_t(0));
+    if (p.is_depthwise) {
+        ref_depthwise_conv(x.data(), w.data(),
+                           p.has_bias ? b.data() : nullptr,
+                           y_ref.data(),
+                           p.batch, p.in_ch, p.in_h, p.in_w,
+                           out_h, out_w,
+                           p.kh, p.kw,
+                           p.stride_h, p.stride_w,
+                           p.dilation_h, p.dilation_w,
+                           p.pad_top, p.pad_left,
+                           p.has_bias ? 1u : 0u);
+    } else {
+        ref_conv(x.data(), w.data(),
+                 p.has_bias ? b.data() : nullptr,
+                 y_ref.data(),
+                 p.batch, p.in_ch, p.in_h, p.in_w,
+                 p.out_ch, out_h, out_w,
+                 p.kh, p.kw,
+                 p.stride_h, p.stride_w,
+                 p.dilation_h, p.dilation_w,
+                 p.pad_top, p.pad_left,
+                 p.has_bias ? 1u : 0u);
+    }
+
+    char idx_buf[16];
+    std::snprintf(idx_buf, sizeof(idx_buf), "%02d", idx);
+    const std::string prefix = dir + "/test_" + idx_buf + "_";
+    write_hex_file(prefix + "x.hex", x);
+    write_hex_file(prefix + "w.hex", w);
+    write_hex_file(prefix + "b.hex", b);
+    write_hex_file(prefix + "y.hex", y_ref);
+
+    std::fprintf(g_manifest,
+                 "%d %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %s\n",
+                 idx,
+                 p.batch, p.in_ch, p.in_h, p.in_w,
+                 p.out_ch, out_h, out_w,
+                 p.kh, p.kw,
+                 p.stride_h, p.stride_w,
+                 p.dilation_h, p.dilation_w,
+                 p.pad_top, p.pad_left,
+                 p.has_bias ? 1u : 0u,
+                 p.is_depthwise ? 1u : 0u,
+                 sanitize_label(label).c_str());
+
+    std::printf("[DUMP] test_%02d  %-50s  x=%zu w=%zu b=%zu y=%u\n",
+                idx, label,
+                x.size(), w.size(), b.size(), y_size);
+#endif
+}
+
 static int run_test(const char* name, const ConvParams& p,
                     const std::vector<Data_t>& x_data,
                     const std::vector<Data_t>& w_data,
                     const std::vector<Data_t>& b_data)
 {
+    if (!g_dump_dir.empty()) {
+        dump_test_data(g_dump_dir, g_test_idx++, name, p,
+                       x_data, w_data, b_data);
+        return 0;
+    }
+
     const unsigned out_h = out_size(p.in_h, p.kh, p.stride_h, p.dilation_h,
                                     p.pad_top,  p.pad_bottom);
     const unsigned out_w = out_size(p.in_w, p.kw, p.stride_w, p.dilation_w,
@@ -269,15 +403,48 @@ static std::vector<T> rand_vec(unsigned n, float scale, std::mt19937& rng)
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-int main()
+int main(int argc, char** argv)
 {
+    // Optional --dump-data <dir>: write per-test x/w/b/y_ref hex files plus
+    // a manifest, then exit (no kernel run).  Otherwise: original verify mode.
+    for (int i = 1; i < argc; i++) {
+        const std::string a(argv[i]);
+        if ((a == "--dump-data" || a == "-d") && i + 1 < argc) {
+            g_dump_dir = argv[++i];
+        } else if (a == "--help" || a == "-h") {
+            std::printf("Usage: %s [--dump-data <dir>]\n", argv[0]);
+            return 0;
+        }
+    }
+
+    if (!g_dump_dir.empty()) {
+        const std::string manifest_path = g_dump_dir + "/manifest.txt";
+        g_manifest = std::fopen(manifest_path.c_str(), "w");
+        if (!g_manifest) {
+            std::fprintf(stderr, "Failed to open %s for writing\n",
+                         manifest_path.c_str());
+            return 1;
+        }
+        std::fprintf(g_manifest,
+            "# ConvKernel test fixture manifest\n"
+            "# idx batch in_ch in_h in_w out_ch out_h out_w kh kw "
+            "stride_h stride_w dilation_h dilation_w pad_top pad_left "
+            "has_bias is_depthwise label\n");
+    }
+
     std::mt19937 rng(kSeed);
     int total_failures = 0;
 
-    printf("ConvKernel simulation tests\n");
-    printf("Data_t    = %s\n", sizeof(Data_t) == 2 ? "ap_fixed<16,8>" : "float");
-    printf("TILE_M=%u  TILE_IC=%u  MAX_KH=%u  MAX_KW=%u\n",
-           kTileM, kTileIC, kMaxKH, kMaxKW);
+    if (g_dump_dir.empty()) {
+        printf("ConvKernel simulation tests\n");
+        printf("Data_t    = %s\n", sizeof(Data_t) == 2 ? "ap_fixed<16,8>" : "float");
+        printf("TILE_M=%u  TILE_IC=%u  MAX_KH=%u  MAX_KW=%u\n",
+               kTileM, kTileIC, kMaxKH, kMaxKW);
+    } else {
+        printf("ConvKernel test data dump → %s\n", g_dump_dir.c_str());
+        printf("Data_t    = %s  (CONV_HAVE_APFIXED required)\n",
+               sizeof(Data_t) == 2 ? "ap_fixed<16,8>" : "float");
+    }
     printf("------------------------------------------------------------------\n");
 
     // -----------------------------------------------------------------------
@@ -630,6 +797,14 @@ int main()
 #endif
 
     printf("------------------------------------------------------------------\n");
+    if (!g_dump_dir.empty()) {
+        if (g_manifest) {
+            std::fclose(g_manifest);
+            g_manifest = nullptr;
+        }
+        printf("Dumped %d test(s) to %s\n", g_test_idx, g_dump_dir.c_str());
+        return 0;
+    }
     if (total_failures == 0) {
         printf("ALL TESTS PASSED\n");
     } else {

@@ -11,11 +11,25 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #include "PoolingKernel.h"
+
+// ---------------------------------------------------------------------------
+// --dump-data <dir> mode: instead of running PoolingKernel and comparing,
+// dump the per-test x/y_ref tensors to hex files (one 16-bit value per
+// line, suitable for $readmemh).  A manifest.txt indexes every test with
+// its geometry so an HDL testbench can load the same fixtures.
+// ---------------------------------------------------------------------------
+static std::string g_dump_dir;     // empty → verify mode (default)
+static int         g_test_idx = 0;
+static FILE*       g_manifest = nullptr;
 
 // Tolerance: ~5 LSBs for ap_fixed<16,8> (1 LSB = 1/256 ≈ 0.0039).
 // LP p=2 uses sqrtf internally, which adds at most 1 ULP of additional error.
@@ -28,7 +42,7 @@ static Data_t from_float(float v)  { return Data_t(v); }
 // Reference pooling — pure float / double, no quantisation inside.
 // ---------------------------------------------------------------------------
 static float ref_pool_elem(const std::vector<Data_t>& x,
-                            int N, int C, int H, int W,
+                            int C, int H, int W,
                             int n, int c, int oh, int ow,
                             int pool_h, int pool_w,
                             int stride_h, int stride_w,
@@ -76,6 +90,39 @@ static float ref_pool_elem(const std::vector<Data_t>& x,
 }
 
 // ---------------------------------------------------------------------------
+// Dump-mode helpers (only meaningful for fixed-point builds — the HDL
+// testbench reads 16-bit hex values one per line).
+// ---------------------------------------------------------------------------
+#ifdef POOL_HAVE_APFIXED
+static uint16_t data_to_raw16(const Data_t& v) {
+    return static_cast<uint16_t>(v.range().to_uint());
+}
+
+static void write_hex_file(const std::string& path,
+                           const std::vector<Data_t>& vec) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        std::exit(1);
+    }
+    for (const auto& v : vec)
+        std::fprintf(f, "%04x\n", data_to_raw16(v));
+    std::fclose(f);
+}
+#endif
+
+static std::string sanitize_label(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '_' || c == '-') out.push_back(c);
+        else                                          out.push_back('_');
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Run one test case.
 // ---------------------------------------------------------------------------
 struct TC {
@@ -105,6 +152,58 @@ static bool run_test(const TC& tc)
         x[i] = from_float((v - 40) * 0.1f);
     }
 
+    // Dump mode: compute y_ref via the naive oracle, write x/y hex files,
+    // and append a manifest line.  No kernel run, no comparison.
+    if (!g_dump_dir.empty()) {
+#ifndef POOL_HAVE_APFIXED
+        std::fprintf(stderr, "--dump-data requires POOL_HAVE_APFIXED build\n");
+        std::exit(1);
+#else
+        std::vector<Data_t> y_ref(out_size, Data_t(0));
+        for (int n = 0; n < tc.N; n++) {
+            for (int c = 0; c < tc.C; c++) {
+                for (int oh = 0; oh < tc.out_h; oh++) {
+                    for (int ow = 0; ow < tc.out_w; ow++) {
+                        float r = ref_pool_elem(
+                            x, tc.C, tc.H, tc.W,
+                            n, c, oh, ow,
+                            tc.pool_h, tc.pool_w,
+                            tc.stride_h, tc.stride_w,
+                            tc.pad_top, tc.pad_left,
+                            tc.dil_h, tc.dil_w,
+                            tc.pool_type, tc.lp_order,
+                            tc.count_include_pad);
+                        y_ref[(n * tc.C + c) * tc.out_h * tc.out_w
+                              + oh * tc.out_w + ow] = from_float(r);
+                    }
+                }
+            }
+        }
+
+        const int idx = g_test_idx++;
+        char idx_buf[16];
+        std::snprintf(idx_buf, sizeof(idx_buf), "%02d", idx);
+        const std::string prefix = g_dump_dir + "/test_" + idx_buf + "_";
+        write_hex_file(prefix + "x.hex", x);
+        write_hex_file(prefix + "y.hex", y_ref);
+
+        std::fprintf(g_manifest,
+                     "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %s\n",
+                     idx,
+                     tc.N, tc.C, tc.H, tc.W,
+                     tc.out_h, tc.out_w,
+                     tc.pool_h, tc.pool_w,
+                     tc.stride_h, tc.stride_w,
+                     tc.pad_top, tc.pad_left,
+                     tc.dil_h, tc.dil_w,
+                     tc.pool_type, tc.lp_order, tc.count_include_pad,
+                     sanitize_label(tc.name).c_str());
+        std::printf("[DUMP] test_%02d  %-45s  in=%d out=%d\n",
+                    idx, tc.name, in_size, out_size);
+        return true;
+#endif
+    }
+
     PoolingKernel(
         x.data(), y.data(),
         (unsigned)tc.N,    (unsigned)tc.C,
@@ -125,7 +224,7 @@ static bool run_test(const TC& tc)
             for (int oh = 0; oh < tc.out_h; oh++) {
                 for (int ow = 0; ow < tc.out_w; ow++) {
                     float ref = ref_pool_elem(
-                        x, tc.N, tc.C, tc.H, tc.W,
+                        x, tc.C, tc.H, tc.W,
                         n, c, oh, ow,
                         tc.pool_h, tc.pool_w,
                         tc.stride_h, tc.stride_w,
@@ -156,8 +255,35 @@ static bool run_test(const TC& tc)
 // ---------------------------------------------------------------------------
 // Test cases
 // ---------------------------------------------------------------------------
-int main()
+int main(int argc, char** argv)
 {
+    // Optional --dump-data <dir>: write per-test x/y_ref hex files plus a
+    // manifest, then exit (no kernel run).  Otherwise: original verify mode.
+    for (int i = 1; i < argc; ++i) {
+        const std::string a(argv[i]);
+        if ((a == "--dump-data" || a == "-d") && i + 1 < argc) {
+            g_dump_dir = argv[++i];
+        } else if (a == "--help" || a == "-h") {
+            std::printf("Usage: %s [--dump-data <dir>]\n", argv[0]);
+            return 0;
+        }
+    }
+
+    if (!g_dump_dir.empty()) {
+        const std::string manifest_path = g_dump_dir + "/manifest.txt";
+        g_manifest = std::fopen(manifest_path.c_str(), "w");
+        if (!g_manifest) {
+            std::fprintf(stderr, "Failed to open %s for writing\n",
+                         manifest_path.c_str());
+            return 1;
+        }
+        std::fprintf(g_manifest,
+            "# PoolingKernel test fixture manifest\n"
+            "# idx N C H W out_h out_w pool_h pool_w stride_h stride_w "
+            "pad_top pad_left dil_h dil_w pool_type lp_order "
+            "count_include_pad label\n");
+    }
+
     const TC tests[] = {
         // --- MaxPool ---
         // {name, N,C,H,W, out_h,out_w, pool_h,pool_w, stride_h,stride_w,
@@ -240,6 +366,15 @@ int main()
 
     for (int i = 0; i < n_tests; i++) {
         if (run_test(tests[i])) passed++;
+    }
+
+    if (!g_dump_dir.empty()) {
+        if (g_manifest) {
+            std::fclose(g_manifest);
+            g_manifest = nullptr;
+        }
+        printf("\nDumped %d test(s) to %s\n", g_test_idx, g_dump_dir.c_str());
+        return 0;
     }
 
     printf("\n%d / %d tests passed.\n", passed, n_tests);

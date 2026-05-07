@@ -143,6 +143,31 @@ target_compile_options(TestPoolingSim PRIVATE -Wall -Wextra -O2)
 enable_testing()
 add_test(NAME TestPoolingSim COMMAND TestPoolingSim)
 
+# ---------------------------------------------------------------------------
+# gen_pool_test_data — regenerate hex fixtures for the HDL testbench.
+#
+# Runs TestPoolingSim in --dump-data mode, writing per-test x/y_ref hex
+# files plus manifest.txt to ${CMAKE_BINARY_DIR}/pool_test_data/.  The
+# HDL testbench loads these via $readmemh, so HW-level tests stay
+# bit-identical to the C++ verification (same kSeed, same ref_pool_elem()
+# oracle).
+#
+# Requires the ap_fixed build (POOL_HAVE_APFIXED=ON via Vitis HLS headers).
+# ---------------------------------------------------------------------------
+set(POOL_TEST_DATA_DIR "${CMAKE_BINARY_DIR}/pool_test_data"
+    CACHE PATH "Output directory for PoolingKernel HDL testbench fixtures")
+
+if(_POOL_HAVE_HLS)
+    add_custom_target(gen_pool_test_data
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${POOL_TEST_DATA_DIR}"
+        COMMAND $<TARGET_FILE:TestPoolingSim> --dump-data "${POOL_TEST_DATA_DIR}"
+        DEPENDS TestPoolingSim
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Generating PoolingKernel HDL test fixtures → ${POOL_TEST_DATA_DIR}"
+        VERBATIM)
+    message(STATUS "PoolingKernel: gen_pool_test_data → ${POOL_TEST_DATA_DIR}")
+endif()
+
 message(STATUS "PoolingKernel: targets — pool_kernel, pool_kernel_float, TestPoolingSim")
 message(STATUS "PoolingKernel: Data_t=${POOL_DATA_TYPE}  "
                "AccData_t=${POOL_ACC_DATA_TYPE}  "

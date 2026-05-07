@@ -144,6 +144,31 @@ enable_testing()
 add_test(NAME TestMatmulRef COMMAND TestMatmulRef)
 
 # ---------------------------------------------------------------------------
+# gen_matmul_test_data — regenerate hex fixtures for the HDL testbench.
+#
+# Runs TestMatmulRef in --dump-data mode, writing per-test A/B/C_ref hex
+# files plus manifest.txt to ${CMAKE_BINARY_DIR}/matmul_test_data/.  The
+# HDL testbench loads these via $readmemh, so HW-level tests stay
+# bit-identical to the C++ verification (same kSeed, same ref_matmul_2d()
+# oracle).
+#
+# Requires the ap_fixed build (MATMUL_HAVE_APFIXED=ON via Vitis HLS headers).
+# ---------------------------------------------------------------------------
+set(MATMUL_TEST_DATA_DIR "${CMAKE_BINARY_DIR}/matmul_test_data"
+    CACHE PATH "Output directory for MatmulKernel HDL testbench fixtures")
+
+if(_MM_HAVE_HLS)
+    add_custom_target(gen_matmul_test_data
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MATMUL_TEST_DATA_DIR}"
+        COMMAND $<TARGET_FILE:TestMatmulRef> --dump-data "${MATMUL_TEST_DATA_DIR}"
+        DEPENDS TestMatmulRef
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Generating MatmulKernel HDL test fixtures → ${MATMUL_TEST_DATA_DIR}"
+        VERBATIM)
+    message(STATUS "MatmulKernel: gen_matmul_test_data → ${MATMUL_TEST_DATA_DIR}")
+endif()
+
+# ---------------------------------------------------------------------------
 # TestMatmulBlas — validates the float kernel against cblas_sgemm.
 #
 # Requires libblas-dev (provides cblas.h and libblas.so).  Skipped silently
