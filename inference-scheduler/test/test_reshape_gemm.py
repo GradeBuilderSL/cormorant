@@ -79,7 +79,7 @@ class TestGemmPreprocess(unittest.TestCase):
 
     def test_gemm_with_bias_becomes_matmul_add(self):
         model = self._make_gemm_model(with_bias=True)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         ops = [n.op_type for n in result.graph.node]
         self.assertIn("MatMul", ops)
         self.assertIn("Add",    ops)
@@ -87,7 +87,7 @@ class TestGemmPreprocess(unittest.TestCase):
 
     def test_gemm_no_bias_becomes_matmul_only(self):
         model = self._make_gemm_model(with_bias=False)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         ops = [n.op_type for n in result.graph.node]
         self.assertIn("MatMul", ops)
         self.assertNotIn("Gemm", ops)
@@ -96,7 +96,7 @@ class TestGemmPreprocess(unittest.TestCase):
     def test_gemm_intermediate_in_value_info(self):
         """MatMul output tensor from Gemm decomposition appears in value_info."""
         model  = self._make_gemm_model(with_bias=True)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         vi_names = {vi.name for vi in result.graph.value_info}
         # The MatMul output should be registered so tensor registry can find it
         matmul_out = next(
@@ -107,7 +107,7 @@ class TestGemmPreprocess(unittest.TestCase):
     def test_gemm_matmul_feeds_add(self):
         """Add node's first input == MatMul node's output."""
         model  = self._make_gemm_model(with_bias=True)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         mm_out = next(n.output[0] for n in result.graph.node if n.op_type == "MatMul")
         add_in = next(n.input[0]  for n in result.graph.node if n.op_type == "Add")
         self.assertEqual(mm_out, add_in)
@@ -125,7 +125,7 @@ class TestGemmPreprocess(unittest.TestCase):
         )
         model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model  = shape_inference.infer_shapes(model)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         self.assertIs(result, model)   # identical object when nothing changed
 
     def test_gemm_transA_raises(self):
@@ -152,7 +152,7 @@ class TestGemmPreprocess(unittest.TestCase):
         )
         model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model  = shape_inference.infer_shapes(model)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
 
         # 1. The rewritten graph contains exactly one MatMul, no Gemm.
         ops = [n.op_type for n in result.graph.node]
@@ -222,7 +222,7 @@ class TestGemmPreprocess(unittest.TestCase):
         )
         model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model  = shape_inference.infer_shapes(model)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         wt_count = sum(1 for i in result.graph.initializer if i.name == "W_T")
         self.assertEqual(wt_count, 1)
 
@@ -248,7 +248,7 @@ class TestGemmPreprocess(unittest.TestCase):
         )
         model  = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model  = shape_inference.infer_shapes(model)
-        result = OnnxGraph._preprocess_model(model)
+        result, _ = OnnxGraph._preprocess_model(model)
         ops    = [n.op_type for n in result.graph.node]
         self.assertEqual(ops.count("MatMul"), 2)
         self.assertEqual(ops.count("Add"),    2)

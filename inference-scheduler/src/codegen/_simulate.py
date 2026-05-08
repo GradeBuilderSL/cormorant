@@ -32,7 +32,8 @@ file are needed: all type-specific logic is encapsulated in ``DataType``.
 """
 
 from __future__ import annotations
-from typing import Dict, List
+from collections import namedtuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -44,6 +45,53 @@ from ..nodes  import (
 from ..tensor import TensorInfo
 
 # Expected GT arrays larger than this threshold are written to external
+
+
+ResidualStats = namedtuple("ResidualStats", ("abs_max", "nrmse", "sqnr_db"))
+
+
+def _residual_stats(full: np.ndarray, quant: np.ndarray,
+                    *, eps: float = 1e-12) -> ResidualStats:
+    """Tensor-level summary of the residual ``r = full − quant``.
+
+    Returns three numbers:
+
+    * ``abs_max``  — ``max |r|`` over all elements; the tightest bound on
+      any single-element error.  Useful for verifying the dtype's
+      theoretical LSB ceiling.
+    * ``nrmse``    — normalised RMS error, ``‖r‖₂ / ‖full‖₂``.  Treats
+      the residual as noise and the original as signal, weighted by
+      magnitude — so a single near-zero element cannot dominate, unlike
+      max-elementwise relative error.
+    * ``sqnr_db``  — signal-to-quantisation-noise ratio in decibels,
+      ``20·log₁₀(‖full‖₂ / ‖r‖₂)``.  Higher is better.  This is the
+      standard quality metric for fixed-point quantisation.
+
+    Edge cases:
+      * All-zero ``full`` and zero residual: ``nrmse = 0``, ``sqnr_db = inf``.
+      * All-zero ``full`` with non-zero residual (impossible for true
+        quantisation, defensive only): ``nrmse = inf``, ``sqnr_db = -inf``.
+    """
+    full  = np.asarray(full,  dtype=np.float64)
+    quant = np.asarray(quant, dtype=np.float64).reshape(full.shape)
+    r = full - quant
+
+    abs_max = float(np.abs(r).max()) if r.size else 0.0
+    norm_r  = float(np.linalg.norm(r.flat))
+    norm_w  = float(np.linalg.norm(full.flat))
+
+    if norm_w <= eps:
+        # Tensor is essentially zero — relative metrics aren't meaningful.
+        if norm_r <= eps:
+            return ResidualStats(abs_max, 0.0, float("inf"))
+        return ResidualStats(abs_max, float("inf"), float("-inf"))
+
+    nrmse = norm_r / norm_w
+    if norm_r <= eps:
+        sqnr_db = float("inf")
+    else:
+        sqnr_db = 20.0 * np.log10(norm_w / norm_r)
+    return ResidualStats(abs_max, nrmse, float(sqnr_db))
 
 
 def _conv2d_ref(
@@ -233,6 +281,37 @@ class _SimulateMixin:
     # Internal: ramp-input simulation (used by generate_test)             #
     # ------------------------------------------------------------------ #
 
+    def compute_quant_errors(self) -> Dict[str, Tuple[float, float]]:
+        """Run the ramp-input simulation and return ``{output_name:
+        (abs_max, rel_max)}`` for every kernel-bearing node.
+
+        ReshapeNodes have no truncation (pure buffer alias) and are
+        omitted.  Used by the report generator to surface per-layer
+        quantization residuals when the active dtype is fixed-point.
+        Always runs in float64; the figures are independent of any
+        runtime numpy quirks on the deployment platform.
+        """
+        ramp_inputs = self._build_ramp_inputs()
+        errors: Dict[str, Tuple[float, float]] = {}
+        self._forward_pass(ramp_inputs, errors_out=errors)
+        return errors
+
+    def _build_ramp_inputs(self) -> Dict[str, np.ndarray]:
+        """Construct the same ramp inputs ``_simulate()`` uses, factored
+        out so ``compute_quant_errors()`` can share the seeding logic
+        without duplicating it."""
+        dtype = self._dtype
+        ramp_inputs: Dict[str, np.ndarray] = {}
+        for t in self._graph.input_tensors:
+            idx = np.arange(t.numel, dtype=np.int64)
+            lay = self._layouts.get(t.onnx_name)
+            if lay and lay.n_chunks > 1:
+                positions = (idx // lay.chunk) * lay.stride + (idx % lay.chunk)
+            else:
+                positions = idx
+            ramp_inputs[t.onnx_name] = dtype.ramp_to_float(positions).reshape(t.shape)
+        return ramp_inputs
+
     def _simulate(self) -> Dict[str, np.ndarray]:
         """
         Forward-pass with the ramp inputs that generate_test() writes into
@@ -250,19 +329,7 @@ class _SimulateMixin:
         {onnx_name: ndarray}  for every tensor visited (inputs, weights,
         intermediates, outputs), float64 in logical shape.
         """
-        dtype = self._dtype
-        ramp_inputs: Dict[str, np.ndarray] = {}
-
-        for t in self._graph.input_tensors:
-            idx = np.arange(t.numel, dtype=np.int64)
-            lay = self._layouts.get(t.onnx_name)
-            if lay and lay.n_chunks > 1:
-                positions = (idx // lay.chunk) * lay.stride + (idx % lay.chunk)
-            else:
-                positions = idx
-            ramp_inputs[t.onnx_name] = dtype.ramp_to_float(positions).reshape(t.shape)
-
-        return self._forward_pass(ramp_inputs)
+        return self._forward_pass(self._build_ramp_inputs())
 
     # ------------------------------------------------------------------ #
     # Core: topological forward pass                                      #
@@ -271,16 +338,32 @@ class _SimulateMixin:
     def _forward_pass(
         self,
         input_arrays: Dict[str, np.ndarray],
+        errors_out: Optional[Dict[str, "tuple"]] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Run every ScheduledNode in topological order, quantizing outputs with
         ``self._dtype.quantize()`` at each step.  Numpy broadcasting handles
         the same trailing-contiguous rules as the hardware broadcast loop.
 
+        If ``errors_out`` is provided, each kernel-bearing node's output is
+        accompanied by an ``(abs_max, rel_max)`` tuple measuring the
+        truncation residual at that node — i.e. ``full_precision_result -
+        dtype.truncate(...)``.  ReshapeNodes (no truncation) are skipped.
+
         Returns {onnx_name: float64 ndarray} for every tensor visited.
         """
         dtype   = self._dtype
         arrays: Dict[str, np.ndarray] = {}
+
+        def _store_quant(name, full, truncate_fn=dtype.truncate, shape=None):
+            quant = truncate_fn(full)
+            if shape is not None:
+                quant = quant.reshape(shape)
+            arrays[name] = quant
+            if errors_out is not None:
+                full_r = full.reshape(shape) if shape is not None else full
+                errors_out[name] = _residual_stats(full_r, quant)
+            return quant
 
         # Seed with quantized weights (mirrors the ROM encoding written to C)
         for t in self._graph.weight_tensors:
@@ -297,30 +380,27 @@ class _SimulateMixin:
             if isinstance(sn, MatmulNode):
                 a = arrays[sn.inputs[0].onnx_name]
                 b = arrays[sn.inputs[1].onnx_name]
-                result = np.matmul(a, b)
-                arrays[sn.output.onnx_name] = dtype.truncate(result).reshape(
-                    sn.output.shape
-                )
+                _store_quant(sn.output.onnx_name, np.matmul(a, b),
+                             shape=sn.output.shape)
                 continue
 
             if isinstance(sn, ConvNode):
                 conv_fn = _depthwise_conv2d_ref if sn.is_depthwise else _conv2d_ref
-                arrays[sn.output.onnx_name] = dtype.truncate(
-                    conv_fn(
-                        x=arrays[sn.inputs[0].onnx_name],
-                        w=arrays[sn.inputs[1].onnx_name],
-                        bias=(arrays[sn.inputs[2].onnx_name]
-                              if sn.has_bias else None),
-                        stride_h=sn.stride_h,
-                        stride_w=sn.stride_w,
-                        pad_top=sn.pad_top,
-                        pad_left=sn.pad_left,
-                        dilation_h=sn.dilation_h,
-                        dilation_w=sn.dilation_w,
-                        out_h=sn.out_h,
-                        out_w=sn.out_w,
-                    )
-                ).reshape(sn.output.shape)
+                full = conv_fn(
+                    x=arrays[sn.inputs[0].onnx_name],
+                    w=arrays[sn.inputs[1].onnx_name],
+                    bias=(arrays[sn.inputs[2].onnx_name]
+                          if sn.has_bias else None),
+                    stride_h=sn.stride_h,
+                    stride_w=sn.stride_w,
+                    pad_top=sn.pad_top,
+                    pad_left=sn.pad_left,
+                    dilation_h=sn.dilation_h,
+                    dilation_w=sn.dilation_w,
+                    out_h=sn.out_h,
+                    out_w=sn.out_w,
+                )
+                _store_quant(sn.output.onnx_name, full, shape=sn.output.shape)
                 continue
 
             if isinstance(sn, ReshapeNode):
@@ -329,24 +409,23 @@ class _SimulateMixin:
                 continue
 
             if isinstance(sn, PoolNode):
-                arrays[sn.output.onnx_name] = dtype.truncate(
-                    _pool2d_ref(
-                        x=arrays[sn.inputs[0].onnx_name],
-                        pool_h=sn.pool_h,
-                        pool_w=sn.pool_w,
-                        stride_h=sn.stride_h,
-                        stride_w=sn.stride_w,
-                        pad_top=sn.pad_top,
-                        pad_left=sn.pad_left,
-                        dil_h=sn.dil_h,
-                        dil_w=sn.dil_w,
-                        out_h=sn.out_h,
-                        out_w=sn.out_w,
-                        pool_type=sn.pool_type,
-                        lp_order=sn.lp_order,
-                        count_include_pad=sn.count_include_pad,
-                    )
-                ).reshape(sn.output.shape)
+                full = _pool2d_ref(
+                    x=arrays[sn.inputs[0].onnx_name],
+                    pool_h=sn.pool_h,
+                    pool_w=sn.pool_w,
+                    stride_h=sn.stride_h,
+                    stride_w=sn.stride_w,
+                    pad_top=sn.pad_top,
+                    pad_left=sn.pad_left,
+                    dil_h=sn.dil_h,
+                    dil_w=sn.dil_w,
+                    out_h=sn.out_h,
+                    out_w=sn.out_w,
+                    pool_type=sn.pool_type,
+                    lp_order=sn.lp_order,
+                    count_include_pad=sn.count_include_pad,
+                )
+                _store_quant(sn.output.onnx_name, full, shape=sn.output.shape)
                 continue
 
             a = arrays[sn.inputs[0].onnx_name]
@@ -362,9 +441,9 @@ class _SimulateMixin:
                 # DIV: HLS computes a_int / b_int (C integer division =
                 # truncation toward zero), so use truncate_div instead of
                 # the default truncate (floor toward −∞).
-                arrays[sn.output.onnx_name] = dtype.truncate_div(result).reshape(
-                    sn.output.shape
-                )
+                _store_quant(sn.output.onnx_name, result,
+                             truncate_fn=dtype.truncate_div,
+                             shape=sn.output.shape)
                 continue
             elif sn.op_code == OP_RELU:
                 result = np.maximum(a, 0.0)
@@ -376,9 +455,7 @@ class _SimulateMixin:
                     f"in node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
                 )
 
-            arrays[sn.output.onnx_name] = dtype.truncate(result).reshape(
-                sn.output.shape
-            )
+            _store_quant(sn.output.onnx_name, result, shape=sn.output.shape)
 
         return arrays
 

@@ -44,6 +44,7 @@ from src.codegen          import CodeGenerator
 from src.codegen._simulate import LARGE_EXPECTED_THRESHOLD
 from src.kernels           import KERNEL_REGISTRY, mixed_driver_readme
 from src.nodes            import SchedulerError
+from src.report           import ReportGenerator
 from src.tensor           import LARGE_WEIGHT_THRESHOLD
 
 
@@ -109,6 +110,12 @@ def parse_args(argv=None):
             f"would normally be written to external expected/*.dat files. "
             f"Produces a larger but fully self-contained test file."
         ),
+    )
+    p.add_argument(
+        "--no-report",
+        action="store_true",
+        default=False,
+        help="Skip writing report.md (the human-readable model summary).",
     )
     return p.parse_args(argv)
 
@@ -304,7 +311,7 @@ def main(argv=None):
               file=sys.stderr)
 
     # ---------------------------------------------------------------- #
-    # 7. Report                                                         #
+    # 7. Generated-files summary on stderr                              #
     # ---------------------------------------------------------------- #
     print("", file=sys.stderr)
     print("Generated project:", file=sys.stderr)
@@ -326,6 +333,25 @@ def main(argv=None):
         report_items.append("weights/")
     if large_expected:
         report_items.append("expected/")
+
+    # ---------------------------------------------------------------- #
+    # 8. Markdown report (model summary, transformations, layers)      #
+    # ---------------------------------------------------------------- #
+    if not args.no_report:
+        report_items.append("report.md")
+        try:
+            md = ReportGenerator(
+                graph=graph, codegen=gen,
+                model_path=args.model, out_dir=out_dir,
+                generated_files=report_items,
+            ).render_markdown()
+            _write(os.path.join(out_dir, "report.md"), md)
+        except Exception as e:
+            # The report is informational; never let a formatting bug
+            # break a successful project generation.
+            print(f"warning: report.md not written ({e})", file=sys.stderr)
+            report_items.remove("report.md")
+
     for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)
 

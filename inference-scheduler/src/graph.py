@@ -80,7 +80,14 @@ class OnnxGraph:
     """Parsed, validated, and resolved ONNX computation graph."""
 
     @staticmethod
-    def _preprocess_model(model: onnx.ModelProto) -> onnx.ModelProto:
+    def _preprocess_model(model: onnx.ModelProto):
+        """Rewrite Gemm → MatMul + Add (when applicable) so downstream node
+        classes only see the supported op set.
+
+        Returns ``(rewritten_model, gemm_decomposed_count)``.  The count is
+        zero for graphs that contained no Gemm nodes (in which case the
+        original model is returned unmodified).
+        """
         """
         Simplify the ONNX graph before scheduling:
 
@@ -211,7 +218,7 @@ class OnnxGraph:
                 )
 
         if gemm_counter[0] == 0:
-            return model  # nothing changed
+            return model, 0  # nothing changed
 
         new_graph = onnx_helper.make_graph(
             new_nodes,
@@ -225,7 +232,7 @@ class OnnxGraph:
             new_graph, opset_imports=list(model.opset_import)
         )
         new_model.ir_version = model.ir_version
-        return new_model
+        return new_model, gemm_counter[0]
 
     def __init__(self, model_path: str,
                  dtype: DataType = None) -> None:
@@ -241,8 +248,10 @@ class OnnxGraph:
         # Run shape inference so every intermediate tensor gets a shape
         model = shape_inference.infer_shapes(model)
 
-        # Simplify: decompose Gemm → MatMul + Add
-        model = OnnxGraph._preprocess_model(model)
+        # Simplify: decompose Gemm → MatMul + Add.  The count is exposed via
+        # ``self.gemm_decomposed_count`` so the report generator can list it
+        # as an applied transformation.
+        model, self.gemm_decomposed_count = OnnxGraph._preprocess_model(model)
 
         graph = model.graph
 
