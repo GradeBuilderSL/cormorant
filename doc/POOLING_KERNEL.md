@@ -124,9 +124,9 @@ for ni in [0, batch)                    // batch dimension
 - Validates NCHW 4-D shapes; parses `kernel_shape`, `strides`, `dilations`, `auto_pad` (NOTSET/VALID/SAME_UPPER/SAME_LOWER), `pads`, `p`, `count_include_pad`; rejects `ceil_mode=1`
 - Global variants normalized to `pool=in_spatial, stride=1, pad=0`
 
-**Code-generated `run_pool()` (`_source.py`)** sets all 19 AXI-Lite scalar registers, calls `XPoolingkernel_Start()`, and spins on `XPoolingkernel_IsDone()`.
+**Code-generated `run_pool()` (`_source.py`)** sets all 19 AXI-Lite scalar registers and calls `XPoolingkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_POOL)` later, only when a downstream op needs the Pool output or another op wants to reuse the Pool lane, which lets work on other lanes (e.g. Conv, VectorOP) overlap with the Pool.
 
-**Buffer layout (`_core.py`)** packs all pool tensor buffers into a single contiguous 64-byte-aligned DMA allocation.
+**Buffer layout (`_core.py`)** packs all pool tensor buffers into a single contiguous 64-byte-aligned DMA allocation. Slot colouring uses event-stream liveness intervals so two tensors share a slot only when one is fully drained before the other's producer starts.
 
 **Reference simulation (`_simulate.py`)** implements float64 `_pool2d_ref()` matching kernel semantics for bit-accurate test comparison.
 

@@ -492,6 +492,9 @@ def print_report(results: List[ModelResult]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _load_json(path: Path) -> dict:
+    if not path.exists():
+        from _config_help import missing_config_die
+        missing_config_die(path)
     with open(path) as f:
         return json.load(f)
 

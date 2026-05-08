@@ -20,6 +20,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_pool_models.py
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
+.venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 
 # Run all tests
 .venv/bin/python -m pytest test/ -v
@@ -67,9 +68,13 @@ src/
   tensor.py              TensorInfo: metadata + C declaration emitters
   nodes.py               ScheduledNode: ONNX op → VectorOPKernel call
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
+  schedule.py            Dag: data-flow DAG over scheduled nodes; topological order,
+                         predecessors/successors, independent-pair queries
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
-    _core.py             _compute_tensor_layouts() → TensorLayout; large-tensor lists, pool sizing
+    _core.py             _compute_event_stream() → list of Start/Wait/Drain events
+                         _compute_live_intervals() → event-stream-based intervals
+                         _compute_tensor_layouts() → TensorLayout; pool slot colouring
     _header.py           generate_header()  → include/inference.h
     _source.py           generate_source()  → src/inference.c
     _buf_impl.py         generate_buf_impl() → src/inference_buf.c
@@ -81,7 +86,11 @@ test/
   gen_test_models.py     Build all test ONNX models
   helpers.py             _model(), _models_exist() shared by test modules
   models/                Pre-generated ONNX models (single_add.onnx, etc.)
-  test_*.py              pytest test modules (897 tests total)
+  test_*.py              pytest test modules (1086 tests total)
+                         — includes test_dag.py (DAG correctness),
+                           test_parallel_waits.py (split start/wait emission),
+                           test_nop_corner_cases.py (NOP-layer corner cases),
+                           test_profiler_overlap.py (overlapping bracket support)
 ```
 
 ## Key Abstractions
@@ -170,6 +179,105 @@ Allocation rules (`_compute_tensor_layouts` → `TensorLayout`):
 - Phase 3: layout propagates forward through non-broadcast, non-MatmulNode chains
 - MatmulNode reads row strides directly from `TensorLayout.gap` at emit time
 
+### Memory layout — event-stream liveness
+
+Pool-slot colouring uses interval-graph greedy first-fit. The
+**intervals are derived from the event stream**, not from node-index
+order, so two tensors share a slot only when one is fully drained
+before the other's producer starts under the parallel-wait emission.
+
+For each non-Reshape intermediate tensor `T`:
+
+- `start_event` = event index of `T`'s producer Start
+- `end_event`   = max event index of any `kernel_wait` that drains a
+  consumer on its lane
+- Consumers reached via a ReshapeNode chain (Squeeze, Unsqueeze,
+  Reshape, Dropout, Flatten — all `RESHAPE_OP_TYPES`) extend `T`'s
+  interval through the alias: a `Pool → Squeeze → MatMul` chain keeps
+  Pool's output buffer live until the Matmul lane drains.
+
+This is what makes parallel branches correct: in `parallel_two_chains`,
+`ca1` (consumed by Pool) and `cb0` (written by Conv-B in parallel) have
+overlapping event intervals, so the colouring places them in different
+slots even though their node indices look disjoint. Coloring is still
+valid for the strictly-sequential case — every node-index interval is
+also an event-index interval.
+
+The Dag invariant *"if two tensors share a pool offset, their event
+intervals must be strictly disjoint"* is enforced by
+`test/test_nop_corner_cases.py::TestNopFixturesNoSlotAliasing` across
+every NOP fixture.
+
+### Schedule (DAG) — `src/schedule.py`
+
+`Dag.from_graph(OnnxGraph)` builds a producer/consumer DAG over the
+scheduled node list:
+
+- Edge `u → v` iff some intermediate tensor produced by `u` is consumed
+  by `v`. Graph inputs and constant initializers are **external** —
+  they impose no edges (they're already available before
+  `inference_run()` enters its body).
+- ReshapeNodes appear as ordinary DAG nodes (`kernel_name == ""`), so
+  consumers of an alias are correctly ordered after the producer of the
+  underlying source. The event-stream walker traverses through them
+  when it needs the *real* producing kernel for wait emission.
+
+Public API: `predecessors(idx)`, `successors(idx)`, `roots()`,
+`leaves()`, `topological_order()` (deterministic Kahn), `ancestors()`,
+`independent_pairs()`. The DAG is the foundation for the parallel-wait
+scheduler — it answers "which nodes have all their data ready" and
+"which nodes are concurrency-independent".
+
+### Parallel kernel execution (`kernel_wait`)
+
+Each kernel-bearing node lives on exactly one hardware lane (`Conv`,
+`Pool`, `Matmul`, `VectorOP`); only one of each IP exists on the FPGA.
+The codegen overlaps work across **different** lanes.
+
+**Helpers** are non-blocking: `run_op()` / `run_matmul()` / `run_conv()`
+/ `run_pool()` program the AXI-Lite registers, call `XKernel_Start()`,
+and return immediately. (`run_matmul_at()` — used only inside the 4D×3D
+outer loop where iterations would race on the same Matmul registers —
+remains synchronous.)
+
+**Sync** funnels through a single weak-symbol primitive emitted into the
+generated source:
+
+```c
+typedef enum {
+    KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL, KERNEL_COUNT
+} kernel_id_t;
+
+__attribute__((weak))
+void kernel_wait(kernel_id_t k);   // default: poll IsDone in a tight loop
+```
+
+Override at link time to swap in IRQ-driven waiting (UIO under Linux,
+GIC under bare-metal) without touching the generated code.
+
+**Event stream** — `CodeGenerator._compute_event_stream()` is the single
+source of truth for the schedule. It walks `graph.nodes` once, tracks
+`pending[lane] → node_idx`, and emits a deterministic sequence:
+
+```
+('comment', node_idx)              ─ node header
+('start',   node_idx)              ─ non-blocking Start
+('start_sync', node_idx)           ─ Start whose helper drains internally
+('wait',    kid, drained_idx)      ─ kernel_wait(KERNEL_*) call
+('drain',   kid, drained_idx)      ─ final wait before output cache sync
+('reshape', node_idx)              ─ ReshapeNode (no kernel work)
+```
+
+Both the body emitter (`_inference_function`) and the live-interval
+analyser (`_compute_live_intervals`) consume this stream verbatim, so
+the buffer-slot colouring and the emitted waits cannot disagree about
+which lanes are in flight at any point.
+
+A wait fires only when (a) some predecessor is still in flight on its
+lane, or (b) the target lane has a different op pending. Predecessor
+analysis walks **through** ReshapeNode chains to reach the real
+producing kernel.
+
 ### Cache Coherency Model
 
 The kernel's AXI master reads/writes DDR using **physical addresses** programmed
@@ -180,8 +288,8 @@ into AXI-Lite registers. CPU cache must be explicitly managed:
 
 **Contract**:
 - `inference_init()`: syncs each weight buffer **once** after `memcpy` from ROM
-- `inference_run()`: syncs all graph **inputs** at the top, all graph **outputs** at the bottom
-- `run_op()`: performs **no sync** — pure AXI-Lite register writes + poll
+- `inference_run()`: syncs all graph **inputs** at the top, all graph **outputs** at the bottom; `kernel_wait` calls drain in-flight kernels before the output sync
+- `run_*()` helpers: pure AXI-Lite register writes + Start (no sync, no poll)
 - Internal kernel-to-kernel buffers (intermediates): **no sync ever needed**
 
 ### Large Tensor Handling

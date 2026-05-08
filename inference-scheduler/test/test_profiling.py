@@ -76,10 +76,14 @@ class TestProfilingEmissions(unittest.TestCase):
 
     def test_kernel_call_wrapped_with_prof_macros(self):
         s = self._gen("single_add.onnx").generate_source()
-        # The Add call must sit between PROF_BEGIN(0) and PROF_END(0).
+        # PROF_BEGIN(0) precedes the (now non-blocking) Start; PROF_END(0)
+        # follows the matching kernel_wait that drains lane 0.  The drain
+        # may include a comment line and the wait call between Start and END.
         m = re.search(
             r"INFERENCE_PROF_BEGIN\(0u\);\s*"
-            r"run_op\([^)]*\);\s*"
+            r"run_op\([^)]*\);"
+            r"(?:\s*/\*[^*]*\*/)?"             # optional drain comment
+            r"\s*kernel_wait\(KERNEL_\w+\);\s*"
             r"INFERENCE_PROF_END\(0u\);",
             s,
         )

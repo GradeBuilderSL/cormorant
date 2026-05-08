@@ -68,10 +68,8 @@ def _http_download(url: str, dst: Path) -> None:
 
 def _load_config(path: Path) -> dict:
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} does not exist — copy "
-            f"image_classification_config.json.example and edit it."
-        )
+        from _config_help import missing_config_die
+        missing_config_die(path)
     with open(path) as f:
         return json.load(f)
 

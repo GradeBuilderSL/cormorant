@@ -40,7 +40,7 @@ flowchart TB
 
 Three pieces:
 
-1. **`inference_prof`** — flat-API per-layer aggregator (`init/reset/begin/end/dump_json/deinit`).  Codegen wraps every kernel-backed node call with `INFERENCE_PROF_BEGIN(idx)` / `INFERENCE_PROF_END(idx)`.  Counters are aggregate-only (count / total_ns / min_ns / max_ns) — no sample reservoir, ~32 B per layer.
+1. **`inference_prof`** — flat-API per-layer aggregator (`init/reset/begin/end/dump_json/deinit`).  Codegen wraps every kernel-backed node call with `INFERENCE_PROF_BEGIN(idx)` / `INFERENCE_PROF_END(idx)`.  Counters are aggregate-only (count / total_ns / min_ns / max_ns) plus a per-layer `begin_ns` slot for overlapping brackets — no sample reservoir, ~40 B per layer.
 2. **`inference_ddr`** — dispatcher that walks a vtable registry of platform backends (`probe → start → sample* → stop → read_counts → dump_json`).  The first backend whose `probe()` succeeds wins; one env var skips probing.
 3. **Codegen integration** — emits a `static const char *const inference_layer_names[N]` table next to the kernel-driver instances, plus `inference_num_layers()` / `inference_layer_names_ptr()` accessors.  Layer names use `onnx_node.name` when present, falling back to `op_type_index`; collisions are resolved by suffixing every collider with `_index`.
 
@@ -105,12 +105,23 @@ profiler.  In the generated project, the codegen-emitted
 `inference_layer_names[]` array is `static const`, so passing
 `inference_layer_names_ptr()` always satisfies that contract.
 
-`begin/end` pairs are **strictly nested** — no overlap, no thread safety.
-Defensive guards inside `end()` discard stray calls whose `layer_idx`
-doesn't match the most recent `begin()`.
+Each layer index has its own `begin_ns` slot, so `begin/end` brackets
+for **different** indices may freely overlap — which they do under the
+parallel-wait codegen (Conv ‖ Pool ‖ VectorOP across non-dependent
+branches). For the **same** index, a second `begin()` without an
+intervening `end()` overwrites the first start time. Stray `end()`
+calls without a matching `begin()` are silently dropped.  No thread
+safety.
 
 Codegen emits the `_BEGIN/_END` wrap automatically; host code never
-calls them directly.
+calls them directly. Brackets are placed by the event-stream walker:
+`PROF_BEGIN(N)` immediately precedes the (non-blocking) `Start` of node
+`N`, and `PROF_END(N)` is emitted right after the matching
+`kernel_wait` that drains `N`'s lane (or after the helper itself for
+synchronous nodes whose helper polls internally — currently only
+`run_matmul_at`). This means each layer's recorded duration is the
+true wall-clock from "Start fired" to "lane drained", even when the
+brackets of other layers overlap with it.
 
 ### DDR bandwidth
 
@@ -483,10 +494,13 @@ two orders of magnitude faster than wrap.
 
 ### Aggregate-only profiling
 
-`inference_prof` keeps `count + total_ns + min_ns + max_ns` per layer —
-≈32 bytes per layer plus a borrowed name pointer.  No sample reservoir
-means no percentiles, but RAM cost is constant regardless of run length.
-Mean is computed from `total_ns / calls` at dump time.
+`inference_prof` keeps `count + total_ns + min_ns + max_ns + begin_ns`
+per layer — ≈40 bytes per layer plus a borrowed name pointer.  The
+per-layer `begin_ns` slot is what lets brackets for different indices
+overlap correctly (the older single-global design dropped the
+overlapping sample). No sample reservoir means no percentiles, but RAM
+cost is constant regardless of run length.  Mean is computed from
+`total_ns / calls` at dump time.
 
 ### Layer-call window
 

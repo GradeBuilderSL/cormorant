@@ -264,7 +264,8 @@ def generate_for_model(*, model_name: str, model_path: Path,
 
 def _load_config(path: Path) -> dict:
     if not path.exists():
-        raise FileNotFoundError(f"{path} does not exist")
+        from _config_help import missing_config_die
+        missing_config_die(path)
     with open(path) as f:
         return json.load(f)
 

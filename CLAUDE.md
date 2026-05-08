@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AXI-stream vector operation IP core for Xilinx FPGAs, implemented in Vitis HLS. The kernel reads up to two equal-length element arrays, applies a runtime-selected element-wise operation, and writes the results to a third array. Six operations are supported (Add, Sub, Mul, Div, Relu, Relu6); the selector is a runtime AXI-Lite register. The vector length and element data type are also configurable at runtime and CMake configure time respectively.
 
-The repository also contains **`inference-scheduler/`**, a Python code-generator that parses an ONNX model and emits a self-contained C file that drives `VectorOPKernel` sequentially for every supported layer using the generated XVectoropkernel driver API and the Xil bare-metal library.
+The repository also contains **`inference-scheduler/`**, a Python code-generator that parses an ONNX model and emits a self-contained C project that drives all four hardware IPs (VectorOPKernel, MatmulKernel, ConvKernel, PoolingKernel) using the generated Xilinx driver APIs and the Xil bare-metal library. The codegen overlaps work across different kernel lanes — ops on distinct lanes (e.g. Conv ‖ Pool) run concurrently, with synchronisation funnelled through a single weak-symbol `kernel_wait()` primitive that defaults to polling but can be link-overridden for IRQ/UIO waiting. Pool-slot colouring uses event-stream liveness intervals so two tensors share a slot only when one is fully drained before the other's producer starts.
 
 ## Build System
 

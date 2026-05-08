@@ -29,6 +29,10 @@ from pathlib import Path
 DEMO_DIR = Path(__file__).resolve().parent
 SCRIPTS  = DEMO_DIR / "scripts"
 
+# Pull in the shared bootstrap-error helper from scripts/.
+sys.path.insert(0, str(SCRIPTS))
+from _config_help import format_missing_config  # noqa: E402
+
 
 def _run(label: str, cmd: list) -> int:
     print(f"\n=== {label} ===")
@@ -55,6 +59,14 @@ def main(argv=None) -> int:
                         "(per-layer wall-clock stats)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
+
+    # Fail fast with a comprehensive, copy-pasteable error before invoking
+    # any subscript — otherwise the user sees an opaque traceback from
+    # whichever stage runs first.
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(format_missing_config(config_path), file=sys.stderr)
+        return 2
 
     py = sys.executable
 

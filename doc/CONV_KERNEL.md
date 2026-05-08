@@ -188,7 +188,7 @@ for ni in [0, batch)
 - Determines `is_depthwise`: group=1 → standard, group=in_ch → depthwise, otherwise rejected
 - Enforces `kh ≤ kMaxKH`, `kw ≤ kMaxKW`
 
-**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers, calls `XConvkernel_Start()`, and spins on `XConvkernel_IsDone()`. The `bias` argument may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case.
+**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case.
 
 **Layout constraint (`_core.py`):** `ConvKernel` writes a flat NCHW output. If the output tensor feeds a broadcast `VectorOP` node that requires an advancing-strided layout (`n_chunks > 1`), the scheduler raises a `SchedulerError`. Per-channel bias must be passed as the Conv operator's 3rd input, not as a separate downstream `Add` node.
 

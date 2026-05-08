@@ -25,13 +25,18 @@ typedef struct {
     uint64_t total_ns;
     uint64_t min_ns;
     uint64_t max_ns;
+    /* Timestamp of the most-recent PROF_BEGIN for this layer.  PROF_BEGIN/END
+     * brackets for different layer indices may overlap freely (which they do
+     * under cross-lane kernel parallelism — Conv ‖ Pool ‖ VectorOP), so each
+     * layer needs its own start-time slot.  UINT64_MAX = no pending begin. */
+    uint64_t begin_ns;
 } prof_layer_t;
 
-static prof_layer_t       *g_layers      = NULL;
-static const char *const  *g_names       = NULL;
-static unsigned            g_n_layers    = 0u;
-static uint64_t            g_begin_ns    = 0u;   /* begin → end carry */
-static unsigned            g_begin_layer = 0u;   /* layer that called begin */
+#define PROF_NO_BEGIN  UINT64_MAX
+
+static prof_layer_t       *g_layers   = NULL;
+static const char *const  *g_names    = NULL;
+static unsigned            g_n_layers = 0u;
 
 static uint64_t now_ns(void)
 {
@@ -64,24 +69,25 @@ void inference_prof_reset(void)
         g_layers[i].total_ns = 0u;
         g_layers[i].min_ns   = UINT64_MAX;
         g_layers[i].max_ns   = 0u;
+        g_layers[i].begin_ns = PROF_NO_BEGIN;
     }
 }
 
 void inference_prof_begin(unsigned layer_idx)
 {
     if (layer_idx >= g_n_layers) return;
-    g_begin_layer = layer_idx;
-    g_begin_ns    = now_ns();
+    g_layers[layer_idx].begin_ns = now_ns();
 }
 
 void inference_prof_end(unsigned layer_idx)
 {
     if (layer_idx >= g_n_layers) return;
-    /* Defensive: skip if a stray end() landed on a different layer than
-     * the most recent begin() — keeps the counters self-consistent. */
-    if (layer_idx != g_begin_layer) return;
-    uint64_t dt = now_ns() - g_begin_ns;
     prof_layer_t *L = &g_layers[layer_idx];
+    /* Defensive: an end without a matching begin (or a double-end after
+     * the bracket was already closed) is silently dropped. */
+    if (L->begin_ns == PROF_NO_BEGIN) return;
+    uint64_t dt = now_ns() - L->begin_ns;
+    L->begin_ns = PROF_NO_BEGIN;
     L->calls    += 1u;
     L->total_ns += dt;
     if (dt < L->min_ns) L->min_ns = dt;
