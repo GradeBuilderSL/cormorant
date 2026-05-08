@@ -778,19 +778,19 @@ A truncated fragment from the report for `parallel_two_chains.onnx`:
 
 ### Weight quantization error (vs original float32)
 
-| Tensor | Shape | Elements | Used by | Max \|abs\| | NRMSE | SQNR (dB) |
-|--------|-------|---------:|---------|-----------:|------:|---------:|
-| **All weights (worst)** | — | — | — | `1.905e-03` | `0.417%` | `47.6 dB` |
-| `Wa` | [4,4,1,1] | 16 | [0] Conv (weight) | `1.905e-03` | `0.417%` | `47.6 dB` |
-| `Wb` | [4,4,1,1] | 16 | [3] Conv (weight) | `1.786e-03` | `0.408%` | `47.8 dB` |
+| Tensor | Shape     | Elements | Used by           | Max |abs|  | NRMSE    | SQNR (dB) |
+|--------|-----------|----------|-------------------|------------|----------|-----------|
+| **All weights (worst)**       | -                 |`1.905e-03` | `0.417%` | `47.6 dB` |
+| `Wa`   | [4,4,1,1] | 16       | [0] Conv (weight) |`1.905e-03` | `0.417%` | `47.6 dB` |
+| `Wb`   | [4,4,1,1] | 16       | [3] Conv (weight) |`1.786e-03` | `0.408%` | `47.8 dB` |
 
 …
 
-| # | Op       | Lane             | Inputs     | Output | Notes | Out max \|abs\| | NRMSE  | SQNR (dB) |
-|--:|----------|------------------|------------|--------|-------|-----------:|-------:|----------:|
-| 0 | `Conv`   | `ConvKernel`     | …          | `ca0`  | …     | `3.891e-03` | `0.738%` | `42.6 dB` |
-| 1 | `Relu`   | `VectorOPKernel` | …          | `ca1`  | …     | `0.000e+00` | `0.000%` | `∞`       |
-| 2 | `MaxPool`| `PoolKernel`     | …          | `ca2`  | …     | `0.000e+00` | `0.000%` | `∞`       |
+| # | Op       | Lane             | Inputs     | Output | Notes | Out max |abs|| NRMSE    | SQNR (dB) |
+|---|----------|------------------|------------|--------|-------|--------------|----------|-----------|
+| 0 | `Conv`   | `ConvKernel`     | …          | `ca0`  | …     | `3.891e-03`  | `0.738%` | `42.6 dB` |
+| 1 | `Relu`   | `VectorOPKernel` | …          | `ca1`  | …     | `0.000e+00`  | `0.000%` | `∞`       |
+| 2 | `MaxPool`| `PoolKernel`     | …          | `ca2`  | …     | `0.000e+00`  | `0.000%` | `∞`       |
 ```
 
 The report is regenerated on every scheduler run — there is no need
