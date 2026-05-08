@@ -12,7 +12,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 > [`inference-scheduler/doc/ARCHITECTURE.md`](../inference-scheduler/doc/ARCHITECTURE.md).
 > This file provides a quick orientation. For the DAG / event-stream /
 > liveness / slot-coloring algorithms in detail, see
-> [`SCHEDULER_DAG.md`](SCHEDULER_DAG.md).
+> [`SCHEDULER_DAG.md`](../inference-scheduler/doc/SCHEDULER_DAG.md).
 
 ---
 

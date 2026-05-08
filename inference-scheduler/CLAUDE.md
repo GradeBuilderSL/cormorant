@@ -210,7 +210,7 @@ every NOP fixture.
 
 ### Schedule (DAG) — `src/schedule.py`
 
-See [`doc/SCHEDULER_DAG.md`](../doc/SCHEDULER_DAG.md) for the full
+See [`doc/SCHEDULER_DAG.md`](doc/SCHEDULER_DAG.md) for the full
 algorithm reference (DAG construction, event-stream walk,
 event-timeline liveness, slot coloring, worked examples on
 `parallel_two_chains`, `squeeze_then_matmul`,

@@ -4,13 +4,39 @@ This document describes the data-flow DAG used by `inference-scheduler` and
 the algorithms that derive the parallel-execution schedule from it. It
 is the single technical reference for anyone modifying:
 
-- `inference-scheduler/src/schedule.py`            (the DAG itself)
-- `inference-scheduler/src/codegen/_core.py`       (event stream + live intervals)
-- `inference-scheduler/src/codegen/_source.py`     (body emission consuming the events)
+- `src/schedule.py`            (the DAG itself)
+- `src/codegen/_core.py`       (event stream + live intervals)
+- `src/codegen/_source.py`     (body emission consuming the events)
 
-For a higher-level orientation see
-[`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md); for the profiler that
-piggybacks on the same brackets see [`PROFILER.md`](PROFILER.md).
+For a higher-level orientation see the sibling
+[`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md) and
+[`ARCHITECTURE.md`](ARCHITECTURE.md); for the profiler that piggybacks
+on the same brackets see [`PROFILER.md`](../../doc/PROFILER.md).
+
+## Pipeline overview
+
+The DAG sits between the parsed graph and the code emitter.  Once
+built, it drives a single event-stream walk that both the live-interval
+analyser and the body emitter consume verbatim — so they cannot
+disagree about what is in flight on each lane at any point.
+
+```mermaid
+flowchart TD
+    M([model.onnx]) --> OG["OnnxGraph<br/>src/graph.py<br/>parse · shape inference · Gemm rewrite"]
+    OG --> DAG["Dag<br/>src/schedule.py<br/>producer/consumer edges<br/>(§3)"]
+    DAG --> EVS["Event stream<br/>_compute_event_stream<br/>start · wait · drain · reshape<br/>(§4)"]
+    EVS --> LI["Live intervals<br/>_compute_live_intervals<br/>(start_event, end_event) per tensor<br/>(§5)"]
+    EVS --> EM["inference_run() body<br/>_inference_function<br/>(consumed verbatim)"]
+    LI --> POOL["Pool slot coloring<br/>_compute_pool_layout<br/>greedy first-fit on event intervals<br/>(§6)"]
+    POOL --> EM
+    EM --> OUT([src/inference.c])
+
+    classDef stage fill:#eef,stroke:#33a
+    class DAG,EVS,LI,POOL,EM stage
+```
+
+Sections §1–§6 walk through each box; §7 puts them together on real
+fixtures; §8–§10 cover edge cases, invariants, and future work.
 
 ---
 
@@ -126,6 +152,30 @@ Two consequences worth flagging:
   alias are correctly ordered after the producer of the underlying
   source by transitivity through the ReshapeNode.
 
+A two-node example illustrates both rules:
+
+```mermaid
+flowchart LR
+    Win[(Wc<br/>initializer)]:::ext
+    Xin[(X<br/>graph input)]:::ext
+
+    Conv["Conv (idx 0)<br/>kernel: KERNEL_CONV"]:::kernel
+    Relu["Relu (idx 1)<br/>kernel: KERNEL_VECTOROP"]:::kernel
+    Yout[(Y<br/>graph output)]:::ext
+
+    Win -.->|"weight · no DAG edge"| Conv
+    Xin -.->|"graph input · no DAG edge"| Conv
+    Conv ==>|"intermediate C · DAG edge 0→1"| Relu
+    Relu --> Yout
+
+    classDef ext fill:#eef,stroke:#33a,stroke-dasharray:5,color:#000
+    classDef kernel fill:#dfd,stroke:#393,color:#000
+```
+
+Solid arrow = DAG edge (drives wait emission and liveness). Dashed
+arrow = data flow whose source is **external** (graph input / weight)
+and therefore imposes no edge.
+
 ### 3.2 Public surface
 
 `Dag` exposes only the queries the schedulers need:
@@ -177,6 +227,23 @@ Without this pass-through, a `Pool → Squeeze → MatMul` chain would
 leave the Pool lane unwaited when MatMul starts — exactly the
 `squeeze_then_matmul` bug found on hardware.
 
+Visualised as a small BFS state machine for the `Pool → Squeeze →
+MatMul` example:
+
+```mermaid
+flowchart LR
+    S(["effective_preds(MatMul)"]) --> I["frontier = preds(MatMul)<br/>= {Squeeze}<br/>result = ∅"]
+    I --> P1{"pop p = Squeeze<br/>kind?"}
+    P1 -->|ReshapeNode| Push["frontier += preds(Squeeze)<br/>= {Pool}"]
+    Push --> P2{"pop p = Pool<br/>kind?"}
+    P2 -->|"kernel-bearing"| Add["result += {Pool}"]
+    Add --> Done(["return {Pool}<br/>→ wait on KERNEL_POOL<br/>before MatMul Start"])
+```
+
+The same machine handles arbitrarily-deep alias chains
+(`Conv → Squeeze → Unsqueeze → Reshape → MatMul`) — see
+`nop_chain_dropout_fork.onnx` for a 3-deep test case.
+
 ### 4.2 Per-node procedure
 
 For each `sn` in `graph.nodes` (graph order):
@@ -218,6 +285,41 @@ else:
 # (after the loop)
 for lane_, drained in pending.items():       # final drain
     emit ('drain', lane_, drained)
+```
+
+As a flowchart:
+
+```mermaid
+flowchart TD
+    A([next sn in graph.nodes]) --> EMC["emit ('comment', sn.index)"]
+    EMC --> RX{"isinstance(sn, ReshapeNode)?"}
+    RX -->|Yes| RXemit["emit ('reshape', sn.index)"]
+    RXemit --> A
+
+    RX -->|No| TG["target = lane(sn)<br/>queued_waits = []<br/>seen_lane = ∅"]
+
+    TG --> P1["for p in effective_preds(sn.index):<br/>  if pending[lane(p)] == p<br/>     and lane(p) ∉ seen_lane:<br/>    queued_waits += (lane(p), p)"]
+
+    P1 --> TW{"target ∈ pending<br/>and target ∉ seen_lane?"}
+    TW -->|Yes| TWadd["queued_waits += (target, pending[target])"]
+    TW -->|No| Skip[skip]
+    TWadd --> EmitW
+    Skip --> EmitW
+
+    EmitW["for (lane, drained) in queued_waits:<br/>  emit ('wait', lane, drained)<br/>  pending.pop(lane)"]
+
+    EmitW --> Sync{"is_synchronous(sn)?<br/>(MatmulNode 4D×3D)"}
+    Sync -->|Yes| StartSync["emit ('start_sync', sn.index)<br/>pending.pop(target)"]
+    Sync -->|No| StartReg["emit ('start', sn.index)<br/>pending[target] = sn.index"]
+
+    StartSync --> A
+    StartReg --> A
+
+    A -.->|"after the loop"| Drain["for (lane, idx) in pending:<br/>  emit ('drain', lane, idx)"]
+    Drain --> END([end of stream])
+
+    classDef decision fill:#fff5cc,stroke:#cc9
+    class RX,TW,Sync decision
 ```
 
 Properties of this scheme worth internalising:
@@ -408,6 +510,59 @@ Event-stream intervals:
 ends before `ca2 [7,17]` starts → reuse slot 0. Correct on hardware
 and locked in by `TestEventTimelineLiveness`.
 
+The parallel structure is easier to see laid out by lane:
+
+```mermaid
+gantt
+    title parallel_two_chains — execution timeline (event-stream index = unit)
+    dateFormat X
+    axisFormat %s
+
+    section Conv lane
+    convA #0  :crit,   1, 3
+    convB #3  :crit,   9, 11
+
+    section VectorOP lane
+    reluA #1  :active, 4, 6
+    reluB #4  :active, 12, 15
+    join  #5  :active, 16, 17
+
+    section Pool lane
+    poolA #2  :done,   7, 14
+```
+
+Each bar spans `[start_event_idx, drain_event_idx)` — the window in
+which that node is in flight on its lane. Pool #2 overlaps Conv #3
+(events 9-11) and reluB #4 (events 12-14): three lanes are
+simultaneously in flight at event 12. The join Add at event 16 only
+fires after waits drain Pool and VectorOP at events 14 and 15.
+
+The slot view is the same x-axis but coloured by pool slot:
+
+```mermaid
+gantt
+    title parallel_two_chains — tensor lifetimes & pool slots
+    dateFormat X
+    axisFormat %s
+
+    section Slot 0 (shared)
+    ca0   :done,   1, 3
+    ca2   :done,   7, 17
+
+    section Slot 1
+    ca1   :active, 4, 14
+
+    section Slot 2
+    cb0   :crit,   9, 15
+
+    section Slot 3
+    cb1   :crit,   12, 17
+```
+
+Slot 0 reuse is safe (`ca0` ends at 3, `ca2` starts at 7). Every
+other tensor needs its own slot because its interval overlaps with at
+least one already-placed tenant.
+
 ### 7.3 `squeeze_then_matmul.onnx` — Reshape pass-through
 
 ```
@@ -425,10 +580,51 @@ walks through the Reshape and returns Pool, so the emitter inserts
 
 Three roots on three different lanes (Conv, Pool, VectorOP). Branch B
 contains its own internal sub-fork that joins before contributing to
-the top-level join. The algorithm handles the nesting uniformly: at
-no point does it reason about "branches" or "sub-branches" — it only
-asks "is some predecessor still pending?" and "is the target lane
-still busy?". Tested against
+the top-level join.
+
+```mermaid
+flowchart TB
+    X([X · graph input]):::ext
+
+    %% Branch A — deep Conv chain
+    X --> CA1["convA1 · Conv"]:::conv
+    CA1 --> RA1["reluA1 · VectorOP"]:::vec
+    RA1 --> CA2["convA2 · Conv"]:::conv
+    CA2 --> RA2["reluA2 · VectorOP"]:::vec
+
+    %% Branch B sub-branch 1 — Pool
+    X --> P["poolB · Pool"]:::pool
+
+    %% Branch B sub-branch 2 — Mul → Relu
+    X --> M["mulB · VectorOP"]:::vec
+    M --> RB["reluB · VectorOP"]:::vec
+
+    %% Branch B sub-join
+    P --> JB["joinB · VectorOP"]:::vec
+    RB --> JB
+
+    %% Top-level A ⊕ B join
+    RA2 --> JAB["joinAB · VectorOP"]:::vec
+    JB --> JAB
+
+    %% Skip-add via graph input
+    JAB --> SK["skipAdd · VectorOP"]:::vec
+    X -. "X is external<br/>(no DAG edge)" .-> SK
+
+    SK --> Y([Y · graph output]):::ext
+
+    classDef ext fill:#eef,stroke:#33a,color:#000,stroke-dasharray:5
+    classDef conv fill:#fdd,stroke:#a33,color:#000
+    classDef pool fill:#dff,stroke:#3aa,color:#000
+    classDef vec fill:#dfd,stroke:#3a3,color:#000
+```
+
+Three roots (`convA1`, `poolB`, `mulB`), two join points (`joinB`,
+`joinAB`), and a skip-add at the end whose access to `X` is *not* a
+DAG edge (X is external). The algorithm handles the nesting uniformly:
+at no point does it reason about "branches" or "sub-branches" — it
+only asks "is some predecessor still pending?" and "is the target
+lane still busy?". Tested against
 `TestDagOnParallelModels::test_asymmetric_branch_a_independent_of_branch_b`.
 
 ---

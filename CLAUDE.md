@@ -132,7 +132,7 @@ Key source files:
 - **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (predecessors, topological order, independent pairs)
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake)
 
-See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
+See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
 
 ### HLS Pragmas Used
 
