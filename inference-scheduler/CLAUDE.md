@@ -210,6 +210,13 @@ every NOP fixture.
 
 ### Schedule (DAG) — `src/schedule.py`
 
+See [`doc/SCHEDULER_DAG.md`](../doc/SCHEDULER_DAG.md) for the full
+algorithm reference (DAG construction, event-stream walk,
+event-timeline liveness, slot coloring, worked examples on
+`parallel_two_chains`, `squeeze_then_matmul`,
+`asymmetric_nested_branches`, and the invariants tested in CI).
+
+
 `Dag.from_graph(OnnxGraph)` builds a producer/consumer DAG over the
 scheduled node list:
 
