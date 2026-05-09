@@ -165,3 +165,114 @@ else()
     message(STATUS "axi_kernels: 'build_hw_kv260' and 'sim_hw_kv260' not available — submodule not initialised")
     message(STATUS "             Run: git submodule update --init hw/cormorant_hw_128")
 endif()
+
+# ---------------------------------------------------------------------------
+# Per-kernel behavioural-simulation targets — drive cormorant_test_stand's
+# Vivado projects (one per kernel) through their xsim flow with the freshly-
+# built IP catalogue and the **checked-in** golden fixtures under hw/test_data/.
+#
+# Requires the cormorant_test_stand submodule and Vivado 2025.2.
+#
+# Generated targets:
+#   make behavior_test_conv         — ConvKernel testbench
+#   make behavior_test_pool         — PoolingKernel testbench
+#   make behavior_test_matmul       — MatmulKernel testbench
+#   make behavior_test_vectorop     — VectorOPKernel testbench
+#   make behavior_test              — all four kernels in sequence
+#
+# Each per-kernel target:
+#   - depends on `synthesize_<k>_kv260` (IP catalogue must exist at the
+#     revision the test stand's .xpr's .xci references)
+#   - reads its fixtures from the source tree at hw/test_data/<dir>/ — the
+#     same goldens are used on every machine, so any divergence is a kernel
+#     change, not a fixture-regeneration drift.  `gen_<k>_test_data` is left
+#     in place for ad-hoc fixture regeneration but is NOT a dependency here.
+#   - invokes the test stand's `make tb-<name>` with DATA_DIR_<name>,
+#     IP_REPO_<name>, and REPORT_<name> all pinned by this CMake target.
+#   - finally runs cmake/check_test_report.py to turn summary.all_passed
+#     into the target's exit code.
+#
+# Kernel-name asymmetry:
+#   axi_kernel  | test-stand | hls_project    | fixture dir under hw/test_data/
+#   conv        | conv       | conv_kv260     | conv_test_data
+#   pool        | pooling    | pool_kv260     | pool_test_data
+#   matmul      | matmul_op  | matmul_kv260   | matmul_test_data
+#   vectorop    | vector_op  | vadd_kv260     | vecop_test_data       (note: vadd legacy)
+#
+# IP repo path resolution: Vitis HLS exports the IP catalogue under
+# <build>/kernels/<k>/kv260/<hls_project>/solution1/impl/ip/ (the directory
+# containing component.xml).  Vivado's set_property ip_repo_paths needs that
+# exact directory; passing the parent <hls_project>/ or kv260/ does NOT work.
+# ---------------------------------------------------------------------------
+set(_TS_REPO "${CMAKE_SOURCE_DIR}/hw/cormorant_test_stand")
+if(EXISTS "${_TS_REPO}/Makefile")
+
+    # Map columns: axi_kernels-side | test-stand registry | hls_project | fixture-dir name
+    set(_BEHAVIOR_TESTS
+        "conv|conv|conv_kv260|conv_test_data"
+        "pool|pooling|pool_kv260|pool_test_data"
+        "matmul|matmul_op|matmul_kv260|matmul_test_data"
+        "vectorop|vector_op|vadd_kv260|vecop_test_data"
+    )
+
+    set(_BEHAVIOR_TEST_AGG_DEPS "")
+
+    foreach(_BT IN LISTS _BEHAVIOR_TESTS)
+        string(REPLACE "|" ";" _BT_LIST "${_BT}")
+        list(GET _BT_LIST 0 _bt_kernel)    # axi_kernels-side name (matches synthesize_<k>_kv260)
+        list(GET _BT_LIST 1 _bt_tsname)    # test-stand registry name (for tb-<name>)
+        list(GET _BT_LIST 2 _bt_hlsproj)   # HLS project dir name produced by Vitis
+        list(GET _BT_LIST 3 _bt_dataname)  # subdirectory under hw/test_data/
+
+        set(_bt_datadir "${CMAKE_SOURCE_DIR}/hw/test_data/${_bt_dataname}")
+        set(_bt_iprepo  "${CMAKE_BINARY_DIR}/kernels/${_bt_kernel}/kv260/${_bt_hlsproj}/solution1/impl/ip")
+
+        # Pin the scoreboard JSON report to a known path in the build tree.
+        # check_test_report.py turns summary.all_passed into the target's
+        # exit code, so behavior_test_<k> fails whenever any mismatch is
+        # recorded — independent of run_tb.sh's own exit code (which today
+        # masks the Python parse-block failure with `|| true`).
+        set(_bt_reportdir "${CMAKE_BINARY_DIR}/kernels/${_bt_kernel}/kv260")
+        set(_bt_report "${_bt_reportdir}/${_bt_tsname}_test_report.json")
+
+        add_custom_target("behavior_test_${_bt_kernel}"
+            COMMAND ${CMAKE_COMMAND} -E echo
+                    "behavior_test_${_bt_kernel}: tb-${_bt_tsname}  data=${_bt_datadir}  ip=${_bt_iprepo}  report=${_bt_report}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_bt_reportdir}"
+            # Wipe any stale report from a prior run BEFORE the test runs —
+            # otherwise a Vivado crash that never overwrites the JSON would
+            # let check_test_report.py succeed against a leftover PASS file.
+            COMMAND ${CMAKE_COMMAND} -E rm -f "${_bt_report}"
+            COMMAND ${CMAKE_MAKE_PROGRAM} -C "${_TS_REPO}"
+                    "tb-${_bt_tsname}"
+                    "DATA_DIR_${_bt_tsname}=${_bt_datadir}"
+                    "IP_REPO_${_bt_tsname}=${_bt_iprepo}"
+                    "REPORT_${_bt_tsname}=${_bt_report}"
+            COMMAND python3 "${CMAKE_SOURCE_DIR}/cmake/check_test_report.py"
+                    "${_bt_report}"
+            WORKING_DIRECTORY "${_TS_REPO}"
+            DEPENDS
+                "synthesize_${_bt_kernel}_kv260"
+            COMMENT "Vivado xsim: behavioural test of ${_bt_kernel} via cormorant_test_stand"
+            USES_TERMINAL
+            VERBATIM
+        )
+        message(STATUS "axi_kernels: target 'behavior_test_${_bt_kernel}' "
+                       "(data=hw/test_data/${_bt_dataname}, depends on synthesize_${_bt_kernel}_kv260)")
+        list(APPEND _BEHAVIOR_TEST_AGG_DEPS "behavior_test_${_bt_kernel}")
+    endforeach()
+
+    # Aggregate — runs all four behavioural tests sequentially.  CMake doesn't
+    # parallelise add_custom_target dependencies that share a working dir, so
+    # the kernels are exercised one after another (which is what we want for
+    # Vivado batch invocations anyway).
+    add_custom_target(behavior_test
+        DEPENDS ${_BEHAVIOR_TEST_AGG_DEPS}
+        COMMENT "Vivado xsim: behavioural test of all four kernels"
+    )
+    message(STATUS "axi_kernels: aggregate target 'behavior_test' (${_BEHAVIOR_TEST_AGG_DEPS})")
+
+else()
+    message(STATUS "axi_kernels: 'behavior_test_<k>' not available — submodule not initialised")
+    message(STATUS "             Run: git submodule update --init hw/cormorant_test_stand")
+endif()
