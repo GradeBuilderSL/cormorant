@@ -5,19 +5,38 @@
 // Global variants) in a channel-tiled structure that maps cleanly to Vitis
 // HLS synthesis.
 //
-// Loop structure:
+// Top-level dataflow (HLS DATAFLOW):
 //
-//   batch loop      — iterates over input images
-//     oh / ow loops — slide over output spatial positions
-//       valid_count — count valid (non-padded) pixels for AVG denominator
-//       inv_denom   — precomputed reciprocal for multiply-instead-of-divide
-//       c_tile loop — tiles the channel dimension (kTileC)
-//         load win_buf  — pool window into on-chip buffer
-//         acc init      — −∞ for MAX, 0 for AVG/LP  (fully unrolled, 1 cycle)
-//         reduce loop   — II=1 flat counter over pool_h*pool_w*kTileC
-//         finalize+write — apply post-reduction op and write to DDR
+//   PoolingKernel
+//     input_window_producer  ──window_pipe──►  process_pool_kernel_tile
+//                            ──denom_pipe ──►          │
+//                                                      └──acc_stream──► write_output_tile
+//                                                                              │
+//     x (DDR gmem0)                                                           ▼
+//                                                                       y (DDR gmem1)
 //
-// II=1 strategy (reduction loop):
+// Stage responsibilities:
+//   * input_window_producer  — for each (ni, oh, ow) emits one denom value
+//                              (= valid_count for AVG, or pool_h*pool_w when
+//                              count_include_pad=1) and, for each channel
+//                              tile ct, kTileC*pool_h*pool_w window pixels
+//                              into window_pipe.  Out-of-bounds positions
+//                              are filled with the pool-type identity so the
+//                              consumer's reduce loop needs no bounds check.
+//                              Channel-padding lanes (c_l >= c_valid) are
+//                              also filled with the identity so the producer
+//                              emits a fixed-size block per (ni, ct, oh, ow).
+//   * process_pool_kernel_tile — drains kTileC*pool_h*pool_w pixels into
+//                              win_buf, runs the II=1 flat-counter reduction,
+//                              applies the post-reduction op (multiply by
+//                              precomputed inv_denom for AVG, sqrt for LP-2)
+//                              and pushes c_valid AccData_t results to
+//                              acc_stream.
+//   * write_output_tile      — saturates AccData_t → Data_t and writes to y
+//                              with the channel-major (stride = out_h*out_w)
+//                              addressing the original kernel used.
+//
+// II=1 reduction strategy (process_pool_kernel_tile):
 //   The flat counter ri runs 0 .. pool_h*pool_w*kTileC - 1.
 //   c1 = ri & (kTileC - 1)  — compile-time bitmask, no divider.
 //   acc[c1] is written every kTileC cycles, satisfying the dependency
@@ -31,8 +50,526 @@
 
 #include <algorithm>
 #include <cmath>
-#include "PoolingKernel.h"
+#include "hls_stream.h"
 
+#include "PoolingKernel.h"
+#include "PoolingKernelDebug.h"
+
+// ---------------------------------------------------------------------------
+// Debug-only DDR-read tracking.  Enabled automatically for C-simulation
+// builds; disabled (zero-cost) under HLS synthesis.  Mirrors the pattern in
+// kernels/conv/kernel/ConvKernel.cpp so the testbench can flag any cell
+// read from DDR more than once per invocation.
+// ---------------------------------------------------------------------------
+#ifndef __SYNTHESIS__
+#define DEBUG_LOAD_DATA_CACHING
+#endif
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+static unsigned g_pool_debug_duplicate_reads = 0;
+#endif
+
+void pool_debug_reset_duplicate_reads() {
+#ifdef DEBUG_LOAD_DATA_CACHING
+    g_pool_debug_duplicate_reads = 0;
+#endif
+}
+
+unsigned pool_debug_duplicate_read_count() {
+#ifdef DEBUG_LOAD_DATA_CACHING
+    return g_pool_debug_duplicate_reads;
+#else
+    return 0;
+#endif
+}
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+#include <cstddef>
+#include <iostream>
+#include <list>
+#include <map>
+
+// One record per DDR fetch — captures the loop-nest position so a duplicate
+// dump can show *where* the kernel went back to the same address.
+struct PoolReadCounters {
+    unsigned ni;
+    unsigned ct;
+    unsigned c_l;
+    unsigned oh;
+    unsigned ow;
+    unsigned khi;
+    unsigned kwi;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const PoolReadCounters& c) {
+    os << "{ni=" << c.ni
+       << " ct=" << c.ct
+       << " c_l=" << c.c_l
+       << " oh=" << c.oh
+       << " ow=" << c.ow
+       << " khi=" << c.khi
+       << " kwi=" << c.kwi
+       << "}";
+    return os;
+}
+
+typedef std::map<std::size_t, std::list<PoolReadCounters>> PoolAddressMap_t;
+#endif /* DEBUG_LOAD_DATA_CACHING */
+
+// ---------------------------------------------------------------------------
+// compute_ow_tile — runtime W-tile width.
+//
+// Returns the largest ow chunk size whose loaded input-column span fits in
+// kMaxLineBufCols.  When in_w <= kMaxLineBufCols the result is out_w (single tile, no
+// duplication — same as the zero-duplication path).  When the input is
+// wider than the cache we split out_w into multiple tiles; adjacent tiles
+// re-read overlapping boundary columns from DDR — the explicit relaxation
+// that lets the kernel handle in_w > kMaxLineBufCols.
+//
+// Span(OW) = (OW - 1) * stride_w + (pool_w - 1) * dil_w + 1
+// Solve Span(OW) <= kMaxLineBufCols for the largest OW.
+// ---------------------------------------------------------------------------
+static inline unsigned compute_ow_tile(
+    unsigned out_w,
+    unsigned pool_w,
+    unsigned stride_w,
+    unsigned dil_w
+) {
+    const unsigned win_w_span = (pool_w - 1) * dil_w + 1;
+    unsigned ow_tile = 0;
+    if (win_w_span <= kMaxLineBufCols && stride_w > 0) {
+        ow_tile = (kMaxLineBufCols - win_w_span) / stride_w + 1;
+    }
+    if (ow_tile == 0) ow_tile = 1;
+    if (ow_tile > out_w) ow_tile = out_w;
+    return ow_tile;
+}
+
+// ---------------------------------------------------------------------------
+// input_window_producer — DATAFLOW source.
+//
+// Loop nest is (ni, ct, owt, oh, ow) with ct hoisted OUTER of oh AND a W-tile
+// dimension owt OUTER of oh.  Per (ni, ct, owt) the line buffer caches a
+// contiguous slab of input columns sized to fit the current W-tile's span
+// (≤ kMaxLineBufCols columns).  Within a tile the buffer is reused across the oh
+// sweep — overlapping pool windows in the same tile are served from cache
+// without re-reading x[] from DDR.
+//
+// At W-tile boundaries (only triggered when in_w > kMaxLineBufCols) the next tile's
+// leftmost columns may overlap the previous tile's rightmost columns — those
+// overlapping columns are loaded twice.  This is the explicit relaxation
+// that lets the kernel handle inputs wider than the on-chip line buffer.
+//
+// Per (ni, ct, owt):
+//   ow_lo = owt * ow_tile;  ow_hi = min(ow_lo + ow_tile, out_w)
+//   iw_load_lo = max(ow_lo * stride_w - pad_left, 0)
+//   iw_load_hi = min((ow_hi - 1) * stride_w + (pool_w-1)*dil_w - pad_left,
+//                    in_w - 1)
+//   line_buf is indexed by  local_iw = iw - iw_load_lo  ∈ [0, kMaxLineBufCols).
+//
+// Per (ni, ct, owt, oh):
+//   Phase 1 — load any new input rows the current (oh, ct) window needs
+//             over columns [iw_load_lo, iw_load_hi].
+// Per (ni, ct, owt, oh, ow):
+//   Phase 2 — write valid_count's denom to denom_pipe, then stream
+//             kTileC * pool_h * pool_w pixels into window_pipe (c_l
+//             slowest, kwi fastest).  Out-of-bounds positions emit the
+//             pool-type identity.
+//
+// Constraints (validated by the inference scheduler):
+//   (pool_w - 1) * dil_w + 1 <= kMaxLineBufCols         (single window fits)
+//   (pool_h - 1) * dil_h + 1 <= kMaxLineBufRows (vertical span fits)
+//   kMaxLineBufRows is a power of two (slot = ih & (kMaxLineBufRows-1)).
+// ---------------------------------------------------------------------------
+static void input_window_producer(
+    const Data_t*          x,
+    hls::stream<Data_t>&   window_pipe,
+    hls::stream<unsigned>& denom_pipe,
+    unsigned               batch,
+    unsigned               channels,
+    unsigned               in_h,
+    unsigned               in_w,
+    unsigned               out_h,
+    unsigned               out_w,
+    unsigned               pool_h,
+    unsigned               pool_w,
+    unsigned               stride_h,
+    unsigned               stride_w,
+    unsigned               pad_top,
+    unsigned               pad_left,
+    unsigned               dil_h,
+    unsigned               dil_w,
+    unsigned               pool_type,
+    unsigned               count_include_pad,
+    unsigned               ow_tile
+) {
+    const unsigned c_tiles  = (channels + kTileC - 1) / kTileC;
+    const unsigned in_hw    = in_h * in_w;
+    const unsigned ow_tiles_w =
+        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+
+    // line_buf:  kTileC * kMaxLineBufRows * kMaxLineBufCols * sizeof(Data_t)
+    //         =      8  *       16        *       64        *      2     =  16 KB
+    // ARRAY_PARTITION dim=1 complete → kTileC independent BRAMs of
+    // [kMaxLineBufRows][kMaxLineBufCols], one per channel lane.  Required
+    // because Phase 2 emits c_l innermost (one channel lane per cycle at
+    // II=1), so the consumer can fuse window_pipe.read() with the reduce
+    // MAC at II=1 — see process_pool_kernel_tile.  Each per-lane BRAM is
+    // 16 × 64 × 2 B = 2 KB, comfortably below the 36 Kb BRAM18 limit.
+    static Data_t line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols];
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    // Local to one kernel invocation — collects every DDR cell read across
+    // all (ni, ct, owt, c_l, ih_load, iw_load).  Walked at function exit;
+    // any address with more than one record bumps the global duplicate
+    // counter.  When in_w > kMaxLineBufCols, W-tile boundary columns appear here
+    // multiple times — that's the documented relaxation.
+    PoolAddressMap_t read_addresses;
+#endif
+
+    const Data_t pad_val = (pool_type == kPoolMax)
+        ? Data_t(kDataMin)
+        : Data_t(0);
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned ct = 0; ct < c_tiles; ct++) {
+            const unsigned c_off   = ct * kTileC;
+            const unsigned c_valid = std::min(kTileC, channels - c_off);
+
+            for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
+                const unsigned ow_lo = owt * ow_tile;
+                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+
+                // Compute the input-column window for this W-tile.  May
+                // extend past the input edges (pad_left or right pad);
+                // load_lo/hi clamp to [0, in_w-1].
+                const int iw_start =
+                    (int)(ow_lo * stride_w) - (int)pad_left;
+                const int iw_end =
+                    (int)((ow_hi - 1) * stride_w + (pool_w - 1) * dil_w)
+                  - (int)pad_left;
+                const int iw_load_lo = (iw_start < 0) ? 0 : iw_start;
+                const int iw_load_hi = (iw_end >= (int)in_w)
+                                     ? (int)in_w - 1 : iw_end;
+
+                int last_loaded_row = -1;
+
+                for (unsigned oh = 0; oh < out_h; oh++) {
+                    const int ih_window_max = (int)(oh * stride_h)
+                                            - (int)pad_top
+                                            + (int)((pool_h - 1) * dil_h);
+
+                    // ---------------------------------------------------
+                    // Phase 1: load rows the current (oh, ct, owt) window
+                    // needs that are not yet in line_buf.  Within one W-
+                    // tile, each x cell is read at most once per (ni, c).
+                    // Across W-tiles, boundary columns may be re-read.
+                    // ---------------------------------------------------
+                    int load_start = last_loaded_row + 1;
+                    if (load_start < 0) load_start = 0;
+                    int load_end = ih_window_max;
+                    if (load_end >= (int)in_h) load_end = (int)in_h - 1;
+
+                    for (int ih = load_start; ih <= load_end; ih++) {
+                        const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
+                        for (unsigned c_l = 0; c_l < c_valid; c_l++) {
+                            const unsigned c     = c_off + c_l;
+                            const unsigned x_row = (ni * channels + c) * in_hw
+                                                 + (unsigned)ih * in_w;
+                            for (int iw = iw_load_lo; iw <= iw_load_hi; iw++) {
+                                #pragma HLS PIPELINE II=1
+                                const std::size_t addr =
+                                    (std::size_t)x_row + (unsigned)iw;
+                                const unsigned local_iw =
+                                    (unsigned)(iw - iw_load_lo);
+                                line_buf[c_l][slot][local_iw] = x[addr];
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+                                PoolReadCounters c_rc;
+                                c_rc.ni  = ni;
+                                c_rc.ct  = ct;
+                                c_rc.c_l = c_l;
+                                c_rc.oh  = oh;
+                                c_rc.ow  = owt;
+                                c_rc.khi = (unsigned)ih;
+                                c_rc.kwi = (unsigned)iw;
+                                read_addresses[addr].push_back(c_rc);
+#endif /* DEBUG_LOAD_DATA_CACHING */
+                            }
+                        }
+                    }
+                    if (load_end > last_loaded_row) {
+                        last_loaded_row = load_end;
+                    }
+
+                    for (unsigned ow = ow_lo; ow < ow_hi; ow++) {
+
+                        // ---------------------------------------------------
+                        // Count valid (non-padded) positions for this
+                        // (oh, ow) and emit one denom value to denom_pipe.
+                        // Geometry-only — does not touch line_buf or x[].
+                        // ---------------------------------------------------
+                        unsigned valid_count = 0;
+                        for (unsigned khi = 0; khi < pool_h; khi++) {
+                            for (unsigned kwi = 0; kwi < pool_w; kwi++) {
+                                const int ih_v = (int)(oh * stride_h + khi * dil_h)
+                                               - (int)pad_top;
+                                const int iw_v = (int)(ow * stride_w + kwi * dil_w)
+                                               - (int)pad_left;
+                                if (ih_v >= 0 && (unsigned)ih_v < in_h &&
+                                    iw_v >= 0 && (unsigned)iw_v < in_w)
+                                    valid_count++;
+                            }
+                        }
+                        const unsigned denom_u = count_include_pad
+                            ? (pool_h * pool_w)
+                            : valid_count;
+                        denom_pipe.write(denom_u);
+
+                        // ---------------------------------------------------
+                        // Phase 2: stream kTileC * pool_h * pool_w window
+                        // pixels from line_buf into window_pipe.  Order is
+                        // (khi outer, kwi middle, c_l innermost) — c_l
+                        // cycles fastest so the consumer can fuse the
+                        // pipe read with its II=1 reduce loop where
+                        // c1 = ri & (kTileC-1).  Per-cycle reads of
+                        // different c_l banks need ARRAY_PARTITION dim=1
+                        // (set above on line_buf).
+                        // ---------------------------------------------------
+                        for (unsigned khi = 0; khi < pool_h; khi++) {
+                            const int ih =
+                                (int)(oh * stride_h + khi * dil_h) - (int)pad_top;
+                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                            const unsigned slot = ih_ok
+                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                                : 0u;
+
+                            for (unsigned kwi = 0; kwi < pool_w; kwi++) {
+                                const int iw =
+                                    (int)(ow * stride_w + kwi * dil_w) - (int)pad_left;
+                                const bool spatial_ok =
+                                    ih_ok && iw >= 0 && (unsigned)iw < in_w;
+                                const unsigned local_iw = spatial_ok
+                                    ? (unsigned)(iw - iw_load_lo)
+                                    : 0u;
+
+                                for (unsigned c_l = 0; c_l < kTileC; c_l++) {
+                                    #pragma HLS PIPELINE II=1
+                                    const bool valid = spatial_ok && (c_l < c_valid);
+                                    window_pipe.write(valid
+                                        ? line_buf[c_l][slot][local_iw]
+                                        : pad_val);
+                                }
+                            }
+                        }
+                    } // ow loop (within W-tile)
+                } // oh loop
+            } // owt loop
+        } // c_tile loop
+    } // batch loop
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    // Count distinct DDR addresses fetched more than once during this
+    // invocation.  When in_w <= kMaxLineBufCols (single W-tile) this should be 0.
+    // When in_w > kMaxLineBufCols (multi-tile) boundary columns appear multiple
+    // times — that's the documented relaxation.
+    for (const auto& it : read_addresses) {
+        if (it.second.size() > 1) {
+            ++g_pool_debug_duplicate_reads;
+            std::cout << it.first << " --> " << std::endl;
+            for (const auto& l_item : it.second) {
+                std::cout << "\t" << l_item << std::endl;
+            }
+        }
+    }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+}
+
+// ---------------------------------------------------------------------------
+// process_pool_kernel_tile — DATAFLOW processor.
+//
+// Loop nest matches the producer: (ni, ct, owt, oh, ow) with ct OUTER of
+// oh AND a W-tile dimension owt OUTER of oh.  ow_tile = out_w yields a
+// single tile and degenerates to (ni, ct, oh, ow); ow_tile < out_w
+// processes ow chunks in turn so the producer's line buffer stays bounded.
+//
+// Per (ni, ct, owt, oh, ow):
+//   * Read denom_u from denom_pipe; precompute inv_denom = 1/denom_u
+//     (multiply beats divide).
+//   * Fused drain + reduce: a single II=1 loop reads kTileC*pool_h*pool_w
+//     pixels directly from window_pipe and folds them into the per-lane
+//     accumulators acc[kTileC].  ri counts 0..pool_h*pool_w*kTileC-1 with
+//     c1 = ri & (kTileC-1) cycling fastest — matching the producer's
+//     (khi, kwi, c_l) emit order.  acc[c1] is written every kTileC cycles
+//     so the dependency distance (= kTileC) covers the MAX/AVG/LP latency
+//     of ap_fixed<32,16> at 300 MHz.
+//   * Finalise: multiply by inv_denom for AVG, sqrt for LP-2, identity
+//     otherwise; push c_valid lanes to acc_stream as AccData_t.  The
+//     writer saturates AccData_t → Data_t at the boundary.
+//
+// Fusion eliminates the previous separate drain (window_pipe → win_buf)
+// loop, halving the consumer's per-output cycle count and balancing it
+// against the producer.  win_buf is gone; only acc[kTileC] survives.
+// ---------------------------------------------------------------------------
+static void process_pool_kernel_tile(
+    hls::stream<Data_t>&    window_pipe,
+    hls::stream<unsigned>&  denom_pipe,
+    hls::stream<AccData_t>& acc_stream,
+    unsigned                batch,
+    unsigned                channels,
+    unsigned                out_h,
+    unsigned                out_w,
+    unsigned                pool_h,
+    unsigned                pool_w,
+    unsigned                pool_type,
+    unsigned                lp_order,
+    unsigned                ow_tile
+) {
+    AccData_t acc[kTileC];
+    #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+
+    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
+    const unsigned ow_tiles_w =
+        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned ct = 0; ct < c_tiles; ct++) {
+            const unsigned c_off   = ct * kTileC;
+            const unsigned c_valid = std::min(kTileC, channels - c_off);
+
+            for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
+                const unsigned ow_lo = owt * ow_tile;
+                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+
+                for (unsigned oh = 0; oh < out_h; oh++) {
+                    for (unsigned ow = ow_lo; ow < ow_hi; ow++) {
+
+                    const unsigned denom_u   = denom_pipe.read();
+                    const float    inv_denom =
+                        (denom_u > 0u) ? 1.0f / (float)denom_u : 0.0f;
+
+                    // ---------------------------------------------------
+                    // Initialise accumulators (1 cycle, fully unrolled).
+                    //   MAX: kAccMin sentinel (any valid input beats it
+                    //        on the first comparison).
+                    //   AVG / LP: 0 (sum starts at zero).
+                    // ---------------------------------------------------
+                    for (unsigned c1 = 0; c1 < kTileC; c1++) {
+                        #pragma HLS UNROLL
+                        acc[c1] = (pool_type == kPoolMax)
+                            ? AccData_t(kAccMin)
+                            : AccData_t(0);
+                    }
+
+                    // ---------------------------------------------------
+                    // Fused drain + reduce: II=1 over the producer stream.
+                    //
+                    // ri runs 0 .. pool_h*pool_w*kTileC - 1, matching the
+                    // producer's (khi, kwi, c_l) emit order.  c1 = ri &
+                    // (kTileC-1) selects the lane; acc[c1] is written
+                    // every kTileC cycles so the RAW distance (= kTileC)
+                    // covers operator latency.  No win_buf needed — the
+                    // value flows window_pipe → ALU → acc[] in one cycle.
+                    // ---------------------------------------------------
+                    const unsigned ri_bound = pool_h * pool_w * kTileC;
+                    for (unsigned ri = 0; ri < ri_bound; ri++) {
+                        #pragma HLS PIPELINE II=1
+                        const unsigned  c1  = ri & (kTileC - 1);
+                        const AccData_t val = AccData_t(window_pipe.read());
+
+                        if (pool_type == kPoolMax) {
+                            if (val > acc[c1]) acc[c1] = val;
+                        } else if (pool_type == kPoolAvg) {
+                            acc[c1] += val;
+                        } else {
+                            // LP: p=1 → |val|,  p=2 → val²
+                            // Both branches cast to AccData_t: unary minus widens by 1 bit,
+                            // multiplication doubles the bit width; explicit casts required.
+                            const AccData_t contrib = (lp_order == 1u)
+                                ? (val < AccData_t(0) ? AccData_t(-val) : val)
+                                : AccData_t(val * val);
+                            acc[c1] += contrib;
+                        }
+                    }
+
+                    // ---------------------------------------------------
+                    // Finalise and push c_valid lanes to acc_stream.
+                    //
+                    //   MAX: identity — acc is already the max value.
+                    //   AVG: multiply by precomputed reciprocal denominator.
+                    //   LP p=1: identity — acc is already Σ|x_i|.
+                    //   LP p=2: sqrt(acc) via float (DSP-friendly in HLS).
+                    // ---------------------------------------------------
+                    for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                        #pragma HLS PIPELINE II=1
+                        AccData_t result;
+                        if (pool_type == kPoolMax) {
+                            result = acc[c1];
+                        } else if (pool_type == kPoolAvg) {
+                            result = AccData_t((float)acc[c1] * inv_denom);
+                        } else {
+                            result = (lp_order == 1u)
+                                ? acc[c1]
+                                : AccData_t(sqrtf((float)acc[c1]));
+                        }
+                        acc_stream.write(result);
+                    }
+
+                    } // ow loop (within W-tile)
+                } // oh loop
+            } // owt loop
+        } // c_tile loop
+    } // batch loop
+}
+
+// ---------------------------------------------------------------------------
+// write_output_tile — DATAFLOW sink.
+//
+// Drains acc_stream in the consumer's emit order — (ni, ct, owt, oh, ow, c1)
+// with c1 cycling 0..c_valid-1.  Output addresses are non-contiguous in C
+// (stride = out_h*out_w per channel); y_addr is advanced by a counter to
+// avoid a multiplier inside the pipeline.  Saturates AccData_t → Data_t
+// at the boundary.  ow_tile = out_w degenerates to (ni, ct, oh, ow, c1).
+// ---------------------------------------------------------------------------
+static void write_output_tile(
+    Data_t*                 y,
+    hls::stream<AccData_t>& acc_stream,
+    unsigned                batch,
+    unsigned                channels,
+    unsigned                out_h,
+    unsigned                out_w,
+    unsigned                ow_tile
+) {
+    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
+    const unsigned hw_stride  = out_h * out_w;
+    const unsigned ow_tiles_w =
+        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned ct = 0; ct < c_tiles; ct++) {
+            const unsigned c_off   = ct * kTileC;
+            const unsigned c_valid = std::min(kTileC, channels - c_off);
+            const unsigned y_base  = (ni * channels + c_off) * hw_stride;
+
+            for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
+                const unsigned ow_lo = owt * ow_tile;
+                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+
+                for (unsigned oh = 0; oh < out_h; oh++) {
+                    for (unsigned ow = ow_lo; ow < ow_hi; ow++) {
+                        unsigned y_addr = y_base + oh * out_w + ow;
+                        for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                            #pragma HLS PIPELINE II=1
+                            y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
+                            y_addr += hw_stride;
+                        }
+                    } // ow loop (within W-tile)
+                } // oh loop
+            } // owt loop
+        } // c_tile loop
+    } // batch loop
+}
 
 void PoolingKernel(
     const Data_t* x,
@@ -86,190 +623,77 @@ void PoolingKernel(
     #pragma HLS INTERFACE s_axilite port=return            bundle=ctrl
 
     // -----------------------------------------------------------------------
-    // On-chip buffers (BRAM in HLS).
-    //
-    // win_buf[kTileC][kMaxPoolH][kMaxPoolW]
-    //   Holds the pool window for the current output position (oh, ow) and
-    //   current channel tile.  Out-of-bounds positions are filled with the
-    //   identity element during the load phase so the reduce loop needs no
-    //   bounds check.
-    //   ARRAY_PARTITION complete dim=1 → kTileC independent BRAM arrays,
-    //   each [kMaxPoolH][kMaxPoolW].  All kTileC channels readable same cycle.
-    //
-    // acc[kTileC]
-    //   Per-channel accumulators.  ARRAY_PARTITION complete dim=0 → all
-    //   kTileC registers independent.  acc[c1] is written every kTileC cycles
-    //   in the reduce loop, satisfying the dependency distance requirement.
+    // STABLE: read-only m_axi base pointer x and every s_axilite scalar are
+    // latched at ap_start and never written during the DATAFLOW region's
+    // execution.  Marking them STABLE tells HLS not to insert auto-generated
+    // synchronization stages or fan-out FIFOs into the producers — see the
+    // ConvKernel.cpp note for the full rationale.  `y` is intentionally NOT
+    // listed because write_output_tile writes through it during the dataflow
+    // region.
     // -----------------------------------------------------------------------
-    static Data_t    win_buf[kTileC][kMaxPoolH][kMaxPoolW];
-    static AccData_t acc    [kTileC];
+    #pragma HLS STABLE variable=x
+    #pragma HLS STABLE variable=batch
+    #pragma HLS STABLE variable=channels
+    #pragma HLS STABLE variable=in_h
+    #pragma HLS STABLE variable=in_w
+    #pragma HLS STABLE variable=out_h
+    #pragma HLS STABLE variable=out_w
+    #pragma HLS STABLE variable=pool_h
+    #pragma HLS STABLE variable=pool_w
+    #pragma HLS STABLE variable=stride_h
+    #pragma HLS STABLE variable=stride_w
+    #pragma HLS STABLE variable=pad_top
+    #pragma HLS STABLE variable=pad_left
+    #pragma HLS STABLE variable=dil_h
+    #pragma HLS STABLE variable=dil_w
+    #pragma HLS STABLE variable=pool_type
+    #pragma HLS STABLE variable=lp_order
+    #pragma HLS STABLE variable=count_include_pad
 
-    #pragma HLS ARRAY_PARTITION variable=win_buf complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=acc     complete dim=0
+    // -----------------------------------------------------------------------
+    // Top-level DATAFLOW region.
+    //
+    //   window_pipe  carries kTileC * pool_h * pool_w pixels per output
+    //                position; depth covers one full window block so the
+    //                producer can stage the next tile while the consumer
+    //                is reducing.
+    //   denom_pipe   one entry per output position — small FIFO is enough.
+    //   acc_stream   c_valid AccData_t entries per (ni, ct, owt, oh, ow);
+    //                depth kTileC matches the writer's per-tile drain burst.
+    //
+    // ow_tile is the W-tile chunk size (single source of truth — passed to
+    // all three stages so they iterate (ni, ct, owt, oh, ow) in lockstep).
+    // When in_w <= kMaxLineBufCols the formula yields ow_tile = out_w and the
+    // owt loop runs once: the kernel matches the zero-duplication path.
+    // When in_w > kMaxLineBufCols, ow_tile < out_w and boundary input columns are
+    // re-read once per W-tile transition — the documented relaxation.
+    // -----------------------------------------------------------------------
+    const unsigned ow_tile = compute_ow_tile(out_w, pool_w, stride_w, dil_w);
 
-    const unsigned c_tiles = (channels + kTileC - 1) / kTileC;
+    #pragma HLS DATAFLOW
 
-    for (unsigned ni = 0; ni < batch; ni++) {
+    hls::stream<Data_t>   window_pipe;
+    #pragma HLS STREAM variable=window_pipe depth=kTileC*kMaxPoolH*kMaxPoolW
 
-        for (unsigned oh = 0; oh < out_h; oh++) {
-            for (unsigned ow = 0; ow < out_w; ow++) {
+    hls::stream<unsigned> denom_pipe;
+    #pragma HLS STREAM variable=denom_pipe depth=4
 
-                // -------------------------------------------------------
-                // Count valid (non-padded) pixels for this output position.
-                // Used as the AVG denominator when count_include_pad=0.
-                // Computed once per (oh, ow) — same for all channels.
-                // -------------------------------------------------------
-                unsigned valid_count = 0;
-                for (unsigned khi = 0; khi < pool_h; khi++) {
-                    for (unsigned kwi = 0; kwi < pool_w; kwi++) {
-                        const int ih = (int)(oh * stride_h + khi * dil_h) - (int)pad_top;
-                        const int iw = (int)(ow * stride_w + kwi * dil_w) - (int)pad_left;
-                        if (ih >= 0 && (unsigned)ih < in_h &&
-                            iw >= 0 && (unsigned)iw < in_w)
-                            valid_count++;
-                    }
-                }
+    hls::stream<AccData_t> acc_stream;
+    #pragma HLS STREAM variable=acc_stream depth=kTileC
 
-                // Precompute reciprocal denominator for AVG (multiply beats divide).
-                const unsigned denom_u = count_include_pad
-                    ? (pool_h * pool_w)
-                    : valid_count;
-                const float inv_denom = (denom_u > 0u) ? 1.0f / (float)denom_u : 0.0f;
+    input_window_producer(
+        x, window_pipe, denom_pipe,
+        batch, channels, in_h, in_w, out_h, out_w,
+        pool_h, pool_w, stride_h, stride_w,
+        pad_top, pad_left, dil_h, dil_w,
+        pool_type, count_include_pad, ow_tile);
 
-                for (unsigned ct = 0; ct < c_tiles; ct++) {
-                    const unsigned c_off   = ct * kTileC;
-                    const unsigned c_valid = std::min(kTileC, channels - c_off);
+    process_pool_kernel_tile(
+        window_pipe, denom_pipe, acc_stream,
+        batch, channels, out_h, out_w,
+        pool_h, pool_w, pool_type, lp_order, ow_tile);
 
-                    // ---------------------------------------------------
-                    // Load pool window into win_buf.
-                    //
-                    // For each (c_l, khi), compute the DDR row address once,
-                    // then burst-load kw elements along the width dimension.
-                    // Out-of-bounds pixels are filled with the identity:
-                    //   MAX → kNegInfSentinel (saturates to min representable)
-                    //   AVG / LP → 0
-                    // The reduce loop therefore needs no bounds checks.
-                    // ---------------------------------------------------
-                    for (unsigned c_l = 0; c_l < c_valid; c_l++) {
-                        const unsigned x_c_base =
-                            (ni * channels + c_off + c_l) * in_h * in_w;
-                        for (unsigned khi = 0; khi < pool_h; khi++) {
-                            const int ih =
-                                (int)(oh * stride_h + khi * dil_h) - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned x_row =
-                                x_c_base + (ih_ok ? (unsigned)ih * in_w : 0u);
-                            for (unsigned kwi = 0; kwi < pool_w; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const int iw =
-                                    (int)(ow * stride_w + kwi * dil_w) - (int)pad_left;
-                                const bool valid =
-                                    ih_ok && iw >= 0 && (unsigned)iw < in_w;
-                                const Data_t pad_val = (pool_type == kPoolMax)
-                                    ? Data_t(kDataMin)
-                                    : Data_t(0);
-                                win_buf[c_l][khi][kwi] =
-                                    valid ? x[x_row + (unsigned)iw] : pad_val;
-                            }
-                        }
-                    }
-
-                    // ---------------------------------------------------
-                    // Initialise accumulators.
-                    //
-                    // Fully unrolled → kTileC registers written in 1 cycle.
-                    //   MAX: kAccMin sentinel (minimum representable AccData_t value;
-                    //        any valid input beats it on the first comparison)
-                    //   AVG / LP: 0 (sum starts at zero)
-                    // ---------------------------------------------------
-                    for (unsigned c1 = 0; c1 < kTileC; c1++) {
-                        #pragma HLS UNROLL
-                        acc[c1] = (pool_type == kPoolMax)
-                            ? AccData_t(kAccMin)
-                            : AccData_t(0);
-                    }
-
-                    // ---------------------------------------------------
-                    // Reduce: II=1 pipelined flat counter.
-                    //
-                    // ri runs 0 .. pool_h*pool_w*kTileC - 1.
-                    //
-                    //   c1 = ri & (kTileC - 1)  — bitwise AND (kTileC is
-                    //        a compile-time power of 2); selects channel lane.
-                    //
-                    // acc[c1] is written at ri and next at ri+kTileC, so
-                    // the dependency distance = kTileC ≥ operation latency
-                    // → II=1 achievable for all three pool types.
-                    //
-                    // Spatial counters (kwi_cnt, khi_cnt) advance every
-                    // kTileC iterations via compare-increment chains.
-                    // ---------------------------------------------------
-                    unsigned kwi_cnt = 0, khi_cnt = 0;
-                    const unsigned ri_bound = pool_h * pool_w * kTileC;
-                    for (unsigned ri = 0; ri < ri_bound; ri++) {
-                        #pragma HLS PIPELINE II=1
-                        const unsigned c1  = ri & (kTileC - 1);
-                        const AccData_t val = AccData_t(win_buf[c1][khi_cnt][kwi_cnt]);
-
-                        if (pool_type == kPoolMax) {
-                            if (val > acc[c1]) acc[c1] = val;
-                        } else if (pool_type == kPoolAvg) {
-                            acc[c1] += val;
-                        } else {
-                            // LP: p=1 → |val|,  p=2 → val²
-                            // Both branches cast to AccData_t: unary minus widens by 1 bit,
-                            // multiplication doubles the bit width; explicit casts required.
-                            const AccData_t contrib = (lp_order == 1u)
-                                ? (val < AccData_t(0) ? AccData_t(-val) : val)
-                                : AccData_t(val * val);
-                            acc[c1] += contrib;
-                        }
-
-                        if ((ri & (kTileC - 1)) == kTileC - 1) {
-                            if (++kwi_cnt == pool_w) {
-                                kwi_cnt = 0;
-                                ++khi_cnt;
-                            }
-                        }
-                    }
-
-                    // ---------------------------------------------------
-                    // Finalise and write output.
-                    //
-                    // Post-reduction operations:
-                    //   MAX: identity — acc is already the max value.
-                    //   AVG: multiply by precomputed reciprocal denominator.
-                    //   LP p=1: identity — acc is already Σ|x_i|.
-                    //   LP p=2: sqrt(acc) via float (DSP-friendly in HLS).
-                    //
-                    // Output addresses are non-contiguous in C (stride =
-                    // out_h*out_w per channel); y_addr is advanced by a
-                    // counter to avoid a multiplier inside the pipeline.
-                    // ---------------------------------------------------
-                    const unsigned hw_stride = out_h * out_w;
-                    unsigned y_addr =
-                        (ni * channels + c_off) * out_h * out_w + oh * out_w + ow;
-
-                    for (unsigned c1 = 0; c1 < c_valid; c1++) {
-                        #pragma HLS PIPELINE II=1
-                        AccData_t result;
-                        if (pool_type == kPoolMax) {
-                            result = acc[c1];
-                        } else if (pool_type == kPoolAvg) {
-                            result = AccData_t((float)acc[c1] * inv_denom);
-                        } else {
-                            result = (lp_order == 1u)
-                                ? acc[c1]
-                                : AccData_t(sqrtf((float)acc[c1]));
-                        }
-                        y[y_addr] = saturate_cast<Data_t>(result);
-                        y_addr += hw_stride;
-                    }
-
-                } // c_tile loop
-
-            } // ow loop
-        } // oh loop
-
-    } // batch loop
+    write_output_tile(
+        y, acc_stream,
+        batch, channels, out_h, out_w, ow_tile);
 }

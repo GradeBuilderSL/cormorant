@@ -59,6 +59,11 @@ set(POOL_MAX_KH  7  CACHE STRING
     "Compile-time pool window height limit; models with pool_h > MAX_KH are rejected")
 set(POOL_MAX_KW  7  CACHE STRING
     "Compile-time pool window width limit; models with pool_w > MAX_KW are rejected")
+set(POOL_MAX_LINE_BUF_ROWS  16  CACHE STRING
+    "Compile-time line-buffer row count (power-of-two ≥ (pool_h-1)*dil_h + 1)")
+set(POOL_MAX_LINE_BUF_COLS  64  CACHE STRING
+    "Line-buffer column capacity; W-tile chunk size is bounded by this. \
+in_w > MAX_LINE_BUF_COLS triggers W-tiling with boundary re-reads.")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -172,7 +177,9 @@ message(STATUS "PoolingKernel: targets — pool_kernel, pool_kernel_float, TestP
 message(STATUS "PoolingKernel: Data_t=${POOL_DATA_TYPE}  "
                "AccData_t=${POOL_ACC_DATA_TYPE}  "
                "TILE_C=${POOL_TILE_C}  "
-               "MAX_KH=${POOL_MAX_KH}  MAX_KW=${POOL_MAX_KW}")
+               "MAX_KH=${POOL_MAX_KH}  MAX_KW=${POOL_MAX_KW}  "
+               "MAX_LINE_BUF_ROWS=${POOL_MAX_LINE_BUF_ROWS}  "
+               "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.

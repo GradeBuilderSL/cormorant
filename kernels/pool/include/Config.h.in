@@ -36,6 +36,28 @@ static constexpr unsigned kTileC    = @POOL_TILE_C@;
 static constexpr unsigned kMaxPoolH = @POOL_MAX_KH@;
 static constexpr unsigned kMaxPoolW = @POOL_MAX_KW@;
 
+// ---------------------------------------------------------------------------
+// Line-buffer dimensions — used by input_window_producer to cache input rows
+// across the oh sweep within a single channel tile.
+//
+// kMaxLineBufRows  Power-of-2 upper bound on the vertical span of a pool
+//                  window: (pool_h - 1) * dil_h + 1.  The producer hashes
+//                  the input row index modulo kMaxLineBufRows to pick a
+//                  slot, so this MUST be a power of two.  Models violating
+//                  the bound are rejected by the inference scheduler.
+//
+// kMaxLineBufCols  Line buffer's innermost column dimension — caps the
+//                  width of one W-tile.  When in_w <= kMaxLineBufCols the
+//                  whole row fits in cache and there are no duplicate DDR
+//                  reads.  When in_w > kMaxLineBufCols the producer
+//                  splits out_w into multiple W-tiles; boundary input
+//                  columns are re-read once per tile transition.  Only
+//                  hard constraint: (pool_w-1)*dil_w + 1 <= kMaxLineBufCols
+//                  (a single pool window must fit horizontally).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxLineBufRows = @POOL_MAX_LINE_BUF_ROWS@;
+static constexpr unsigned kMaxLineBufCols = @POOL_MAX_LINE_BUF_COLS@;
+
 // Pool type codes (match pool_type AXI-Lite register value).
 static constexpr unsigned kPoolMax = 0u;
 static constexpr unsigned kPoolAvg = 1u;
