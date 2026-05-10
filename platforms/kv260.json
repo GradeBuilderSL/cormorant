@@ -10,7 +10,7 @@
       "max_kw":            7,
       "max_line_buf_rows": 16,
       "max_line_buf_cols": 64,
-      "ow_parallel":       4
+      "ow_parallel":       2
     }
   }
 }

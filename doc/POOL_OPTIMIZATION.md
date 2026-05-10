@@ -880,6 +880,102 @@ on the existing test suite.  A workload with much larger `in_h × in_w`
 (e.g. early-conv-pool stages of a 512×512-input model) would be needed
 to put Phase 1 back on the critical path before this is worth retrying.
 
+### 6.2. Tried and rejected: writer-side bus-utilisation fixes (post-§2.10)
+
+A Vivado timing-diagram capture of `write_output_tile`'s `m_axi` activity
+revealed that every 32-bit beat carries only one 16-bit `Data_t` —
+`WSTRB` is always `0x3` or `0xC`, never `0xF`.  Half the write-bus
+bandwidth is unused per beat.  Three attempts were made to flip those
+beats to full-`WSTRB` packed writes; **all three regressed**.  Diagnosis
+across the trio: the writer was already overlapped behind the producer's
+reduce/finalize critical path in the DATAFLOW region, so saving AXI bus
+cycles didn't unblock anything — and each attempt's structural change
+added cycles that the bus savings couldn't repay.
+
+#### 6.2.1. Writer loop flip `(p, c1) → (c1, p)`
+
+Flipping the finalize/drain loop order so the inner `p` walks adjacent
+ow positions (`Δ = sizeof(Data_t) = 2 B`) should have let HLS pack two
+16-bit writes into one 32-bit beat with `WSTRB=0xF`.  Result:
+**+1.0% total** (1,677,745 → 1,695,345 ns); no individual test moved
+more than ±2%.
+
+Diagnosis: HLS doesn't coalesce writes across the inner `p` loop
+because of the residual-padding mask `if (ow_ok) y[…] = v` — every beat
+could be either a full write or a no-op, so HLS conservatively keeps
+them as separate single-element transactions with partial WSTRB.  The
+favorable address pattern is wasted on the conditional store.
+
+#### 6.2.2. Row-buffered Phase A → Phase B burst writes
+
+Two-phase rewrite: Phase A drains `acc_stream` into a per-channel row
+buffer `out_row[kTileC][kMaxLineBufCols]` (the `ow_ok` mask gates the
+buffer write, not the DDR write); Phase B issues a contiguous,
+unconditional, monotonic write loop per channel that HLS should widen
+into packed beats.  Result: **+3.25% total** (1,677,745 → 1,732,295 ns).
+All 31 tests regressed; global pool variants worst-hit at **+10–17%**
+(Phase A+B overhead with only 1 element per row is pure waste).
+
+Diagnosis: Phase A and Phase B serialise inside `write_output_tile` —
+no inner-function DATAFLOW pulls them apart, so the writer's per-`(oh,
+owt)` cycle count grew from `kOwParallel × c_valid × n_groups` (= one
+phase, pipelined) to `kOwParallel × c_valid × n_groups + c_valid ×
+ow_span` (= two sequential phases).  Even when Phase B's packed beats
+halve the AXI traffic, the added Phase B cycles outweigh the savings,
+and for `out_w=1` the buffering is pure overhead.
+
+#### 6.2.3. Wider `acc_stream` (`AccBundle`) + parallel finalize
+
+Replaced `hls::stream<AccData_t>` with `hls::stream<AccBundle>` (one
+wide transaction per ow-group carrying all kOwParallel × kTileC
+AccData_t lanes).  Producer fully unrolls the finalize across both `p`
+and `c1` and emits one bundle per group; in theory this collapses the
+producer's per-group cost from `pool_h × pool_w + kOwParallel × c_valid`
+(reduce + scalar finalize) to `pool_h × pool_w + 1`.
+
+Result: **+19.05% total** (1,677,745 → 1,997,395 ns) — by far the
+largest regression of the three.  The slowdown clustered exactly on the
+consumer-bound tests this change was meant to help:
+
+| Test category | Δ% vs narrow stream |
+|---|---:|
+| 3x3 stride1 pad1 narrow (5 variants) | **+40% uniform** |
+| Wide-W 3x3 (single + batch=2) | **+33 to +35%** |
+| Wide-W 2x2 stride2 | **+36 to +39%** |
+| Dilation=2 pool2x2 | +13.6% |
+| Phase 1-bound (C_16 / C_32 / GlobalPool) | +0.2 to +1.0% (noise) |
+
+Diagnosis: HLS could not actually fit the fully-unrolled finalize into
+~1 cycle.  16 parallel poly_sqrt / AVG-multiply instances feeding a
+512-bit wide FIFO write force a multi-cycle pipeline for the bundle
+assembly + emit, and the reduce → finalize schedule lengthened beyond
+the original narrow-stream `II=1` finalize loop.  The +40% uniform
+hit on all five 3x3 pad1 variants is the signature of producer-side
+pipeline lengthening (not writer or DDR, which would show selective
+patterns).
+
+#### 6.2.4. Conclusion
+
+The half-WSTRB observation is real but **persistently un-improvable
+through kernel-side restructuring at the HLS abstraction level the
+current code uses**.  Every attempt either keeps the conditional
+residual-padding store (HLS won't pack), removes the conditional via
+buffering (Phase A/B serialise inside the function), or tries to feed
+the writer through a wider FIFO (HLS can't realise the parallel
+finalize at II=1 the way the analysis predicts).  The bus-utilisation
+inefficiency is harmless because the writer is not on the wall-clock
+critical path — saving bus cycles doesn't unblock anything in the
+DATAFLOW region.
+
+If the half-WSTRB pattern ever becomes a real problem (e.g. on a
+heavily-shared AXI fabric where multiple kernels contend for the same
+DDR controller), the right fix is **widening the global
+`AXI_BUS_WIDTH`** at the top-level CMake (32 → 64/128).  HLS's m_axi
+auto-widening handles the packing without any kernel-side restructure
+and benefits all four kernels symmetrically.  It requires re-running
+synthesis for all platforms and validating that the Vivado AXI
+interconnect matches — outside the scope of pool-only optimisation.
+
 ---
 
 ## 7. Verification matrix
