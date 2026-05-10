@@ -714,10 +714,45 @@ To go further requires more invasive changes:
 |---|---|---|
 | kOwParallel = 4 | Replicate `line_buf` banks (or column-cyclic partition) so the producer can read 4 columns/cycle/channel; widen MultiWindow to 4 lanes; quad-up acc[][] grid | Up to 2× on tests already saturating consumer at kOwParallel=2 (wide-W) |
 | Wider window vectors (kwi-fanout) | Emit `pool_w` pixels per cycle along kwi axis; reduce trip drops to `pool_h` cycles per ow-group | 2–4× on consumer (orthogonal to kOwParallel) |
-| Phase 1 DDR burst | Coalesce row_loader's `(c_l, iw)` reads into m_axi bursts | Up to 2× on multi-channel-tile (C_16/C_32) and 2x2 stride2 narrow |
 
 These are deferred until profiling shows pool on a critical path of a real
 inference workload.
+
+### 6.1. Tried and rejected: Phase 1 DDR burst (post-§2.9)
+
+Reordering `row_loader` and `window_emitter` Phase 1 from `(ih, c_l, iw)`
+to `(c_l, ih, iw)` — so a per-channel sweep is one address-monotonic
+range that HLS could fold into a single AXI4 burst — was implemented and
+benchmarked.  Result on the kv260 sim: **+0.39% total** (1,677,745 →
+1,684,215 ns), within HLS synthesis noise; no individual test moved more
+than ±1%.
+
+Two diagnoses combine to explain why:
+
+1. **Phase 1 wasn't on the critical path** for any test post-§2.9.  On
+   3x3 stride1 pad1 the consumer's reduce already pipelined at II=1 and
+   was the wall-clock bottleneck; halving the producer's per-channel
+   issue cost doesn't move it.  On wide-W tests the consumer's
+   `pool_h × pool_w / kOwParallel` cycle count likewise sets the floor.
+2. **Default HLS burst inference was already adequate** at the
+   geometries the test suite exercises — the original `(ih, c_l, iw)`
+   nest's per-channel `iw_load_hi - iw_load_lo + 1` bursts (≤128 elems)
+   fit inside the default `max_read_burst_length=16` × DDR-controller
+   queue pipelining, with `num_read_outstanding` masking AR-channel
+   serialisation.
+
+Adding `max_read_burst_length=256`, `num_read_outstanding=4`, and
+`max_widen_bitwidth=128` to the `m_axi` pragmas alongside the reorder
+made things **worse by 3.4%** — the wider bus widening forced HLS to
+generate alignment shifters that add per-burst overhead, hurting the
+narrow tests where bursts are short (8–16 elements).  The pragmas and
+the loop reorder were both reverted.
+
+Conclusion: the producer/consumer balance after §2.5 + §2.9 is tight
+enough that DDR-side coalescing yields no measurable wall-clock benefit
+on the existing test suite.  A workload with much larger `in_h × in_w`
+(e.g. early-conv-pool stages of a 512×512-input model) would be needed
+to put Phase 1 back on the critical path before this is worth retrying.
 
 ---
 
