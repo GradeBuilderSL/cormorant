@@ -26,12 +26,14 @@ after running the full TestPoolingSim case list.
 | + 3 batch=2 wide-W tests | 31 | 7,021,605 | (test-set change) | — |
 | + Drain/reduce fusion in consumer | 31 | 5,178,425 | -26.3% | — |
 | + Vector window_pipe (kTileC lanes/cycle) | 31 | 3,527,035 | -31.9% | — |
-| **+ Producer split (Phase1/Phase2 dataflow) + unrolled valid_count** | **31** | **3,416,225** | **-3.1%** | **-51.4%** |
+| + Producer split (Phase1/Phase2 dataflow) + unrolled valid_count | 31 | 3,416,225 | -3.1% | -51.4% |
+| + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
+| **+ Fixed-point AVG reciprocal (drop FP div+mul on AVG path)** | **31** | **2,214,605** | **-22.5%** | **-68.5%** |
 
-**Net result on the 31-test suite: ~2.06× faster than the post-baseline
-(line-buffer-only) implementation; ~50% reduction in total HW sim time.**
+**Net result on the 31-test suite: ~3.17× faster than the post-baseline
+(line-buffer-only) implementation; ~68.5% reduction in total HW sim time.**
 
-For the 25 tests common to every stage the same kernel runs **3.4× faster**
+For the 25 tests common to every stage the same kernel runs **~5.4× faster**
 than the pre-optimization baseline (line-buffer-only equivalent on the same
 test list).
 
@@ -225,9 +227,172 @@ bottleneck:
 | Wide-W non-overlap | -8 to -10% |
 | 3x3 stride1 pad1 (consumer-bound) | ~0% |
 
+### 2.7. poly_sqrt — drop the FP sqrt unit (LP-Pool p=2)
+
+**Problem.** LP-Pool p=2's finalize step called `sqrtf((float)acc)` to apply
+the square root. Even though only one of three pool types uses this path, HLS
+still has to instantiate a **floating-point square-root unit** as part of the
+consumer's compiled hardware. The FP sqrt is a heavy block (multi-cycle
+latency, dedicated DSP slices, large LUT footprint), and its presence in the
+consumer's pipeline budget tightens timing on every iteration — not just on
+LP-2.
+
+**Change.** Replaced the FP round-trip with a fully fixed-point 3rd-order
+polynomial approximation. New helper `poly_sqrt(AccData_t)` lives at the top
+of `PoolingKernel.cpp`:
+
+1. **Range reduction** — decompose `x = m × 4^k` with `m ∈ [1, 4)`, `k ∈ ℤ`.
+   Find the MSB position of the raw 32-bit fixed-point value via an
+   unrolled priority encoder (~5 LUT levels), then shift to land
+   `m_raw ∈ [2^16, 2^18)`.
+2. **Polynomial via Horner's scheme** —
+   `√m ≈ 0.4434 + 0.6432·m − 0.0943·m² + 0.0077·m³`, Lagrange-interpolated
+   through (1,1), (2,√2), (3,√3), (4,2). Max error ~0.22% on the
+   normalized mantissa. All coefficients in `ap_fixed<16,1>` (15 frac bits);
+   intermediates in `ap_fixed<24,4>`.
+3. **Final scale** — `√x = √m × 2^k` via a single barrel shift on `AccData_t`.
+
+Float fallback under `#ifndef POOL_HAVE_APFIXED` retained for non-Vitis
+builds.
+
+**Reference parity.** Both the C++ test reference (`ref_poly_sqrt` in
+`TestPoolingSim.cpp`) and the inference-scheduler simulator
+(`_pool_poly_sqrt` in `_simulate.py`) now mirror the kernel **bit-exactly**
+— same coefficients, same range reduction, same `AP_TRN` intermediate
+truncations via a `quantize_trn(v, frac_bits) = floor(v · 2^N) / 2^N` helper.
+This keeps the dump-mode hex fixtures aligned with the kernel's RTL output
+without any 1-LSB drift.
+
+**Result.** **-16.4% sim_time_ns** (3,416,225 → 2,856,995 ns).
+
+The surprise: gains were **uniform across all pool types**, not just LP-2.
+Every 3x3 stride1 pad1 test dropped ~18.7% — including MaxPool and AvgPool
+which never call `sqrtf`. The wide-W tests dropped 18–23%.
+
+| Test category | Δ% |
+|---|---:|
+| 3x3 stride1 pad1 (MaxPool / AvgPool / LpPool) | **-18.7%** |
+| Wide-W 3x3 batch=2 (Max / Avg) | **-22.5% to -22.7%** |
+| Wide-W 2x2 stride2 (Max) | -17.9% to -18.5% |
+| 2x2 stride2 narrow | -1.8% to -3.0% |
+| Global pool (small outputs) | -0.3% to -1.5% |
+| LpPool subset only | -9.4% (per-LP gain not the whole story) |
+
+**Why the cross-cutting win.** When HLS sees `sqrtf` it reserves area in the
+consumer's compiled hardware for the FP unit — even on the MAX/AVG paths
+the budget is set by the heaviest operator. Removing the FP block lets HLS:
+
+1. Reclaim the LUTs/DSPs the unit occupied
+2. Schedule the consumer's reduce loop more aggressively (likely lower II
+   on the AVG/LP path, fewer pipeline registers throughout)
+3. Drop the dataflow region's overall resource pressure
+
+The 22% improvement on wide-W tests — which spend the most time in the
+consumer reduce — is the smoking gun. The kernel was implicitly paying the
+FP sqrt cost on every consumer cycle, regardless of whether LP-2 was active.
+
+### 2.8. Fixed-point AVG reciprocal — drop the FP divider + multiplier
+
+**Problem.** AVG-Pool's finalize step computed the divide-by-`denom` as
+
+```cpp
+const float inv_denom = 1.0f / (float)denom_u;
+result = AccData_t((float)acc[c1] * inv_denom);
+```
+
+Three FP units lived in the consumer's compiled hardware to support this:
+an **FP divider** (~28 cyc, ~5 DSPs) computing `1/d` once per output
+position; an **FP multiplier** (~3 DSPs) for the per-lane scale; and two
+**FP↔fixed converters** for the `(float)acc` cast and the result writeback.
+By the same dataflow-budgeting logic as Section 2.7's poly_sqrt: HLS sized
+the consumer's pipeline budget around the heaviest operator, so MAX/LP also
+paid the cost on every cycle even though they never touch the AVG path.
+
+**Change.** Replaced the FP round-trip with a precomputed fixed-point
+reciprocal LUT:
+
+1. New `inv_denom_lookup(d)` returns `1/d` as `ap_ufixed<24, 1>`, indexed
+   by `denom_u`.  The table is `constexpr`-built from
+   `raw = ((1<<23) + d/2) / d` (integer round-to-nearest of `2^23 / d`)
+   and stored as raw 24-bit values; the use site reconstructs the
+   `ap_ufixed` by direct `.range()` bit-copy — no FP→fixed converter.
+2. Sized to `kMaxLineBufRows × kMaxLineBufCols` (1024 entries with
+   defaults), the worst-case denom the line buffers can hold.  HLS
+   synthesises a single ~3 KiB ROM (1 BRAM18) with the table contents
+   baked in at translation time.
+3. The finalize multiply becomes `result = AccData_t(acc[c1] * inv_denom)`
+   — a native `ap_fixed<32,16> × ap_ufixed<24,1>` multiply with a single
+   fabric multiplier; no DSP-FPU.
+
+**Numerical stability.**  LUT entries hold `1/d` to 23 fractional bits
+(LSB ≈ 1.19e-7), well below `Data_t`'s 1/256 LSB.  The new path is in fact
+*more* numerically accurate than the prior float path: the old `(float)acc`
+cast lost ~8 bits of precision on the 32-bit `AccData_t` whenever
+`|acc| > 256`, which the new ap_fixed multiply preserves.
+
+**Reference parity.**  This change shifts the kernel's exact arithmetic on
+~2.5% of AVG-Pool inputs (1-LSB drift vs an idealised `acc / denom` divide),
+so three reference paths had to be re-aligned bit-for-bit:
+
+- `TestPoolingSim.cpp::ref_avg_pool_fixed` mirrors `inv_denom_lookup` +
+  the AccData_t/Data_t truncations exactly.  `ref_pool_elem`'s AVG branch
+  routes through it so `--dump-data` writes y.hex fixtures that match the
+  RTL output under strict equality.
+- `inference-scheduler/_simulate.py::_pool2d_ref` was updated to use the
+  same encoded reciprocal — `test_inference.c` compares output bytes for
+  strict equality against the generated `expected/*.dat`, so any
+  divergence between the kernel and the simulator would surface as a
+  legitimate-cell mismatch on-device.
+- `hw/test_data/pool_test_data/test_{09,10,26,29}_y.hex` regenerated for
+  the four AVG-Pool behavior cases (13/13/90/190 cells changed, all by
+  exactly 1 LSB).
+
+A new C-sim subtest (`run_avg_pool_strict_test`) pins this contract from
+the kernel side: 5×5 pad=2 over a deterministic LCG-generated input,
+compared with strict equality (no tolerance) against `ref_avg_pool_fixed`.
+Replay-against-the-old-path shows ~3% of cells would diverge there, so
+the test is genuinely sensitive to a regression to the FP reciprocal.
+
+**Result.** **-22.5% sim_time_ns** (2,856,995 → 2,214,605 ns total).
+
+The same cross-cutting pattern Section 2.7 documented for poly_sqrt
+repeats here, scaled up — removing the FP div+mul has even more reach
+than removing FP sqrt because the AVG path's units sat directly in the
+consumer's hot reduce/finalize pipeline rather than guarded behind
+`pool_type == kPoolLp`:
+
+| Test category | Δ% |
+|---|---:|
+| 3x3 stride1 pad1 (Max / Avg / Lp p=1 / Lp p=2) | **-26%** (uniform) |
+| Wide-W 3x3 batch=2 (Max / Avg) | **-33% to -34%** |
+| Wide-W 3x3 single-batch | **-33%** |
+| Dilation=2 pool 2x2 | -20.7% |
+| Multi-channel-tile (C_32 2x2 stride2) | -0.4% |
+| Global pool (small outputs) | -0.7% |
+
+The five 3x3 stride1 pad1 variants now finish within 240 ns of each other
+(42,780–43,080 ns) — the consumer reduce loop runs at the same rate
+regardless of pool type, confirming the FP-unit budget tax is fully gone.
+
+**Why even larger than 2.7's win.** Two contributing factors:
+
+1. **FP div+mul is heavier than FP sqrt** in resource and scheduling
+   pressure — the divider especially is expensive — so reclaiming both
+   frees more for the fabric to retime around.
+2. **AVG/LP add latency dominates the consumer's II.** Section 2.5
+   noted the consumer reaches II=1 only on MAX (compare is single-cycle);
+   AVG/LP run at II=2–3 due to the ap_fixed<32,16> add's RAW dependency
+   distance.  Removing FP units from the AVG finalize path lets HLS
+   schedule the reduce loop without that combined budget, recovering
+   cycles that were previously lost to the worst-case operator latency.
+
+The wide-W cases — which spend the most cycles in the consumer reduce —
+again show the largest savings, mirroring 2.7's "FP unit's dataflow tax
+compounded over the longer consumer reduce" diagnostic.
+
 ---
 
-## 3. Current architecture (post-2.6)
+## 3. Current architecture (post-2.8)
 
 ```
                   ┌─────────────┐
@@ -262,21 +427,29 @@ bottleneck:
    (partitioned `complete dim=1`, ~16 KB). Emits one WindowLanes vector
    per `(khi, kwi)`; emits one denom per `(oh, ow)` via parallel adder tree.
 3. **`process_pool_kernel_tile`** — owns `acc[kTileC]`. Vectorized II=1
-   reduce on the WindowLanes stream; finalizes (multiply by inv_denom for
-   AVG, sqrt for LP-2) and pushes c_valid AccData_t to acc_stream.
+   reduce on the WindowLanes stream; finalizes (AVG: multiply by
+   `inv_denom_lookup(denom_u)` — fixed-point ROM reciprocal, see
+   §2.8.  LP-2: `poly_sqrt`, see §2.7) and pushes c_valid AccData_t
+   to acc_stream.
 4. **`write_output_tile`** — saturates AccData_t → Data_t and writes to y.
 
 **Loop nest** (all stages in lockstep): `(ni, ct, owt, oh, ow)`. The W-tile
 dimension `owt` is collapsed to a single iteration when `in_w ≤ kMaxLineBufCols`.
 
-**Cycle counts per output position** at the consumer's reduce loop:
+**Cycle counts per output position** at the consumer's reduce loop
+(post-§2.8 — the FP-unit removal lets HLS hold all four paths near the
+MAX baseline):
 
 | Pool type | II | Cycles per output |
 |---|---:|---:|
 | MaxPool | 1 | `pool_h × pool_w` |
-| AveragePool | 2–3 (DSP add latency) | `2-3 × pool_h × pool_w` |
-| LpPool p=1 | 1–2 | `1-2 × pool_h × pool_w` |
-| LpPool p=2 | 2–3 (mul + add) | `2-3 × pool_h × pool_w` |
+| AveragePool | 1 (post-§2.8 — was 2–3 with FP div+mul) | `pool_h × pool_w` |
+| LpPool p=1 | 1 | `pool_h × pool_w` |
+| LpPool p=2 | 1–2 (poly_sqrt finalize once per output) | `pool_h × pool_w` |
+
+The five Max/Avg/Lp variants of 3x3 stride1 pad1 finishing within 240 ns
+of each other on the kv260 sim is the empirical confirmation — see §2.8
+result table.
 
 The producer is matched at `pool_h × pool_w` cycles per output for
 `emit_phase 2`, with Phase 1 row loads overlapped via the dataflow split.
@@ -316,29 +489,44 @@ from the start; wide-W tests added later.
 
 | Test | Baseline (ns) | Final (ns) | Speedup |
 |---|---:|---:|---:|
-| MaxPool 3x3 stride1 pad1 | 236,600 | 71,840 | **3.30×** |
-| AvgPool 3x3 stride1 pad1 (no incl pad) | 236,610 | 71,860 | **3.29×** |
-| LpPool p=2 3x3 pad1 | 236,350 | 71,610 | **3.30×** |
-| MaxPool C=32 2x2 stride2 | 165,150 | 162,970 | 1.01× |
-| MaxPool dilation=2 pool2x2 | 72,270 | 46,150 | 1.57× |
-| GlobalMaxPool batch=2 C=12 6x6 | 76,680 | 53,560 | 1.43× |
-| MaxPool wide W=128 3x3 stride1 pad1 | (n/a) | 244,780 | — |
-| AvgPool wide W=96 3x3 stride1 pad1 batch=2 | (n/a) | 710,780 | — |
+| MaxPool 3x3 stride1 pad1 | 236,600 | 43,080 | **5.49×** |
+| AvgPool 3x3 stride1 pad1 (no incl pad) | 236,610 | 43,060 | **5.49×** |
+| LpPool p=2 3x3 pad1 | 236,350 | 42,840 | **5.52×** |
+| MaxPool C=32 2x2 stride2 | 165,150 | 161,520 | 1.02× |
+| MaxPool dilation=2 pool2x2 | 72,270 | 30,590 | **2.36×** |
+| GlobalMaxPool batch=2 C=12 6x6 | 76,680 | 53,000 | 1.45× |
+| MaxPool wide W=128 3x3 stride1 pad1 | (n/a) | 127,790 | — |
+| AvgPool wide W=96 3x3 stride1 pad1 batch=2 | (n/a) | 364,750 | — |
+| MaxPool wide W=128 3x3 stride1 pad1 batch=2 | (n/a) | 246,640 | — |
 
 **The 3x3 overlap cases benefited the most** — the line buffer eliminated
-duplicate DDR reads, and consumer fusion + vectorization halved then
-quartered the inner reduce.
+duplicate DDR reads, consumer fusion + vectorization halved then quartered
+the inner reduce, `poly_sqrt` recovered ~19% by removing the implicit
+FP-sqrt budget tax, and the fixed-point AVG reciprocal recovered another
+~26% by retiring FP div+mul from the consumer's pipeline budget — leaving
+all five Max/Avg/Lp variants of the 3x3 pad1 group within 240 ns of each
+other, the consumer's reduce loop now running at the same rate
+independent of pool type.
 
 **Multi-channel-tile and non-overlap tests** (C_32, 2x2 stride2 family)
 benefited mainly from the producer split — Phase 1 was their dominant cost.
+
+**Wide-W tests** got the biggest absolute savings from both FP-unit
+removals (poly_sqrt + fixed-point AVG reciprocal), each compounded over
+the longer consumer reduce — the AVG-reciprocal step alone trimmed
+33–34% off these cases.
 
 ---
 
 ## 6. Where the floor is now
 
-The remaining bottleneck on overlap-heavy 3x3 tests is the consumer's reduce
-loop running at `pool_h × pool_w × II` cycles per output, with II=1 for MAX
-and II=2–3 for AVG/LP due to ap_fixed<32,16> add/MAC latency.
+After §2.8 the consumer's reduce loop runs at the same rate across all pool
+types on overlap-heavy 3x3 tests — the five Max/Avg/Lp variants of 3x3
+stride1 pad1 land within 240 ns of each other (42,780–43,080 ns), so the
+old AVG/LP II=2–3 penalty (ap_fixed<32,16> add/MAC latency, see §2.5) no
+longer dominates the wall-clock total.  The remaining bottleneck is the
+fundamental `pool_h × pool_w` cycles per output position the consumer
+reads from `window_pipe`, matched by the producer's emit rate.
 
 To go further requires more invasive changes:
 
@@ -357,12 +545,19 @@ inference workload.
 
 | Configuration | C-sim (TestPoolingSim) | RTL sim (behavior_test_pool) |
 |---|---|---|
-| Default (kMaxLineBufCols=64) | 31/31 PASS | 31/31 PASS |
-| Reduced cache (kMaxLineBufCols=8) | 31/31 PASS, dup_reads tracks predictor | (not run) |
-| Increased cache (kMaxLineBufCols=256) | 31/31 PASS, dup_reads = 0 throughout | (not run) |
+| Default (kMaxLineBufCols=64) | 33/33 PASS | 31/31 PASS |
+| Reduced cache (kMaxLineBufCols=8) | 33/33 PASS, dup_reads tracks predictor | (not run) |
+| Increased cache (kMaxLineBufCols=256) | 33/33 PASS, dup_reads = 0 throughout | (not run) |
 
 The cache-aware predictor in `TestPoolingSim.cpp` ensures the dup_reads
 column in test output is meaningful at any cache size.
+
+The C-sim count is 33 (vs 31 RTL): 31 geometry cases against the float64
+reference at `kTol = 0.02` (≈ 5 Data_t LSBs) plus 2 strict-equality
+sub-cases (`run_avg_pool_strict_test`, `count_include_pad ∈ {0, 1}`)
+that pin the AVG path's bit-accurate match to `ref_avg_pool_fixed`.  The
+strict cases are sensitive to a regression to the float reciprocal —
+~3% of cells in their input set diverge between the two paths.
 
 ---
 
@@ -370,8 +565,9 @@ column in test output is meaningful at any cache size.
 
 | File | What changed |
 |---|---|
-| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages |
+| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8) |
 | `kernels/pool/include/Config.h.in` | Added `kMaxLineBufRows`, `kMaxLineBufCols` |
 | `kernels/pool/CMakeLists.txt` | Added `POOL_MAX_LINE_BUF_ROWS`, `POOL_MAX_LINE_BUF_COLS` cache vars |
-| `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added |
-| `hw/test_data/pool_test_data/` | 31-test fixtures regenerated for kv260 RTL sim |
+| `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added; `quantize_trn` + `ref_poly_sqrt` mirror kernel's fixed-point sqrt bit-exactly; `ref_avg_pool_fixed` mirrors `inv_denom_lookup` bit-exactly; `ref_pool_elem`'s AVG branch routed through it; new `run_avg_pool_strict_test` (2 strict-equality subtests for AVG path) |
+| `inference-scheduler/src/codegen/_simulate.py` | `_quantize_trn` + `_pool_poly_sqrt` so generated `expected/*.dat` fixtures match the kernel's RTL output for LP-Pool p=2; `_pool2d_ref` AVG branch updated to use the same encoded reciprocal as the kernel so AVG cells match byte-for-byte under `test_inference.c`'s strict equality check |
+| `hw/test_data/pool_test_data/` | 31-test fixtures regenerated for kv260 RTL sim; AVG cases (`test_{09,10,26,29}_y.hex`) refreshed for §2.8 reciprocal change (4 files, 306 cells changed total, all by exactly 1 LSB) |

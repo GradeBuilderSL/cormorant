@@ -49,7 +49,10 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <utility>
 #include "hls_stream.h"
 
 #include "PoolingKernel.h"
@@ -129,6 +132,174 @@ typedef std::map<std::size_t, std::list<PoolReadCounters>> PoolAddressMap_t;
 struct WindowLanes {
     Data_t lanes[kTileC];
 };
+
+// ---------------------------------------------------------------------------
+// poly_sqrt — fixed-point sqrt approximation for LP-Pool p=2 finalize.
+//
+// Replaces sqrtf((float)acc) → AccData_t round-trip with a fully fixed-point
+// pipeline so HLS does not instantiate the FP square-root unit (which costs
+// dedicated DSP slices and adds 12+ cycle latency).
+//
+// Strategy — 3rd-order polynomial with range reduction:
+//   1. Decompose x = m * 4^k with m ∈ [1, 4), k = ⌊log₄ x⌋.
+//      Implementation: locate MSB of the raw 32-bit fixed-point bits via
+//      a priority encoder; shift to land m_raw in [2^16, 2^18).
+//   2. Approximate √m by Lagrange interpolation through (1,1), (2,√2),
+//      (3,√3), (4,2):
+//        √m ≈ 0.4434 + 0.6432·m − 0.0943·m² + 0.0077·m³
+//      Max error on [1, 4]: ~0.22% (well under Data_t's 1/256 ≈ 0.4% LSB).
+//      Evaluated via Horner's scheme — 3 multiplies, 3 adds.
+//   3. √x = √m × 2^k.  Single variable shift (barrel) to scale.
+//
+// Latency: ~6-8 cycles (priority encoder + Horner chain + final shift).
+// Throughput: II=1.  No DSP for FP units; ~3 fabric multipliers for the
+// polynomial.
+// ---------------------------------------------------------------------------
+#ifdef POOL_HAVE_APFIXED
+static inline AccData_t poly_sqrt(AccData_t acc) {
+    #pragma HLS INLINE
+    if (acc <= AccData_t(0)) return AccData_t(0);
+
+    // Step 1 — range reduction.  Reinterpret as ap_ufixed<32,16>; raw
+    // 32-bit value satisfies raw = acc × 2^16.
+    ap_ufixed<32, 16> ux = acc;
+    ap_uint<32> raw = ux.range();
+
+    // Priority encoder: find position P of the highest set bit in raw.
+    // "Last write wins" pattern unrolls to a clog2(32)≈5 LUT-level tree.
+    ap_uint<5> P = 0;
+    for (int i = 0; i < 32; i++) {
+        #pragma HLS UNROLL
+        if (raw[i]) P = (ap_uint<5>)i;
+    }
+
+    // 2k = even integer ≤ (P − 16); k = 2k / 2.
+    // Bit-AND with ~1 rounds toward −∞ in two's complement (correct for
+    // both positive and negative values).
+    const int two_k = ((int)P - 16) & ~1;
+    const int k     = two_k >> 1;
+
+    // Shift raw to land m_raw ∈ [2^16, 2^18) — represents m ∈ [1, 4).
+    ap_uint<32> m_raw;
+    if (two_k >= 0) {
+        m_raw = raw >> (unsigned)two_k;
+    } else {
+        m_raw = raw << (unsigned)(-two_k);
+    }
+    ap_ufixed<18, 2> m;
+    m.range() = m_raw.range(17, 0);
+
+    // Step 2 — 3rd-order polynomial via Horner's scheme.
+    // Coefficients in ap_fixed<16,1> (15 fractional bits, range [-1, 1)).
+    // Lagrange-interpolated through (1,1), (2,√2), (3,√3), (4,2).
+    const ap_fixed<16, 1> c0 =  0.4434;
+    const ap_fixed<16, 1> c1 =  0.6432;
+    const ap_fixed<16, 1> c2 = -0.0943;
+    const ap_fixed<16, 1> c3 =  0.0077;
+
+    const ap_fixed<24, 4> t1     = c3 * m + c2;     // [-0.094, -0.063]
+    const ap_fixed<24, 4> t2     = t1 * m + c1;     // [ 0.297,  0.643]
+    const ap_fixed<24, 4> sqrt_m = t2 * m + c0;     // [ 1.000,  2.000]
+
+    // Step 3 — apply 2^k scaling via variable shift (barrel).
+    AccData_t result = sqrt_m;
+    if (k >= 0) {
+        result <<= (unsigned)k;
+    } else {
+        result >>= (unsigned)(-k);
+    }
+    return result;
+}
+#else  // float fallback for non-ap_fixed builds
+static inline AccData_t poly_sqrt(AccData_t acc) {
+    return AccData_t(sqrtf((float)acc));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// inv_denom_lookup — fixed-point reciprocal lookup for AVG-pool finalisation.
+//
+// The previous AVG path was:
+//     const float inv_denom = 1.0f / (float)denom_u;
+//     result = AccData_t((float)acc[c1] * inv_denom);
+// which forced HLS to instantiate an FP divider (28 cyc / ~5 DSP), an FP
+// multiplier (~3 DSP) and two convert units, just to scale the accumulator
+// by 1/N.  This replaces the round-trip with a pure ap_fixed pipeline:
+//
+//   1. A compile-time-constant ROM, indexed by denom_u, returns 1/denom_u
+//      pre-encoded as ap_ufixed<24, 1> raw bits (`raw = round(2^23 / d)`).
+//      23 fractional bits give an LSB of 2^-23 ≈ 1.19e-7 — five+ orders of
+//      magnitude below Data_t's 1/256 LSB — so the LUT's quantisation error
+//      is invisible at the saturated Data_t output.  Encoding as uint32_t
+//      lets the table be `constexpr`-initialised at translation time; HLS
+//      synthesises it as a ROM (≈3 KiB → 1 BRAM18) with no init loop in
+//      hardware.
+//
+//   2. The use site reconstructs an ap_ufixed<24, 1> by raw .range()
+//      assignment — a direct bit copy, no FP→fixed converter.
+//
+//   3. `acc[c1] * inv_denom` is a native ap_fixed multiply: ap_fixed<32,16> ×
+//      ap_ufixed<24,1> → ap_fixed<56,17>, then implicit-cast back to
+//      AccData_t.  One fabric multiplier; no DSP-FPU.  Overflow on the
+//      narrowing cast is impossible in normal use because |acc/d| ≤
+//      max(|acc|/1) which already fits AccData_t — i.e. dividing can only
+//      shrink magnitude.
+//
+// Sizing — kMaxAvgDenom = kMaxLineBufRows * kMaxLineBufCols (1024 with the
+// default config).  The line buffers cap pool window area, so denom_u (which
+// is at most pool_h * pool_w when count_include_pad=1, and the count of
+// in-bounds positions otherwise) cannot exceed this bound.  The clamp on the
+// lookup is defensive — in normal flow `d` is always in [1, kMaxAvgDenom].
+//
+// Numerical stability vs the prior float path — the LUT holds 1/d to 24-bit
+// fixed-point precision (relative error ≤ 2^-24 / (1/d) = d / 2^24, ≈ 6e-5
+// at d=1024).  The float reciprocal had ~24-bit mantissa (similar precision)
+// but the round-trip through float lost ~8 bits of acc precision on the
+// (float)acc cast (24-bit float mantissa < 32-bit AccData_t).  So the new
+// path is strictly more accurate.
+// ---------------------------------------------------------------------------
+#ifdef POOL_HAVE_APFIXED
+typedef ap_ufixed<24, 1> InvDenom_t;
+static constexpr unsigned kMaxAvgDenom = kMaxLineBufRows * kMaxLineBufCols;
+
+namespace {
+
+constexpr uint32_t encode_inv_denom_bits(unsigned d) {
+    // ap_ufixed<24,1> stores value v as floor(v * 2^23).  We want
+    //   raw = round(2^23 / d)
+    // implemented in pure integer arithmetic via the standard "+d/2"
+    // round-to-nearest trick.  d=0 is unreachable in normal flow; the
+    // sentinel raw=0 ensures multiplying by it produces 0 rather than
+    // garbage if a caller ever did pass 0.
+    return (d == 0u)
+        ? 0u
+        : (((1u << 23) + d / 2u) / d);
+}
+
+template <unsigned... Is>
+constexpr std::array<uint32_t, sizeof...(Is)>
+make_inv_denom_lut_helper(std::integer_sequence<unsigned, Is...>) {
+    return std::array<uint32_t, sizeof...(Is)>{ encode_inv_denom_bits(Is)... };
+}
+
+constexpr auto kInvDenomLutBits = make_inv_denom_lut_helper(
+    std::make_integer_sequence<unsigned, kMaxAvgDenom + 1>{});
+
+}  // namespace
+
+static inline InvDenom_t inv_denom_lookup(unsigned d) {
+    #pragma HLS INLINE
+    const unsigned idx = (d <= kMaxAvgDenom) ? d : 0u;
+    InvDenom_t r;
+    r.range() = ap_uint<24>(kInvDenomLutBits[idx]);
+    return r;
+}
+#else  // float fallback — keep prior FP-domain reciprocal/multiply.
+typedef float InvDenom_t;
+static inline InvDenom_t inv_denom_lookup(unsigned d) {
+    return (d > 0u) ? 1.0f / (float)d : 0.0f;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // compute_ow_tile — runtime W-tile width.
@@ -466,8 +637,9 @@ static void window_emitter(
 // processes ow chunks in turn so the producer's line buffer stays bounded.
 //
 // Per (ni, ct, owt, oh, ow):
-//   * Read denom_u from denom_pipe; precompute inv_denom = 1/denom_u
-//     (multiply beats divide).
+//   * Read denom_u from denom_pipe; fetch inv_denom = 1/denom_u from a
+//     constexpr ap_ufixed<24,1> reciprocal LUT (multiply beats divide and
+//     the LUT keeps the path in fixed-point — see inv_denom_lookup).
 //   * Fused drain + reduce: a single II=1 loop reads kTileC*pool_h*pool_w
 //     pixels directly from window_pipe and folds them into the per-lane
 //     accumulators acc[kTileC].  ri counts 0..pool_h*pool_w*kTileC-1 with
@@ -516,9 +688,8 @@ static void process_pool_kernel_tile(
                 for (unsigned oh = 0; oh < out_h; oh++) {
                     for (unsigned ow = ow_lo; ow < ow_hi; ow++) {
 
-                    const unsigned denom_u   = denom_pipe.read();
-                    const float    inv_denom =
-                        (denom_u > 0u) ? 1.0f / (float)denom_u : 0.0f;
+                    const unsigned   denom_u   = denom_pipe.read();
+                    const InvDenom_t inv_denom = inv_denom_lookup(denom_u);
 
                     // ---------------------------------------------------
                     // Initialise accumulators (1 cycle, fully unrolled).
@@ -574,9 +745,10 @@ static void process_pool_kernel_tile(
                     // Finalise and push c_valid lanes to acc_stream.
                     //
                     //   MAX: identity — acc is already the max value.
-                    //   AVG: multiply by precomputed reciprocal denominator.
+                    //   AVG: multiply by precomputed ap_ufixed<24,1>
+                    //        reciprocal of denom_u — fully fixed-point.
                     //   LP p=1: identity — acc is already Σ|x_i|.
-                    //   LP p=2: sqrt(acc) via float (DSP-friendly in HLS).
+                    //   LP p=2: poly_sqrt — fixed-point polynomial sqrt.
                     // ---------------------------------------------------
                     for (unsigned c1 = 0; c1 < c_valid; c1++) {
                         #pragma HLS PIPELINE II=1
@@ -584,11 +756,18 @@ static void process_pool_kernel_tile(
                         if (pool_type == kPoolMax) {
                             result = acc[c1];
                         } else if (pool_type == kPoolAvg) {
-                            result = AccData_t((float)acc[c1] * inv_denom);
+                            // Pure ap_fixed multiply: acc * inv_denom_lut[d].
+                            // Stays in fixed-point end-to-end — no FP unit.
+                            // See inv_denom_lookup above.
+                            result = AccData_t(acc[c1] * inv_denom);
                         } else {
+                            // LP p=1: identity (Σ|x_i|)
+                            // LP p=2: poly_sqrt — 3rd-order polynomial sqrt with
+                            //         range reduction; ~0.22% max error on the
+                            //         normalized mantissa, no FP unit instantiated.
                             result = (lp_order == 1u)
                                 ? acc[c1]
-                                : AccData_t(sqrtf((float)acc[c1]));
+                                : poly_sqrt(acc[c1]);
                         }
                         acc_stream.write(result);
                     }
