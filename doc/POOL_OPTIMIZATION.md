@@ -50,11 +50,24 @@ serialized end-to-end.
 
 **Change.** Split the body into three sub-functions wired by `hls::stream`:
 
-```
-input_window_producer ──window_pipe──► process_pool_kernel_tile ──acc_stream──► write_output_tile
-                      ──denom_pipe ──►            │
-                                                  ▼
-       x (DDR gmem0)                        y (DDR gmem1)
+```mermaid
+flowchart LR
+    DDR_IN[("x<br/>DDR gmem0")]
+    DDR_OUT[("y<br/>DDR gmem1")]
+    P["input_window_producer"]
+    C["process_pool_kernel_tile"]
+    W["write_output_tile"]
+
+    DDR_IN -->|m_axi read| P
+    P -->|window_pipe| C
+    P -->|denom_pipe| C
+    C -->|acc_stream| W
+    W -->|m_axi write| DDR_OUT
+
+    classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
+    classDef stage fill:#e6f7ff,stroke:#1890ff,color:#003a8c
+    class DDR_IN,DDR_OUT ddr
+    class P,C,W stage
 ```
 
 Top-level wraps the three calls in `#pragma HLS DATAFLOW`. STABLE pragmas on
@@ -394,30 +407,26 @@ compounded over the longer consumer reduce" diagnostic.
 
 ## 3. Current architecture (post-2.8)
 
-```
-                  ┌─────────────┐
-   x (gmem0) ───► │ row_loader  │ ─row_data_pipe─┐
-                  └─────────────┘                │
-                                                 ▼
-                                      ┌──────────────────┐
-                                      │ window_emitter   │ ─window_pipe─┐
-                                      │   (line_buf)     │              │
-                                      └──────────────────┘ ─denom_pipe─┐│
-                                                                       │▼
-                                                       ┌────────────────────────┐
-                                                       │ process_pool_kernel_tile│
-                                                       │   (acc[kTileC])        │
-                                                       └────────────────────────┘
-                                                                       │
-                                                                  acc_stream
-                                                                       │
-                                                                       ▼
-                                                       ┌────────────────────────┐
-                                                       │ write_output_tile      │
-                                                       └────────────────────────┘
-                                                                       │
-                                                                       ▼
-                                                              y (gmem1)
+```mermaid
+flowchart LR
+    DDR_IN[("x<br/>gmem0")]
+    DDR_OUT[("y<br/>gmem1")]
+    RL["row_loader<br/><i>DDR reader</i>"]
+    WE["window_emitter<br/><i>owns line_buf</i><br/>kTileC × kMaxLineBufRows × kMaxLineBufCols"]
+    PP["process_pool_kernel_tile<br/><i>owns acc[kTileC]</i><br/>reduce + finalize"]
+    WO["write_output_tile<br/><i>saturate AccData_t → Data_t</i>"]
+
+    DDR_IN -->|m_axi read| RL
+    RL -->|row_data_pipe| WE
+    WE -->|window_pipe<br/>WindowLanes × kTileC| PP
+    WE -->|denom_pipe| PP
+    PP -->|acc_stream| WO
+    WO -->|m_axi write| DDR_OUT
+
+    classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
+    classDef stage fill:#e6f7ff,stroke:#1890ff,color:#003a8c
+    class DDR_IN,DDR_OUT ddr
+    class RL,WE,PP,WO stage
 ```
 
 **Four DATAFLOW stages**, all running concurrently:
