@@ -80,6 +80,176 @@ class TestPoolNodeValidation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# PoolNode hardware-bound validation
+#
+# These bounds come from the C++ CMake config (see _pool_hw_config) and
+# match the kernel's compile-time line_buf / adder-tree sizes.  Each model
+# below violates exactly one bound by exactly one unit; the tests assert
+# that SchedulerError fires AND that the message names the violated
+# constraint so users get an actionable error.  Two boundary-ok models
+# confirm the inequality is `≤` (limit value passes) rather than `<`.
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(_pool_models_exist(),
+                     "Run test/gen_pool_models.py first")
+class TestPoolNodeHardwareBounds(unittest.TestCase):
+    """PoolNode rejects pool windows the kernel cannot service."""
+
+    def test_pool_h_too_large_raises(self):
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_pool_model("pool_unsupported_pool_h.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("pool_h=8", msg)
+        self.assertIn("kMaxPoolH", msg)
+
+    def test_pool_w_too_large_raises(self):
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_pool_model("pool_unsupported_pool_w.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("pool_w=8", msg)
+        self.assertIn("kMaxPoolW", msg)
+
+    def test_dil_h_overflows_line_buf_rows_raises(self):
+        """pool_h=4 dil_h=6 → vertical span 19 > kMaxLineBufRows=16."""
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_pool_model("pool_unsupported_dil_h.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("vertical span", msg)
+        self.assertIn("kMaxLineBufRows", msg)
+        self.assertIn("19", msg)   # the computed span
+
+    def test_dil_w_overflows_line_buf_cols_raises(self):
+        """pool_w=4 dil_w=22 → horizontal span 67 > kMaxLineBufCols=64."""
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_pool_model("pool_unsupported_dil_w.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("horizontal span", msg)
+        self.assertIn("kMaxLineBufCols", msg)
+        self.assertIn("67", msg)
+
+    def test_pool_h_at_limit_parses(self):
+        """pool_h=7 == kMaxPoolH must parse — bound is `≤`, not `<`."""
+        g = OnnxGraph(_pool_model("pool_pool_h_at_limit.onnx"))
+        self.assertIsInstance(g.nodes[0], PoolNode)
+        self.assertEqual(g.nodes[0].pool_h, 7)
+
+    def test_dil_h_span_at_limit_parses(self):
+        """span=16 == kMaxLineBufRows must parse — boundary inclusive."""
+        g = OnnxGraph(_pool_model("pool_dil_h_at_limit.onnx"))
+        self.assertIsInstance(g.nodes[0], PoolNode)
+        sn = g.nodes[0]
+        self.assertEqual((sn.pool_h - 1) * sn.dil_h + 1, 16)
+
+
+class TestPoolHwConfigResolver(unittest.TestCase):
+    """The hardware-bound resolver reads from the platform JSON
+    (platforms/<AXI_PLATFORM>.json), the same source the C++ CMake build
+    consumes via ``pool_load_constants()``.  Tests use the public
+    ``resolve()`` function so failure paths can be probed without
+    reloading the module — that would replace the
+    ``PoolHwConfigError`` class object and break ``assertRaises``."""
+
+    def _platforms_dir(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parent.parent.parent / "platforms")
+
+    def test_constants_match_kv260_json(self):
+        """Resolved values match platforms/kv260.json's kernels.pool —
+        guards against drift between the Python validator and the JSON
+        the C++ build reads."""
+        import json
+
+        from src._pool_hw_config import (
+            POOL_MAX_KH, POOL_MAX_KW,
+            POOL_MAX_LINE_BUF_ROWS, POOL_MAX_LINE_BUF_COLS,
+        )
+        with (self._platforms_dir() / "kv260.json").open() as f:
+            cfg = json.load(f)["kernels"]["pool"]
+        self.assertEqual(POOL_MAX_KH,            cfg["max_kh"])
+        self.assertEqual(POOL_MAX_KW,            cfg["max_kw"])
+        self.assertEqual(POOL_MAX_LINE_BUF_ROWS, cfg["max_line_buf_rows"])
+        self.assertEqual(POOL_MAX_LINE_BUF_COLS, cfg["max_line_buf_cols"])
+
+    def test_resolve_alternate_platform_picks_up_overrides(self):
+        """``resolve('<name>')`` reads ``platforms/<name>.json`` — same
+        mechanism the CMake build uses when ``-DAXI_PLATFORM=<name>``
+        is passed."""
+        import json
+        from src._pool_hw_config import resolve
+
+        alt = self._platforms_dir() / "_test_override.json"
+        alt.write_text(json.dumps({
+            "description": "test-only override",
+            "part": "x", "clock": 100,
+            "kernels": {"pool": {
+                "tile_c": 8,
+                "max_kh": 5,                      # <-- the override
+                "max_kw": 7,
+                "max_line_buf_rows": 16,
+                "max_line_buf_cols": 64,
+                "ow_parallel": 2,
+            }},
+        }))
+        try:
+            cfg = resolve("_test_override")
+            self.assertEqual(cfg["POOL_MAX_KH"], 5)
+            self.assertEqual(cfg["POOL_MAX_KW"], 7)
+        finally:
+            alt.unlink(missing_ok=True)
+
+    def test_missing_platform_file_raises(self):
+        """``resolve()`` with an unknown platform name must error loudly
+        rather than silently fall back to defaults."""
+        from src._pool_hw_config import PoolHwConfigError, resolve
+
+        with self.assertRaises(PoolHwConfigError) as cm:
+            resolve("_does_not_exist_xyzzy")
+        self.assertIn("not found", str(cm.exception))
+
+    def test_missing_kernels_pool_section_raises(self):
+        """A platform JSON with no ``kernels.pool`` object must error —
+        no silent default fallback."""
+        import json
+        from src._pool_hw_config import PoolHwConfigError, resolve
+
+        bad = self._platforms_dir() / "_test_no_pool_section.json"
+        bad.write_text(json.dumps({"description": "no kernels section",
+                                   "part": "x", "clock": 100}))
+        try:
+            with self.assertRaises(PoolHwConfigError) as cm:
+                resolve("_test_no_pool_section")
+            self.assertIn("kernels.pool", str(cm.exception))
+        finally:
+            bad.unlink(missing_ok=True)
+
+    def test_missing_required_field_raises(self):
+        """A platform JSON missing one of the mandatory ``kernels.pool``
+        fields (e.g. max_kh) must error and name the missing field."""
+        import json
+        from src._pool_hw_config import PoolHwConfigError, resolve
+
+        bad = self._platforms_dir() / "_test_missing_field.json"
+        bad.write_text(json.dumps({
+            "description": "missing max_kh",
+            "part": "x", "clock": 100,
+            "kernels": {"pool": {
+                "tile_c": 8,
+                # max_kh deliberately absent
+                "max_kw": 7,
+                "max_line_buf_rows": 16,
+                "max_line_buf_cols": 64,
+                "ow_parallel": 2,
+            }},
+        }))
+        try:
+            with self.assertRaises(PoolHwConfigError) as cm:
+                resolve("_test_missing_field")
+            self.assertIn("max_kh", str(cm.exception))
+        finally:
+            bad.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # PoolNode geometry fields
 # ---------------------------------------------------------------------------
 
