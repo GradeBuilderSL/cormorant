@@ -565,25 +565,91 @@ ram_t2p`) to satisfy kOwParallel reads/cycle.
 
 ---
 
-## 4. Knobs (Config.h.in / CMakeLists.txt)
+## 4. Knobs
 
-| Constant | Default | Hard constraint | Notes |
-|---|---:|---|---|
-| `kTileC` | 8 | power of 2 | Channel tile width; II=1 lane rotation depth |
-| `kMaxPoolH` | 7 | pool_h ≤ this | Compile-time pool window height limit |
-| `kMaxPoolW` | 7 | pool_w ≤ this | Compile-time pool window width limit |
-| `kMaxLineBufRows` | 16 | power of 2; `(pool_h-1)*dil_h + 1` ≤ this | Line-buffer row capacity |
-| `kMaxLineBufCols` | 64 | `(pool_w-1)*dil_w + 1` ≤ this | Line-buffer column capacity; W-tiling kicks in for `in_w > this` |
-| `kOwParallel` | 2 | power of 2; line_buf must support kOwParallel reads/cycle | Output-position unroll factor (§2.9). At 2 the kernel relies on `BIND_STORAGE ram_t2p` true-dual-port BRAM banking on `line_buf`. Higher values require manual bank replication or column-cyclic partitioning. |
+### 4.1. Single source of truth: `platforms/<name>.json`
 
-**Test predictor adapts** when these change — the `expected_dup_reads_for(tc)`
-helper in `TestPoolingSim.cpp` mirrors the kernel's load schedule using the
-same constants, so per-test `dup_reads=X/Y` always reports cache-aware
-expectations.
+All compile-time bounds live in the platform JSON under
+`kernels.pool` — same file the C++ build and the Python validator both
+read.  Default platform is `kv260`; pick another with
+`-DAXI_PLATFORM=<name>` (CMake) or `AXI_PLATFORM=<name>` (Python env).
 
-Verified at three cache extremes:
+```jsonc
+// platforms/kv260.json
+{
+  "description": "Xilinx KV260 Starter Kit",
+  "part":  "xck26-sfvc784-2LV-c",
+  "board": "xilinx.com:kv260_som:part0:1.4",
+  "clock": 300,
+  "kernels": {
+    "pool": {
+      "tile_c":            8,
+      "max_kh":            7,
+      "max_kw":            7,
+      "max_line_buf_rows": 16,
+      "max_line_buf_cols": 64,
+      "ow_parallel":       2
+    }
+  }
+}
+```
 
-| `kMaxLineBufCols` | Wide-W tests | Narrow tests |
+| JSON field | C++ name (Config.h) | Python name | Default | Hard constraint | Notes |
+|---|---|---|---:|---|---|
+| `tile_c` | `kTileC` | (not validated) | 8 | power of 2 | Channel tile width; II=1 lane rotation depth.  Any model channels count works (channel-tiled). |
+| `max_kh` | `kMaxPoolH` | `POOL_MAX_KH` | 7 | `pool_h ≤ this` | Compile-time pool window height limit. |
+| `max_kw` | `kMaxPoolW` | `POOL_MAX_KW` | 7 | `pool_w ≤ this` | Compile-time pool window width limit. |
+| `max_line_buf_rows` | `kMaxLineBufRows` | `POOL_MAX_LINE_BUF_ROWS` | 16 | power of 2; `(pool_h-1)*dil_h + 1 ≤ this` | Line-buffer row capacity. |
+| `max_line_buf_cols` | `kMaxLineBufCols` | `POOL_MAX_LINE_BUF_COLS` | 64 | `(pool_w-1)*dil_w + 1 ≤ this` | Line-buffer column capacity; W-tiling kicks in for `in_w > this`. |
+| `ow_parallel` | `kOwParallel` | (not validated) | 2 | power of 2; line_buf must support kOwParallel reads/cycle | Output-position unroll factor (§2.9). At 2 the kernel relies on `BIND_STORAGE ram_t2p` true-dual-port BRAM banking on `line_buf`. Higher values require manual bank replication or column-cyclic partitioning.  Any out_w works (residual-lane padding). |
+
+`tile_c` and `ow_parallel` are read by the C++ build but **not** validated
+by the Python scheduler — both have unconditional run-time fallbacks
+(channel tiling for any C; residual-lane padding for any out_w), so
+models cannot violate them.  The other four fields gate model
+acceptance: `PoolNode.from_onnx_node` raises `SchedulerError` naming the
+violated bound.
+
+### 4.2. How CMake reads the JSON
+
+`kernels/pool/CMakeLists.txt::pool_load_constants(platform_json prefix)`
+calls `string(JSON … GET … kernels pool <field>)` for each required
+key, sets `${prefix}_<UPPER_FIELD>` in the parent scope, and errors
+out (`FATAL_ERROR`) on any missing field.  The default-platform
+constants drive `Config.h` for the C-sim build; the per-platform
+synthesis loop calls the function again per platform JSON so each
+synthesised IP gets its own bounds.
+
+`set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS …)`
+lists every platform JSON, so editing one auto-triggers a reconfigure
+on the next `make` — no manual `cmake` rerun needed.
+
+### 4.3. How the Python scheduler reads the JSON
+
+`inference-scheduler/src/_pool_hw_config.py::resolve(platform_name)`:
+
+- `platform_name=None` (the default) → uses `AXI_PLATFORM` env var,
+  falling back to `kv260`.
+- Reads `platforms/<name>.json`; raises `PoolHwConfigError` on missing
+  file, missing `kernels.pool` object, missing required field, or wrong
+  field type.
+- No silent defaults — every error names the JSON path and the
+  problematic key.
+
+`nodes.py` imports the resolved values; `PoolNode.from_onnx_node`
+checks each constraint and raises `SchedulerError` with a message
+that quotes both the model's value and the platform's bound, plus the
+specific JSON field to bump.
+
+### 4.4. Test predictor and cache-extreme verification
+
+The `expected_dup_reads_for(tc)` helper in `TestPoolingSim.cpp` mirrors
+the kernel's load schedule using the same constants, so per-test
+`dup_reads=X/Y` always reports cache-aware expectations.  Verified at
+three cache extremes by setting `max_line_buf_cols` in the JSON and
+rebuilding:
+
+| `max_line_buf_cols` | Wide-W tests | Narrow tests |
 |---:|---|---|
 | 8 | dup_reads = 168/240 (W-tiling, multi-tile narrow) | 64/64 |
 | 64 (default) | dup_reads = 16/32 | 0/0 |
@@ -688,8 +754,12 @@ kOwParallel (Global pool variants and `MaxPool 1x1 pool_full 5x5`,
 | File | What changed |
 |---|---|
 | `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9) |
-| `kernels/pool/include/Config.h.in` | Added `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` |
-| `kernels/pool/CMakeLists.txt` | Added `POOL_MAX_LINE_BUF_ROWS`, `POOL_MAX_LINE_BUF_COLS`, `POOL_OW_PARALLEL` cache vars |
+| `kernels/pool/include/Config.h.in` | Templates `kTileC`, `kMaxPoolH`, `kMaxPoolW`, `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` from CMake-side variables (sourced from the platform JSON, §4) |
+| `kernels/pool/CMakeLists.txt` | `pool_load_constants(platform_json prefix)` reads `kernels.pool.*` from `platforms/<AXI_PLATFORM>.json` via `string(JSON …)`; default-platform values drive C-sim Config.h, per-platform values drive per-platform synthesis Config.h's; `CMAKE_CONFIGURE_DEPENDS` on every platform JSON so edits auto-trigger reconfigure on next `make` |
+| `platforms/<name>.json` | Single source of truth for kernel-side bounds — `kernels.pool` object holds all six values (§4.1).  The C++ build and the Python validator both read from here. |
+| `CMakeLists.txt` (top-level) | `AXI_PLATFORM` cache var (default `kv260`) selects which platform JSON drives C-sim builds; `AXI_DEFAULT_PLATFORM_JSON` is the resolved path |
+| `inference-scheduler/src/_pool_hw_config.py` | `resolve(platform_name=None)` reads `platforms/<AXI_PLATFORM>.json` (env override → `kv260` default); raises `PoolHwConfigError` on missing file / missing section / missing field / wrong type — no silent fallbacks |
+| `inference-scheduler/src/nodes.py` | `PoolNode.from_onnx_node` validates `pool_h ≤ kMaxPoolH`, `pool_w ≤ kMaxPoolW`, dilated vertical span ≤ `kMaxLineBufRows`, dilated horizontal span ≤ `kMaxLineBufCols` against values resolved from the platform JSON; raises `SchedulerError` with an actionable message naming the bound and the JSON field to bump |
 | `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added; `quantize_trn` + `ref_poly_sqrt` mirror kernel's fixed-point sqrt bit-exactly; `ref_avg_pool_fixed` mirrors `inv_denom_lookup` bit-exactly; `ref_pool_elem`'s AVG branch routed through it; new `run_avg_pool_strict_test` (2 strict-equality subtests for AVG path) |
 | `inference-scheduler/src/codegen/_simulate.py` | `_quantize_trn` + `_pool_poly_sqrt` so generated `expected/*.dat` fixtures match the kernel's RTL output for LP-Pool p=2; `_pool2d_ref` AVG branch updated to use the same encoded reciprocal as the kernel so AVG cells match byte-for-byte under `test_inference.c`'s strict equality check |
 | `hw/test_data/pool_test_data/` | 31-test fixtures regenerated for kv260 RTL sim; AVG cases (`test_{09,10,26,29}_y.hex`) refreshed for §2.8 reciprocal change (4 files, 306 cells changed total, all by exactly 1 LSB) |

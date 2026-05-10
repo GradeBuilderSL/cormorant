@@ -147,6 +147,28 @@ configurable kernel/stride/pad/dilation. `groups=1` only.
 `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`. Full 2-D NCHW geometry
 including dilation and `count_include_pad`.
 
+`PoolNode.from_onnx_node` validates the model against the kernel's
+compile-time bounds (`pool_h ≤ kMaxPoolH`, `pool_w ≤ kMaxPoolW`,
+`(pool_h - 1) * dil_h + 1 ≤ kMaxLineBufRows`,
+`(pool_w - 1) * dil_w + 1 ≤ kMaxLineBufCols`) and raises `SchedulerError`
+naming the violated bound + the JSON field to bump.  The bounds come
+from the **same platform JSON the C++ build reads**
+(`platforms/<AXI_PLATFORM>.json`, `kernels.pool` object — see
+`doc/POOL_OPTIMIZATION.md` §4 for the field reference).
+`src/_pool_hw_config.py::resolve(platform_name)` is the resolver:
+
+- `platform_name=None` (default) reads `AXI_PLATFORM` env var (defaults
+  to `kv260`).  Mirrors the CMake cache var of the same name so CLI
+  invocations targeting a non-default board can stay in sync with
+  `cmake -DAXI_PLATFORM=<name>`.
+- Raises `PoolHwConfigError` on missing file, missing `kernels.pool`
+  object, missing required field, or wrong field type — no silent
+  fallback to defaults.
+
+`tile_c` and `ow_parallel` are not validated: any C runs (channel
+tiling) and any out_w runs (residual-lane padding) inside the kernel,
+so models cannot violate them.
+
 **ReshapeNode** — zero-cost buffer alias: `Reshape`. `emit_call()` returns `""`.
 Output pointer is assigned `= source` in `inference_init()`; NULLed without free
 in `inference_deinit()`. Requires equal `numel` between source and output.
