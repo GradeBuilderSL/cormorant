@@ -28,12 +28,13 @@ after running the full TestPoolingSim case list.
 | + Vector window_pipe (kTileC lanes/cycle) | 31 | 3,527,035 | -31.9% | — |
 | + Producer split (Phase1/Phase2 dataflow) + unrolled valid_count | 31 | 3,416,225 | -3.1% | -51.4% |
 | + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
-| **+ Fixed-point AVG reciprocal (drop FP div+mul on AVG path)** | **31** | **2,214,605** | **-22.5%** | **-68.5%** |
+| + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
+| **+ kOwParallel=2 reduce (process 2 adjacent ow's per cycle)** | **31** | **1,679,945** | **-24.1%** | **-76.1%** |
 
-**Net result on the 31-test suite: ~3.17× faster than the post-baseline
-(line-buffer-only) implementation; ~68.5% reduction in total HW sim time.**
+**Net result on the 31-test suite: ~4.18× faster than the post-baseline
+(line-buffer-only) implementation; ~76% reduction in total HW sim time.**
 
-For the 25 tests common to every stage the same kernel runs **~5.4× faster**
+For the 25 tests common to every stage the same kernel runs **~7.1× faster**
 than the pre-optimization baseline (line-buffer-only equivalent on the same
 test list).
 
@@ -403,9 +404,96 @@ The wide-W cases — which spend the most cycles in the consumer reduce —
 again show the largest savings, mirroring 2.7's "FP unit's dataflow tax
 compounded over the longer consumer reduce" diagnostic.
 
+### 2.9. kOwParallel reduce — process kOwParallel adjacent ow's per cycle
+
+**Problem.** After §2.8 the consumer reduce ran at one MultiWindow per cycle
+(II=1 across all pool types — see §2.5/§2.8 convergence) for a single ow
+position, so the per-output-position cost was `pool_h × pool_w` cycles.
+On overlap-heavy 3x3 tests and on long-row wide-W tests the consumer was
+the dominant fraction of the total wall-clock, with no further headroom
+left on the per-position scalar reduce.
+
+**Change.** Duplicated the reduce hardware to process kOwParallel adjacent
+ow positions in lockstep:
+
+1. **`MultiWindow` and `MultiDenom` structs** wrap kOwParallel × kTileC
+   pixels and kOwParallel denom values per FIFO transaction.  Default
+   kOwParallel = 2.
+2. **`window_emitter` Phase 2** iterates ow as groups of kOwParallel,
+   gathering line_buf reads from kOwParallel adjacent positions per
+   (khi, kwi) and emitting one `MultiWindow` per cycle.  Per-position
+   denom counts are bundled into one `MultiDenom` write per group.
+3. **`process_pool_kernel_tile`** holds `acc[kOwParallel][kTileC]`
+   (both dims partitioned `complete dim=0`) and updates ALL kOwParallel ×
+   kTileC accumulators in parallel each reduce cycle, fully unrolled.
+   The reduce trip count drops to `pool_h × pool_w` per kOwParallel
+   outputs — a linear-in-kOwParallel speedup.
+4. **`write_output_tile`** drains kOwParallel × c_valid AccData_t per
+   group; conditional `if (ow < ow_hi)` gates the m_axi store so the
+   read off acc_stream stays unconditional and II=1 holds.
+5. **`line_buf` annotated `BIND_STORAGE type=ram_t2p`** so each per-
+   channel partitioned bank is a true-dual-port BRAM; that's what gives
+   the producer kOwParallel reads per cycle on the same channel without
+   structural read-port contention.
+
+**Residual / edge-case handling.**  When `(ow_hi - ow_lo)` is not a
+multiple of kOwParallel (most commonly when out_w=1, e.g. global pool
+outputs), the producer pads the trailing lanes with the pool-type identity
+value; the writer's `ow < ow_hi` mask drops those padded results before
+DDR.  The padded cycles still flow through the pipeline so the per-group
+cost is exactly `pool_h × pool_w` cycles regardless of group fullness.
+
+**Numerical correctness.**  Per-position math is unchanged — the change
+is purely structural (parallel lanes of identical computation), so the
+ap_fixed accumulators produce bit-identical results vs the §2.8 single-
+position reduce.  C-sim 33/33 PASS, the auto-regenerated y.hex fixtures
+under `--dump-data` show **zero diffs** vs the §2.8 goldens, and the HDL
+behavior test 31/31 PASS without any fixture refresh.
+
+**Result.** **-24.1% sim_time_ns** (2,214,605 → 1,679,945 ns total).
+
+The savings are concentrated exactly where predicted — long consumer
+reduces have the most cycles to halve:
+
+| Test category | Δ% | Δabs (ns) |
+|---|---:|---:|
+| Wide-W AvgPool 3x3 batch=2 | **-45.2%** | -164,880 |
+| Wide-W MaxPool 3x3 batch=2 | **-44.5%** | -109,790 |
+| Wide-W AvgPool 3x3 single | **-44.0%** |  -82,270 |
+| Wide-W MaxPool 3x3 single | **-42.8%** |  -54,740 |
+| Wide-W MaxPool 2x2 stride2 batch=2 | -29.5% |  -45,300 |
+| Wide-W MaxPool 2x2 stride2 single | -25.7% |  -20,950 |
+| 3x3 stride1 pad1 (Max / Avg×2 / Lp×2) | **-24.7% to -25.0%** (uniform) | -10.6k ea |
+| Dilation=2 pool 2x2 | -5.1% | -1,570 |
+| 2x2 stride2 narrow | -1 to -2% | ≤ -500 |
+| Multi-channel-tile (C_16 / C_32) | ~0% | ≤ +50 |
+| out_w=1 (Global pool / 1×1 output) | +0.5 to +1.0% | +50 to +170 |
+
+**Why ~45% on wide-W tests vs the 50% theoretical max for kOwParallel=2.**
+The wide-W tests have out_w = 96 or 128 — both even multiples of
+kOwParallel — so all groups are fully populated; the reduce truly halves
+its trip count.  The remaining 5% gap vs the 50% theoretical comes from
+the residual non-reduce cost (Phase 1 row loads, finalize, output drain)
+that doesn't speed up.  The 3x3 stride1 pad1 narrow tests (out_w=8) get
+~25% because their reduce is a smaller fraction of the test time —
+producer Phase 1 dominates more.
+
+**Why out_w=1 cases get slightly slower (+0.5 to +1.0%).**
+With kOwParallel=2 every group is two-wide; when the actual ow span is
+1 the second lane is padded and its results are discarded.  The pipeline
+cost is essentially unchanged but the writer's masked-write loop runs
+2× as many drain cycles for the same output count, adding ~50-170 ns
+overhead per test.  Negligible vs the wide-W wins.
+
+**Why no change on multi-channel-tile cases (C_16 / C_32).**
+These tests are dominated by Phase 1 DDR row loads and the c_tiles outer
+sweep; the consumer reduce was already overlapped with the next channel
+tile's Phase 1, so halving consumer cycles doesn't reduce the wall-clock
+critical path.  Same diagnosis as §2.6's "Multi-channel-tile" row.
+
 ---
 
-## 3. Current architecture (post-2.8)
+## 3. Current architecture (post-2.9)
 
 ```mermaid
 flowchart LR
@@ -418,9 +506,9 @@ flowchart LR
 
     DDR_IN -->|m_axi read| RL
     RL -->|row_data_pipe| WE
-    WE -->|window_pipe<br/>WindowLanes × kTileC| PP
-    WE -->|denom_pipe| PP
-    PP -->|acc_stream| WO
+    WE -->|window_pipe<br/>MultiWindow<br/>= kOwParallel × kTileC pixels| PP
+    WE -->|denom_pipe<br/>MultiDenom × kOwParallel| PP
+    PP -->|acc_stream<br/>kOwParallel × c_valid<br/>AccData_t per group| WO
     WO -->|m_axi write| DDR_OUT
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
@@ -433,35 +521,47 @@ flowchart LR
 
 1. **`row_loader`** — DDR reader; iterates `(ni, ct, owt, oh, ih, c_l, iw)`.
 2. **`window_emitter`** — owns `line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols]`
-   (partitioned `complete dim=1`, ~16 KB). Emits one WindowLanes vector
-   per `(khi, kwi)`; emits one denom per `(oh, ow)` via parallel adder tree.
-3. **`process_pool_kernel_tile`** — owns `acc[kTileC]`. Vectorized II=1
-   reduce on the WindowLanes stream; finalizes (AVG: multiply by
-   `inv_denom_lookup(denom_u)` — fixed-point ROM reciprocal, see
-   §2.8.  LP-2: `poly_sqrt`, see §2.7) and pushes c_valid AccData_t
-   to acc_stream.
-4. **`write_output_tile`** — saturates AccData_t → Data_t and writes to y.
+   (partitioned `complete dim=1`, `BIND_STORAGE ram_t2p`, ~16 KB).  For
+   each ow-group (size kOwParallel) emits one MultiWindow per (khi, kwi)
+   gathering kOwParallel × kTileC pixels in parallel from the dual-port
+   per-channel banks; emits one MultiDenom (kOwParallel valid_counts) per
+   group via a fully-unrolled adder tree.
+3. **`process_pool_kernel_tile`** — owns `acc[kOwParallel][kTileC]`
+   (both dims partitioned `complete dim=0`). Vectorized II=1 reduce on
+   the MultiWindow stream — every cycle updates ALL kOwParallel × kTileC
+   accumulators in parallel.  Finalizes per lane (AVG: multiply by
+   `inv_denom_lookup(denom)` — fixed-point ROM reciprocal, see §2.8;
+   LP-2: `poly_sqrt`, see §2.7) and pushes kOwParallel × c_valid AccData_t
+   to acc_stream in (p, c1) order.
+4. **`write_output_tile`** — saturates AccData_t → Data_t and writes to
+   y, with a conditional `ow < ow_hi` gate that drops the producer's
+   identity-padded residual lanes (kept off DDR but still drained in
+   pipeline).
 
-**Loop nest** (all stages in lockstep): `(ni, ct, owt, oh, ow)`. The W-tile
-dimension `owt` is collapsed to a single iteration when `in_w ≤ kMaxLineBufCols`.
+**Loop nest** (all stages in lockstep): `(ni, ct, owt, oh, ow_group)`.
+Each ow_group covers kOwParallel adjacent ow positions; the W-tile
+dimension `owt` is collapsed to a single iteration when
+`in_w ≤ kMaxLineBufCols`.
 
 **Cycle counts per output position** at the consumer's reduce loop
-(post-§2.8 — the FP-unit removal lets HLS hold all four paths near the
-MAX baseline):
+(post-§2.9 — kOwParallel-wide reduce, §2.8 FP-unit removal):
 
-| Pool type | II | Cycles per output |
+| Pool type | II | Cycles per **kOwParallel** outputs |
 |---|---:|---:|
 | MaxPool | 1 | `pool_h × pool_w` |
 | AveragePool | 1 (post-§2.8 — was 2–3 with FP div+mul) | `pool_h × pool_w` |
 | LpPool p=1 | 1 | `pool_h × pool_w` |
 | LpPool p=2 | 1–2 (poly_sqrt finalize once per output) | `pool_h × pool_w` |
 
-The five Max/Avg/Lp variants of 3x3 stride1 pad1 finishing within 240 ns
-of each other on the kv260 sim is the empirical confirmation — see §2.8
-result table.
+Per-position cost is therefore `pool_h × pool_w / kOwParallel` cycles —
+e.g. 4.5 cycles on a 3x3 pool at kOwParallel=2.  The wide-W cases approach
+the 50% theoretical max (-44 to -45% wall-clock); narrow tests get less
+because their reduce was a smaller fraction of the total to begin with.
 
-The producer is matched at `pool_h × pool_w` cycles per output for
+The producer is matched at `pool_h × pool_w` cycles per ow-group for
 `emit_phase 2`, with Phase 1 row loads overlapped via the dataflow split.
+Each per-channel `line_buf` bank uses both BRAM ports (`BIND_STORAGE
+ram_t2p`) to satisfy kOwParallel reads/cycle.
 
 ---
 
@@ -474,6 +574,7 @@ The producer is matched at `pool_h × pool_w` cycles per output for
 | `kMaxPoolW` | 7 | pool_w ≤ this | Compile-time pool window width limit |
 | `kMaxLineBufRows` | 16 | power of 2; `(pool_h-1)*dil_h + 1` ≤ this | Line-buffer row capacity |
 | `kMaxLineBufCols` | 64 | `(pool_w-1)*dil_w + 1` ≤ this | Line-buffer column capacity; W-tiling kicks in for `in_w > this` |
+| `kOwParallel` | 2 | power of 2; line_buf must support kOwParallel reads/cycle | Output-position unroll factor (§2.9). At 2 the kernel relies on `BIND_STORAGE ram_t2p` true-dual-port BRAM banking on `line_buf`. Higher values require manual bank replication or column-cyclic partitioning. |
 
 **Test predictor adapts** when these change — the `expected_dup_reads_for(tc)`
 helper in `TestPoolingSim.cpp` mirrors the kernel's load schedule using the
@@ -498,52 +599,56 @@ from the start; wide-W tests added later.
 
 | Test | Baseline (ns) | Final (ns) | Speedup |
 |---|---:|---:|---:|
-| MaxPool 3x3 stride1 pad1 | 236,600 | 43,080 | **5.49×** |
-| AvgPool 3x3 stride1 pad1 (no incl pad) | 236,610 | 43,060 | **5.49×** |
-| LpPool p=2 3x3 pad1 | 236,350 | 42,840 | **5.52×** |
-| MaxPool C=32 2x2 stride2 | 165,150 | 161,520 | 1.02× |
-| MaxPool dilation=2 pool2x2 | 72,270 | 30,590 | **2.36×** |
-| GlobalMaxPool batch=2 C=12 6x6 | 76,680 | 53,000 | 1.45× |
-| MaxPool wide W=128 3x3 stride1 pad1 | (n/a) | 127,790 | — |
-| AvgPool wide W=96 3x3 stride1 pad1 batch=2 | (n/a) | 364,750 | — |
-| MaxPool wide W=128 3x3 stride1 pad1 batch=2 | (n/a) | 246,640 | — |
+| MaxPool 3x3 stride1 pad1 | 236,600 | 32,420 | **7.30×** |
+| AvgPool 3x3 stride1 pad1 (no incl pad) | 236,610 | 32,410 | **7.30×** |
+| LpPool p=2 3x3 pad1 | 236,350 | 32,170 | **7.35×** |
+| MaxPool C=32 2x2 stride2 | 165,150 | 161,560 | 1.02× |
+| MaxPool dilation=2 pool2x2 | 72,270 | 29,020 | **2.49×** |
+| GlobalMaxPool batch=2 C=12 6x6 | 76,680 | 53,050 | 1.45× |
+| MaxPool wide W=128 3x3 stride1 pad1 | (n/a) | 73,050 | — |
+| AvgPool wide W=96 3x3 stride1 pad1 batch=2 | (n/a) | 199,870 | — |
+| MaxPool wide W=128 3x3 stride1 pad1 batch=2 | (n/a) | 136,850 | — |
 
 **The 3x3 overlap cases benefited the most** — the line buffer eliminated
-duplicate DDR reads, consumer fusion + vectorization halved then quartered
-the inner reduce, `poly_sqrt` recovered ~19% by removing the implicit
-FP-sqrt budget tax, and the fixed-point AVG reciprocal recovered another
-~26% by retiring FP div+mul from the consumer's pipeline budget — leaving
-all five Max/Avg/Lp variants of the 3x3 pad1 group within 240 ns of each
-other, the consumer's reduce loop now running at the same rate
-independent of pool type.
+duplicate DDR reads (§2.2), consumer fusion + vectorization halved then
+quartered the inner reduce (§2.4 + §2.5), `poly_sqrt` recovered ~19% by
+removing the implicit FP-sqrt budget tax (§2.7), the fixed-point AVG
+reciprocal recovered another ~26% by retiring FP div+mul from the
+consumer's pipeline budget (§2.8), and the kOwParallel=2 reduce trimmed
+~25% more by halving the consumer's per-position cost (§2.9).  All five
+Max/Avg/Lp variants of the 3x3 pad1 group now finish at ~32k ns —
+**>7× faster** than the pre-optimization baseline.
 
 **Multi-channel-tile and non-overlap tests** (C_32, 2x2 stride2 family)
-benefited mainly from the producer split — Phase 1 was their dominant cost.
+benefited mainly from the producer split — Phase 1 was their dominant
+cost; later optimizations (FP-unit removals, kOwParallel) only nibble at
+the residual consumer fraction.
 
-**Wide-W tests** got the biggest absolute savings from both FP-unit
-removals (poly_sqrt + fixed-point AVG reciprocal), each compounded over
-the longer consumer reduce — the AVG-reciprocal step alone trimmed
-33–34% off these cases.
+**Wide-W tests** got the biggest absolute savings from every consumer-side
+optimization — they spend the most cycles in the reduce, so each
+compounded with the prior gains.  §2.9's kOwParallel alone trimmed ~42–45%
+off these cases (the closest any single change has come to its
+theoretical 50% max — every group is fully populated for out_w = 96/128).
 
 ---
 
 ## 6. Where the floor is now
 
-After §2.8 the consumer's reduce loop runs at the same rate across all pool
-types on overlap-heavy 3x3 tests — the five Max/Avg/Lp variants of 3x3
-stride1 pad1 land within 240 ns of each other (42,780–43,080 ns), so the
-old AVG/LP II=2–3 penalty (ap_fixed<32,16> add/MAC latency, see §2.5) no
-longer dominates the wall-clock total.  The remaining bottleneck is the
-fundamental `pool_h × pool_w` cycles per output position the consumer
-reads from `window_pipe`, matched by the producer's emit rate.
+After §2.9 the consumer's reduce loop runs at `pool_h × pool_w` cycles
+per **kOwParallel = 2** outputs, with all four pool types pipelined at
+II=1 — the five Max/Avg/Lp variants of 3x3 stride1 pad1 land within 250 ns
+of each other (32,080–32,420 ns).  The remaining bottleneck on consumer-
+bound tests is the producer's MultiWindow emit rate (also `pool_h × pool_w`
+cycles per ow-group, exactly matched), and on multi-channel-tile tests it
+is Phase 1 DDR row loading (untouched since §2.6).
 
 To go further requires more invasive changes:
 
 | Option | Mechanism | Estimated win |
 |---|---|---|
-| AVG/LP II=1 via shadow accumulators | Round-robin `acc_0[c1], acc_1[c1]` ping-pong, sum at finalize | ~2× on AVG/LP only |
-| Wider window vectors | Emit 2×2 or full-window worth per cycle | 2–4× on consumer |
-| Multiple parallel output positions | Duplicate reduce hardware, process adjacent ow's | Linear in unroll factor |
+| kOwParallel = 4 | Replicate `line_buf` banks (or column-cyclic partition) so the producer can read 4 columns/cycle/channel; widen MultiWindow to 4 lanes; quad-up acc[][] grid | Up to 2× on tests already saturating consumer at kOwParallel=2 (wide-W) |
+| Wider window vectors (kwi-fanout) | Emit `pool_w` pixels per cycle along kwi axis; reduce trip drops to `pool_h` cycles per ow-group | 2–4× on consumer (orthogonal to kOwParallel) |
+| Phase 1 DDR burst | Coalesce row_loader's `(c_l, iw)` reads into m_axi bursts | Up to 2× on multi-channel-tile (C_16/C_32) and 2x2 stride2 narrow |
 
 These are deferred until profiling shows pool on a critical path of a real
 inference workload.
@@ -568,15 +673,23 @@ that pin the AVG path's bit-accurate match to `ref_avg_pool_fixed`.  The
 strict cases are sensitive to a regression to the float reciprocal —
 ~3% of cells in their input set diverge between the two paths.
 
+§2.9's restructure is purely a cycle-level shape change — every
+per-position computation is identical to §2.8, so the y.hex fixtures
+under `hw/test_data/pool_test_data/` were verified bit-identical after
+the kernel change (zero regen needed).  The kOwParallel residual padding
+path is exercised by every test with `out_w` not divisible by
+kOwParallel (Global pool variants and `MaxPool 1x1 pool_full 5x5`,
+`AvgPool corner_padding 3x3 pad1 on 2x2`).
+
 ---
 
 ## 8. Related files
 
 | File | What changed |
 |---|---|
-| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8) |
-| `kernels/pool/include/Config.h.in` | Added `kMaxLineBufRows`, `kMaxLineBufCols` |
-| `kernels/pool/CMakeLists.txt` | Added `POOL_MAX_LINE_BUF_ROWS`, `POOL_MAX_LINE_BUF_COLS` cache vars |
+| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9) |
+| `kernels/pool/include/Config.h.in` | Added `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` |
+| `kernels/pool/CMakeLists.txt` | Added `POOL_MAX_LINE_BUF_ROWS`, `POOL_MAX_LINE_BUF_COLS`, `POOL_OW_PARALLEL` cache vars |
 | `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added; `quantize_trn` + `ref_poly_sqrt` mirror kernel's fixed-point sqrt bit-exactly; `ref_avg_pool_fixed` mirrors `inv_denom_lookup` bit-exactly; `ref_pool_elem`'s AVG branch routed through it; new `run_avg_pool_strict_test` (2 strict-equality subtests for AVG path) |
 | `inference-scheduler/src/codegen/_simulate.py` | `_quantize_trn` + `_pool_poly_sqrt` so generated `expected/*.dat` fixtures match the kernel's RTL output for LP-Pool p=2; `_pool2d_ref` AVG branch updated to use the same encoded reciprocal as the kernel so AVG cells match byte-for-byte under `test_inference.c`'s strict equality check |
 | `hw/test_data/pool_test_data/` | 31-test fixtures regenerated for kv260 RTL sim; AVG cases (`test_{09,10,26,29}_y.hex`) refreshed for §2.8 reciprocal change (4 files, 306 cells changed total, all by exactly 1 LSB) |

@@ -64,6 +64,9 @@ set(POOL_MAX_LINE_BUF_ROWS  16  CACHE STRING
 set(POOL_MAX_LINE_BUF_COLS  64  CACHE STRING
     "Line-buffer column capacity; W-tile chunk size is bounded by this. \
 in_w > MAX_LINE_BUF_COLS triggers W-tiling with boundary re-reads.")
+set(POOL_OW_PARALLEL  2  CACHE STRING
+    "Output-position unroll factor for the consumer reduce (must be power of 2). \
+At 2 the kernel relies on true-dual-port BRAM banking on line_buf; raise with care.")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -179,7 +182,8 @@ message(STATUS "PoolingKernel: Data_t=${POOL_DATA_TYPE}  "
                "TILE_C=${POOL_TILE_C}  "
                "MAX_KH=${POOL_MAX_KH}  MAX_KW=${POOL_MAX_KW}  "
                "MAX_LINE_BUF_ROWS=${POOL_MAX_LINE_BUF_ROWS}  "
-               "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS}")
+               "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS}  "
+               "OW_PARALLEL=${POOL_OW_PARALLEL}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
