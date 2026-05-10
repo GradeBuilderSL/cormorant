@@ -546,13 +546,34 @@ static void window_emitter(
 
     // line_buf:  kTileC * kMaxLineBufRows * kMaxLineBufCols * sizeof(Data_t)
     //         =      8  *       16        *       64        *      2     =  16 KB
-    // ARRAY_PARTITION dim=1 complete → kTileC independent BRAMs of
-    // [kMaxLineBufRows][kMaxLineBufCols], one per channel lane.
-    // BIND_STORAGE ram_t2p → each per-channel bank is a true-dual-port BRAM
-    // so the §2.9 emit path can read kOwParallel different columns per
-    // cycle for the same channel without a structural read-port hazard.
+    //
+    // Partitioning has two axes (both required for kOwParallel reads/cycle):
+    //
+    //   * ARRAY_PARTITION dim=1 complete → kTileC independent BRAMs of
+    //     [kMaxLineBufRows][kMaxLineBufCols], one per channel lane.  Lets
+    //     the consumer's reduce update kTileC accumulators in parallel.
+    //
+    //   * ARRAY_PARTITION dim=3 cyclic factor=kOwParallel → each per-
+    //     channel bank is column-cyclic-split into kOwParallel sub-banks,
+    //     so kOwParallel adjacent ow positions land in different banks.
+    //     Required at kOwParallel ≥ 4: ram_t2p alone (2 ports) cannot
+    //     service 4 column reads from a single bank when stride_w=1.
+    //
+    //   * BIND_STORAGE type=ram_t2p → each sub-bank is a true-dual-port
+    //     BRAM, so when stride_w=2 makes kOwParallel cols collide on
+    //     fewer cyclic banks (gcd(stride_w, factor) > 1), the dual ports
+    //     still deliver 2 reads per bank — together cyclic+ram_t2p
+    //     handles every stride_w with gcd(stride_w, kOwParallel) ≤ 2.
+    //     For stride_w=1: kOwParallel cols → kOwParallel distinct banks,
+    //     1 port each.  For stride_w=2 at kOwParallel=4: 4 cols → 2
+    //     banks × 2 ports = 4 reads.
+    //
+    // Resource cost at kOwParallel=4: kTileC × kOwParallel = 32 sub-
+    // banks, each [kMaxLineBufRows][kMaxLineBufCols / kOwParallel] = 16×16
+    // × 16 b ≈ 4 Kb → fits in 1 BRAM18 (or LUT-RAM) per sub-bank.
     static Data_t line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=line_buf cyclic factor=kOwParallel dim=3
     #pragma HLS BIND_STORAGE variable=line_buf type=ram_t2p
 
     const Data_t pad_val = (pool_type == kPoolMax)
