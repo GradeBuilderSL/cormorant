@@ -23,9 +23,10 @@ final architecture.
 All numbers are total `sim_time_ns` reported by the kv260 behavior testbench
 after running the full TestConvRef case list.
 
-> Baseline for this run (current branch, 30 RTL tests): **5,204,375 ns**
-> (sum of per-test `duration_ns` = 5,202,175 ns).  Captured by
-> `conv-verify` Gate 4 on `<DATE>` — see `build/kernels/conv/kv260/conv_timing_last.json`.
+> Baseline for this run (current branch `conv_optimisation_3`, 30 RTL tests):
+> **sim_time_ns = 5,204,375 ns** (sum of per-test `duration_ns` =
+> 5,202,175 ns).  Captured by `conv-verify` Gate 4 on **2026-05-12** — see
+> `build/kernels/conv/kv260/conv_timing_last.json`.
 
 | Stage | Tests | sim_time_ns | Δ vs prior | Δ vs base |
 |---|---:|---:|---:|---:|
@@ -36,6 +37,7 @@ after running the full TestConvRef case list.
 | + Depthwise / standard producer split | TODO | TODO | TODO | TODO |
 | + Broadcast patches (`broadcast_patches` stage) | TODO | TODO | TODO | TODO |
 | + Bias producer fused with replay (`bias_producer`) | TODO | TODO | TODO | TODO |
+| **Current state (post-§2.6, baseline captured 2026-05-12)** | **30** | **5,204,375** | — | TODO |
 | **+ Double buffering (planned — see [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md))** | TODO | TODO | TODO | TODO |
 
 **Net result on the <N>-test suite: TODO× faster than the baseline; TODO%
@@ -236,23 +238,62 @@ if not, mark as a deferred TODO.
 
 ## 5. Per-test progression highlights
 
-Selected representative tests, baseline → current on the kv260 RTL sim.
-Captured from `build/kernels/conv/kv260/conv_timing_last.json` (current
-run = 30 tests, totalling 5,202,175 ns).
+All 30 tests from the current `conv_optimisation_3` baseline captured
+2026-05-12, sorted by `duration_ns` descending.  Source:
+`build/kernels/conv/kv260/conv_timing_last.json` (total per-test sum =
+5,202,175 ns; `sim_time_ns` = 5,204,375 ns).  Baseline column (pre-
+optimisation reference) and per-test speedups are TODO — to be backfilled
+from the early `conv_optimisation_1` tag once the timings are re-run.
 
 | Test | Baseline (ns) | Current (ns) | Speedup |
 |---|---:|---:|---:|
 | `batch_3__C_TILE_IC_M_TILE_M_stride_2__ResNet-style_` | TODO | 1,391,110 | TODO |
-| `1x1__IC_TILE_IC_2_M_TILE_M_2__exact_tiles_` | TODO | 784,660 | TODO |
+| `1x1__IC_TILE_IC_2_M_TILE_M_2_bias__exact_tiles_` | TODO | 784,660 | TODO |
 | `partial_IC_tile__in_ch_TILE_IC_5_` | TODO | 506,930 | TODO |
 | `partial_M_tile__out_ch_TILE_M_3_` | TODO | 277,350 | TODO |
-| `DW_ch_TILE_M_2__exact_tile__bias` | TODO | 220,570 | TODO |
+| `DW_ch_TILE_M_2__exact_tile___bias` | TODO | 220,570 | TODO |
 | `DW_partial_M_tile__ch_TILE_M_3_` | TODO | 198,560 | TODO |
 | `DW_batch_2__4ch__pad_1` | TODO | 183,400 | TODO |
+| `DW_3x3__4ch__pad_1__has_bias` | TODO | 163,770 | TODO |
+| `batch_2__3x3__pad_1` | TODO | 152,900 | TODO |
+| `DW_5x5_kernel__4ch_____5x5_out` | TODO | 139,510 | TODO |
+| `DW_asymmetric_stride_h_2_w_1__8ch_____4x8_out` | TODO | 109,200 | TODO |
+| `DW_3x3__4ch__no_pad__no_bias` | TODO | 96,210 | TODO |
+| `1x5_horizontal_filter__pad_left_pad_right_2` | TODO | 90,370 | TODO |
 | `3x3__pad_1__has_bias__2_out_ch` | TODO | 83,580 | TODO |
+| `3x3_dilation_2_____5x5_out` | TODO | 82,310 | TODO |
+| `3x3__pad_1__same______5x5_out` | TODO | 81,230 | TODO |
+| `3x3__asymmetric_dilation_h_1_w_2_____5x5_out` | TODO | 81,180 | TODO |
+| `non-square__6x8_input__3x5_kernel` | TODO | 78,650 | TODO |
+| `DW_stride_2__8ch__pad_1` | TODO | 77,810 | TODO |
+| `DW_3x3_dilation_2__4ch` | TODO | 74,890 | TODO |
+| `5x5_kernel_____3x3_out` | TODO | 69,110 | TODO |
+| `1x1_kernel__1ch__no_bias` | TODO | 46,615 | TODO |
+| `3x3_input_3x3_kernel_____1x1_out__C_TILE_IC_M_TILE_M` | TODO | 35,840 | TODO |
+| `3x3__no_pad__no_bias_____3x3_out` | TODO | 34,000 | TODO |
+| `7x7__stride_2__asymmetric_pad__1_1_0_0_` | TODO | 33,500 | TODO |
+| `3x3__asymmetric_stride_h_2_w_1_____2x4_out` | TODO | 31,450 | TODO |
+| `saturation__positive_overflow_____AP_MAX` | TODO | 21,280 | TODO |
+| `saturation__negative_overflow_____AP_MIN` | TODO | 21,240 | TODO |
+| `3x3__stride_2_____2x2_out` | TODO | 19,360 | TODO |
+| `DW_saturation__positive_overflow_____AP_MAX` | TODO | 15,590 | TODO |
+| **TOTAL** | **TODO** | **5,202,175** | **TODO** |
 
-TODO: narrative — which optimisation moved which test the most, where
-the floor is for each.
+Observations on the current snapshot (pre-Step 1 of any new
+optimisation):
+
+- The single heaviest test (`batch_3 ResNet-style`, 1.39 ms) is **27 %**
+  of total sim time.
+- The top two tests together (`batch_3 ResNet-style` + `1x1 bias exact
+  tiles`, 2.18 ms) account for **42 %** — both are weight-reload-bound
+  (see §6 / the proposed Step 1 hoist).
+- The 11 depthwise tests collectively account for 1.50 ms (**29 %**).
+- The 4 saturation / corner tests collectively account for 77.5 µs
+  (**1.5 %**).
+
+TODO: backfill the Baseline column once a `conv_optimisation_1`-tag
+re-run is captured, then narrate which optimisation moved which test
+the most.
 
 ---
 
