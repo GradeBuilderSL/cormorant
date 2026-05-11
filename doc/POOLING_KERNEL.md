@@ -57,6 +57,8 @@ Global variants (`GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`) are handl
 | `kTileC` | 8 | Channel tile width; must be a power of 2 |
 | `kMaxPoolH` | 7 | Maximum compile-time pool window height |
 | `kMaxPoolW` | 7 | Maximum compile-time pool window width |
+| `kMaxLineBufRows` | 16 | Line-buffer row capacity; power of 2; bounds `(pool_h-1)*dil_h + 1` |
+| `kMaxLineBufCols` | 64 | Line-buffer column capacity; W-tiling activates when `in_w` exceeds it |
 | `kDataMin` | -128.0f | Sentinel for MaxPool identity (ap_fixed\<16,8\> minimum) |
 | `kAccMin` | -32768.0f | Sentinel in accumulator range |
 
@@ -64,24 +66,65 @@ Global variants (`GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`) are handl
 
 ## 4. Loop Structure and HLS Pragmas
 
-The kernel body is a five-level nested loop:
+> **The kernel was significantly restructured after the initial implementation.**
+> See [POOL_OPTIMIZATION.md](POOL_OPTIMIZATION.md) for the full optimization log
+> with timing data; the section below describes the *current* architecture.
+
+The kernel runs four concurrent stages inside a top-level `#pragma HLS DATAFLOW`
+region:
 
 ```
-for ni in [0, batch)                    // batch dimension
-  for oh in [0, out_h)                  // output row
-    for ow in [0, out_w)                // output column
-      // precompute: valid_count (non-padded pixels), inv_denom (1/denom)
-      for ct in [0, ceil(channels/kTileC))  // channel tile
-        // 1. LOAD: fill win_buf[kTileC][kMaxPoolH][kMaxPoolW] from x[]
-        //    Pad pixels → identity fill; inner loop PIPELINE II=1
-        // 2. INIT: reset acc[kTileC] to identity; UNROLL (registers)
-        // 3. REDUCE: flat loop ri ∈ [0, pool_h*pool_w*kTileC); PIPELINE II=1
-        //    lane  = ri & (kTileC-1)          // bitwise AND, no divide
-        //    acc[lane] OP= win_buf[lane][khi][kwi]
-        //    advance khi/kwi every kTileC iterations
-        // 4. FINALIZE + WRITE: emit c_valid results; PIPELINE II=1
-        //    apply post-reduction op; saturate_cast; write y[]
+                  ┌─────────────┐
+   x (gmem0) ───► │ row_loader  │ ─row_data_pipe─┐
+                  └─────────────┘                │
+                                                 ▼
+                                      ┌──────────────────┐
+                                      │ window_emitter   │ ─window_pipe─┐ (vector kTileC lanes)
+                                      │   (line_buf)     │              │
+                                      └──────────────────┘ ─denom_pipe─┐│
+                                                                       │▼
+                                                       ┌────────────────────────┐
+                                                       │ process_pool_kernel_tile│
+                                                       │   (acc[kTileC])        │
+                                                       └────────────────────────┘
+                                                                       │
+                                                                  acc_stream
+                                                                       ▼
+                                                       ┌────────────────────────┐
+                                                       │ write_output_tile      │
+                                                       └─────────┬──────────────┘
+                                                                 ▼
+                                                          y (gmem1)
 ```
+
+Loop nest (all stages in lockstep): `(ni, ct, owt, oh, ow)` where `owt`
+is a runtime W-tile dimension (collapsed to a single iteration when
+`in_w ≤ kMaxLineBufCols`).
+
+```
+for ni in [0, batch):                          // batch dimension
+  for ct in [0, ceil(channels/kTileC)):        // channel tile (outer of oh)
+    for owt in [0, ow_tiles_w):                // W-tile (relaxes in_w cap)
+      for oh in [0, out_h):                    // output row
+        // row_loader   : load any new x[] rows for this (oh, ct, owt) into row_data_pipe
+        // window_emitter: drain row_data_pipe → line_buf
+        for ow in [ow_lo, ow_hi):              // output column within W-tile
+          // window_emitter: emit denom (parallel adder tree),
+          //                 emit pool_h*pool_w WindowLanes vectors
+          // process_pool_kernel_tile: fused II=1 vectorised reduce on kTileC lanes
+          // write_output_tile: drain c_valid AccData_t lanes to y[]
+```
+
+**Key invariants:**
+
+- Each `x[]` cell read from DDR exactly once per `(ni, c)` when
+  `in_w ≤ kMaxLineBufCols`. Wider inputs trigger W-tiling with bounded
+  boundary-column re-reads (see [POOL_OPTIMIZATION.md §2.3](POOL_OPTIMIZATION.md)).
+- `window_pipe` is a vector stream — one `WindowLanes` (kTileC packed
+  `Data_t`) per `(khi, kwi)`, so the consumer's reduce loop runs in
+  `pool_h × pool_w` cycles instead of `pool_h × pool_w × kTileC`.
+- Phase 1 (DDR row loads) overlaps Phase 2 (window emit) via the
+  `row_loader`/`window_emitter` split.
 
 **HLS pragmas applied:**
 
@@ -89,13 +132,22 @@ for ni in [0, batch)                    // batch dimension
 |--------|----------|--------|
 | `INTERFACE m_axi ... bundle=gmem0/1` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
-| `ARRAY_PARTITION variable=win_buf complete dim=1` | `win_buf[kTileC][…][…]` | kTileC independent BRAM banks → parallel access per lane |
-| `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileC]` | All accumulators in registers |
-| `PIPELINE II=1` | load, reduce, write loops | One output per clock |
+| `STABLE variable=...` | every read-only input | Suppresses synthetic DATAFLOW sync stages |
+| `DATAFLOW` | top-level | Concurrent execution of the four stages |
+| `STREAM variable=... depth=...` | each `hls::stream` | Sizes the inferred FIFO |
+| `ARRAY_PARTITION variable=line_buf complete dim=1` | `window_emitter` | kTileC independent BRAM banks → vector emit |
+| `ARRAY_PARTITION variable=acc complete dim=0` | `process_pool_kernel_tile` | kTileC parallel update lanes |
+| `PIPELINE II=1` | row load, drain, vector emit, vector reduce, write | One element per clock |
+| `UNROLL` | per-lane `c_l` / `c1` inner loops, valid_count adder tree | Spatial parallelism |
 
-**II=1 achievability in the reduce loop:**
+**II of the vector reduce loop:**
 
-`acc[lane]` at step `ri` is next accessed at step `ri + kTileC`. Because `kTileC ≥` the operation latency of ap_fixed arithmetic (≈1–3 cycles), the dependency distance is always satisfied and II=1 is met without unrolling.
+| Pool type | II achieved | Reason |
+|-----------|---:|---|
+| MaxPool | 1 | Single-cycle compare |
+| AveragePool | 2–3 | ap_fixed<32,16> add latency; 1-cycle RAW distance |
+| LpPool p=1 | 1–2 | Conditional negate + add |
+| LpPool p=2 | 2–3 | mul + add (DSP MAC) |
 
 ---
 
@@ -107,14 +159,20 @@ for ni in [0, batch)                    // batch dimension
 
 ## 6. Test Coverage (`TestPoolingSim.cpp`)
 
-21 test cases compiled and run with GCC (no Vitis required). Tolerance: `kTol = 0.02f`.
+31 test cases compiled and run with GCC (no Vitis required). Tolerance: `kTol = 0.02f`.
 
 | Category | Cases |
 |----------|-------|
-| MaxPool | 2×2 s2, 3×3 s1 pad1, rect 6×10, batch=3, C=16, dilation=2, Global |
+| MaxPool | 2×2 s2, 3×3 s1 pad1, rect 6×10, batch=3, C=16, C=32, dilation=2, Global |
 | AveragePool | no-pad, pad1 ±count_include_pad, C=12, rect, Global, batch=2 C=16 |
 | LpPool | p=1 and p=2, 2×2, 3×3 pad1, GlobalLpPool (p=1 and p=2) |
 | Edge cases | 1×1 output, all-padded corner (3×3 pad1 on 2×2 input) |
+| Wide-W (in_w > kMaxLineBufCols) | MaxPool W=128 3×3 pad1, AvgPool W=96 3×3 pad1, MaxPool W=128 2×2 s2 — and batch=2 variants of each |
+
+The dup-read predictor `expected_dup_reads_for(tc)` simulates the kernel's
+exact line-buffer + W-tile load schedule, so `dup_reads=actual/predicted`
+always shows cache-aware expectations and adapts when `kMaxLineBufCols`,
+`kTileC`, or geometry change.
 
 ---
 

@@ -207,6 +207,121 @@ ALL_GENERATORS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Hardware-bound violation models — must each raise SchedulerError when
+# loaded by OnnxGraph.  The bounds come from kernels/pool/CMakeLists.txt
+# (defaults: kMaxPoolH/W=7, kMaxLineBufRows=16, kMaxLineBufCols=64).
+#
+# Each model violates exactly one bound by exactly one unit so the test
+# can identify which constraint fired.  Geometries are otherwise minimal
+# to keep ONNX shape-inference fast and the model files tiny.
+# ---------------------------------------------------------------------------
+
+def gen_unsupported_pool_h_too_large() -> None:
+    """pool_h = 8 violates kMaxPoolH=7 (window taller than the adder tree)."""
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[8, 3], strides=[1, 1],
+    )
+    graph = helper.make_graph(
+        [node], "pool_unsupported_pool_h",
+        inputs=[_vi("X", [1, 4, 12, 8])],
+        outputs=[_vi("Y", [1, 4, 5, 6])],   # out_h = 12-8+1 = 5
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_unsupported_pool_h.onnx")
+
+
+def gen_unsupported_pool_w_too_large() -> None:
+    """pool_w = 8 violates kMaxPoolW=7."""
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[3, 8], strides=[1, 1],
+    )
+    graph = helper.make_graph(
+        [node], "pool_unsupported_pool_w",
+        inputs=[_vi("X", [1, 4, 8, 12])],
+        outputs=[_vi("Y", [1, 4, 6, 5])],
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_unsupported_pool_w.onnx")
+
+
+def gen_unsupported_dil_h_overflows_line_buf() -> None:
+    """pool_h=4 with dil_h=6 → vertical span = 3*6 + 1 = 19 > kMaxLineBufRows=16.
+
+    Uses pool_h within the kMaxPoolH=7 limit so the violation isolates the
+    line-buffer-row constraint, not the pool-height constraint.
+    """
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[4, 3], strides=[1, 1], dilations=[6, 1],
+    )
+    graph = helper.make_graph(
+        [node], "pool_unsupported_dil_h",
+        inputs=[_vi("X", [1, 4, 24, 8])],
+        outputs=[_vi("Y", [1, 4, 6, 6])],   # out_h = 24 - 19 + 1 = 6
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_unsupported_dil_h.onnx")
+
+
+def gen_unsupported_dil_w_overflows_line_buf() -> None:
+    """pool_w=4 with dil_w=22 → horizontal span = 3*22 + 1 = 67 > kMaxLineBufCols=64."""
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[3, 4], strides=[1, 1], dilations=[1, 22],
+    )
+    graph = helper.make_graph(
+        [node], "pool_unsupported_dil_w",
+        inputs=[_vi("X", [1, 4, 8, 80])],
+        outputs=[_vi("Y", [1, 4, 6, 14])],   # out_w = 80 - 67 + 1 = 14
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_unsupported_dil_w.onnx")
+
+
+def gen_pool_h_at_limit() -> None:
+    """Boundary-case: pool_h=7 exactly equals kMaxPoolH; must parse OK."""
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[7, 3], strides=[1, 1],
+    )
+    graph = helper.make_graph(
+        [node], "pool_pool_h_at_limit",
+        inputs=[_vi("X", [1, 4, 12, 8])],
+        outputs=[_vi("Y", [1, 4, 6, 6])],
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_pool_h_at_limit.onnx")
+
+
+def gen_dil_h_at_line_buf_limit() -> None:
+    """Boundary-case: pool_h=4 dil_h=5 → span=16 = kMaxLineBufRows; must parse OK."""
+    node = helper.make_node(
+        "MaxPool", inputs=["X"], outputs=["Y"],
+        kernel_shape=[4, 3], strides=[1, 1], dilations=[5, 1],
+    )
+    graph = helper.make_graph(
+        [node], "pool_dil_h_at_limit",
+        inputs=[_vi("X", [1, 4, 20, 8])],
+        outputs=[_vi("Y", [1, 4, 5, 6])],   # out_h = 20 - 16 + 1 = 5
+    )
+    _save(helper.make_model(graph, opset_imports=_opset()),
+          "pool_dil_h_at_limit.onnx")
+
+
+_UNSUPPORTED_POOL_GENERATORS = [
+    gen_unsupported_pool_h_too_large,
+    gen_unsupported_pool_w_too_large,
+    gen_unsupported_dil_h_overflows_line_buf,
+    gen_unsupported_dil_w_overflows_line_buf,
+    gen_pool_h_at_limit,
+    gen_dil_h_at_line_buf_limit,
+]
+ALL_GENERATORS += _UNSUPPORTED_POOL_GENERATORS
+
+
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"Generating pool test models in {OUT_DIR}/")

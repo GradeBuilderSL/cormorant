@@ -36,6 +36,52 @@ static constexpr unsigned kTileC    = @POOL_TILE_C@;
 static constexpr unsigned kMaxPoolH = @POOL_MAX_KH@;
 static constexpr unsigned kMaxPoolW = @POOL_MAX_KW@;
 
+// ---------------------------------------------------------------------------
+// kOwParallel — output-position unroll factor.
+//
+// The consumer's reduce loop processes kOwParallel adjacent ow positions in
+// lockstep: kOwParallel independent acc[][kTileC] lanes accumulate in
+// parallel, fed by a MultiWindow stream that bundles kOwParallel × kTileC
+// pixels per (khi, kwi) cycle.  Reduce cycle count drops from
+// `pool_h × pool_w` per output to `pool_h × pool_w` per kOwParallel outputs
+// — a linear speedup on consumer-bound tests up to the line-buffer's
+// read-port budget.
+//
+// Hardware constraint — line_buf must service kOwParallel reads per channel
+// per cycle.  At kOwParallel=2 this maps to true-dual-port BRAM (BIND_STORAGE
+// ram_t2p on the partitioned banks); higher values require manual bank
+// replication.  Must be a power of 2 (so ow-group rounding compiles to a
+// bitwise AND).
+//
+// Edge-case handling — when (ow_hi - ow_lo) is not a multiple of
+// kOwParallel, the producer emits identity-padded lanes for the residual
+// positions; the writer skips writes for ow ≥ ow_hi so the padded results
+// never reach DDR.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kOwParallel = @POOL_OW_PARALLEL@;
+
+// ---------------------------------------------------------------------------
+// Line-buffer dimensions — used by input_window_producer to cache input rows
+// across the oh sweep within a single channel tile.
+//
+// kMaxLineBufRows  Power-of-2 upper bound on the vertical span of a pool
+//                  window: (pool_h - 1) * dil_h + 1.  The producer hashes
+//                  the input row index modulo kMaxLineBufRows to pick a
+//                  slot, so this MUST be a power of two.  Models violating
+//                  the bound are rejected by the inference scheduler.
+//
+// kMaxLineBufCols  Line buffer's innermost column dimension — caps the
+//                  width of one W-tile.  When in_w <= kMaxLineBufCols the
+//                  whole row fits in cache and there are no duplicate DDR
+//                  reads.  When in_w > kMaxLineBufCols the producer
+//                  splits out_w into multiple W-tiles; boundary input
+//                  columns are re-read once per tile transition.  Only
+//                  hard constraint: (pool_w-1)*dil_w + 1 <= kMaxLineBufCols
+//                  (a single pool window must fit horizontally).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxLineBufRows = @POOL_MAX_LINE_BUF_ROWS@;
+static constexpr unsigned kMaxLineBufCols = @POOL_MAX_LINE_BUF_COLS@;
+
 // Pool type codes (match pool_type AXI-Lite register value).
 static constexpr unsigned kPoolMax = 0u;
 static constexpr unsigned kPoolAvg = 1u;

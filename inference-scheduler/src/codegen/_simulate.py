@@ -171,6 +171,58 @@ def _depthwise_conv2d_ref(
         y += bias.reshape(1, C, 1, 1)
 
     return y
+def _quantize_trn(v: np.ndarray | float, frac_bits: int) -> np.ndarray | float:
+    """AP_TRN-style truncation: floor toward -∞ at the given fractional bit
+    width.  Mirrors HLS ap_fixed<W, I, AP_TRN> narrowing semantics."""
+    scale = float(1 << frac_bits) if frac_bits >= 0 else 1.0 / (1 << -frac_bits)
+    return np.floor(v * scale) / scale
+
+
+def _pool_poly_sqrt(acc: np.ndarray) -> np.ndarray:
+    """Bit-accurate float64 mirror of PoolingKernel.cpp's poly_sqrt().
+
+    The hardware kernel replaces sqrtf() with a fully fixed-point 3rd-order
+    polynomial approximation under range reduction (x = m × 4^k, m ∈ [1, 4)).
+    This helper applies the IDENTICAL coefficients, range reduction, AND
+    intermediate ap_fixed truncations so the generated expected-output
+    fixtures match the kernel's RTL output without any 1-LSB drift.
+    """
+    out = np.zeros_like(acc, dtype=np.float64)
+    pos = acc > 0.0
+    if not np.any(pos):
+        return out
+    a = acc[pos]
+
+    # Range-reduce: m = a / 4^k, m ∈ [1, 4).  np.frexp returns m, e where
+    # a = m * 2^e with m ∈ [0.5, 1).  Convert to a = m' * 4^k:
+    m, e = np.frexp(a)
+    k = np.floor_divide(e, 2)
+    m = m * np.exp2(e - 2 * k)
+    bump = m < 1.0
+    m = np.where(bump, m * 4.0, m)
+    k = np.where(bump, k - 1, k)
+
+    # Mirror the kernel's ap_ufixed<18,2> on m (16 frac bits).
+    m = _quantize_trn(m, 16)
+
+    # Coefficients in ap_fixed<16,1> (15 frac bits).
+    c0 = _quantize_trn( 0.4434, 15)
+    c1 = _quantize_trn( 0.6432, 15)
+    c2 = _quantize_trn(-0.0943, 15)
+    c3 = _quantize_trn( 0.0077, 15)
+
+    # Horner's scheme — each intermediate truncated to ap_fixed<24,4>
+    # (20 frac bits) to mirror the kernel exactly.
+    t1     = _quantize_trn(c3 * m + c2, 20)
+    t2     = _quantize_trn(t1 * m + c1, 20)
+    sqrt_m = _quantize_trn(t2 * m + c0, 20)
+
+    # Apply 2^k scaling, then quantize to AccData_t = ap_fixed<32,16>
+    # (16 frac bits).
+    out[pos] = _quantize_trn(np.ldexp(sqrt_m, k), 16)
+    return out
+
+
 def _pool2d_ref(
     x: np.ndarray,       # float64, shape [N, C, H, W]
     pool_h: int,
@@ -187,7 +239,13 @@ def _pool2d_ref(
     lp_order: int,
     count_include_pad: int,
 ) -> np.ndarray:
-    """Reference 2-D pooling in float64 matching PoolingKernel's NCHW output."""
+    """Reference 2-D pooling in float64 matching PoolingKernel's NCHW output.
+
+    LP-Pool p=2 finalize uses _pool_poly_sqrt (mirrors the kernel's
+    polynomial sqrt approximation) so generated expected-output fixtures
+    line up with the kernel's actual output rather than with an idealised
+    np.sqrt that the hardware no longer computes.
+    """
     N, C, H, W = x.shape
     y = np.zeros((N, C, out_h, out_w), dtype=np.float64)
 
@@ -226,9 +284,27 @@ def _pool2d_ref(
             if pool_type == POOL_MAX:
                 y[:, :, oh, ow] = acc
             elif pool_type == POOL_AVG:
-                y[:, :, oh, ow] = acc / denom
+                # Mirror PoolingKernel.cpp's fixed-point AVG-pool divide:
+                # the kernel substitutes `acc / d` with `acc *
+                # inv_denom_lut[d]` where the LUT entry is
+                #   raw = round(2^23 / d)  (computed via the +d/2 integer
+                #                           round-to-nearest trick)
+                #   inv_denom_q = raw / 2^23   as ap_ufixed<24,1>.
+                # That introduces a ≤ 1-LSB-of-Data_t deviation from a true
+                # float divide on ~2.5% of inputs.  test_inference.c
+                # compares output bytes for strict equality against the
+                # expected fixtures generated here, so we must replicate
+                # the exact kernel arithmetic — otherwise legitimate
+                # kernel output bytes would be flagged as mismatches.
+                # See PoolingKernel.cpp::inv_denom_lookup.
+                raw = ((1 << 23) + denom // 2) // denom
+                inv_denom_q = raw / float(1 << 23)
+                y[:, :, oh, ow] = acc * inv_denom_q
             else:
-                y[:, :, oh, ow] = acc if lp_order == 1 else np.sqrt(np.maximum(acc, 0.0))
+                y[:, :, oh, ow] = (
+                    acc if lp_order == 1
+                    else _pool_poly_sqrt(np.maximum(acc, 0.0))
+                )
 
     return y
 

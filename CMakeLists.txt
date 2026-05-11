@@ -34,6 +34,22 @@ if(NOT AXI_PLATFORM_FILES)
     message(WARNING "axi_kernels: no platform JSON files found in platforms/")
 endif()
 
+# Default platform — drives the C-simulation builds (and the kernel
+# constants embedded in their Config.h).  HLS synthesis targets are still
+# generated per platform from AXI_PLATFORM_FILES; the default is just the
+# one whose bounds the C-sim libraries (and the Python validator in
+# inference-scheduler) target.  Override with -DAXI_PLATFORM=<name> at
+# configure time when a project builds for a non-default board.
+set(AXI_PLATFORM "kv260" CACHE STRING
+    "Default platform whose platforms/<name>.json drives C-sim builds")
+set(AXI_DEFAULT_PLATFORM_JSON
+    "${CMAKE_CURRENT_SOURCE_DIR}/platforms/${AXI_PLATFORM}.json")
+if(NOT EXISTS "${AXI_DEFAULT_PLATFORM_JSON}")
+    message(FATAL_ERROR
+        "axi_kernels: AXI_PLATFORM='${AXI_PLATFORM}' but "
+        "${AXI_DEFAULT_PLATFORM_JSON} does not exist.")
+endif()
+
 # Enable CTest at the top level so `ctest` from the build root discovers tests
 # registered by every kernel subdirectory.
 enable_testing()
