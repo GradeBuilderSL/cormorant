@@ -176,6 +176,33 @@ struct MultiDenom {
 };
 
 // ---------------------------------------------------------------------------
+// PackedWord — kOwParallel * sizeof(Data_t) * 8 bits, the natural width of
+// one packed AXI beat carrying kOwParallel adjacent output lanes.  Used
+// inside burst_writer's fast path to write directly through a reinterpret-
+// cast pointer, bypassing HLS's automatic-widening analysis (which refuses
+// to widen when iteration counts are runtime-variable — see UG1399
+// "Port Width": *"If the size and number of iterations are variable at
+// compile time, then the tool will not automatically widen port widths…
+// you can manually change the port width by using … Arbitrary Precision
+// (AP) Data Types as the data type of the port."*).
+// ---------------------------------------------------------------------------
+typedef ap_uint<kOwParallel * sizeof(Data_t) * 8> PackedWord;
+
+// ---------------------------------------------------------------------------
+// PackedOut — kOwParallel saturated Data_t outputs carried through
+// packed_stream per (c1) cycle, spanning kOwParallel adjacent ow positions.
+//
+// Width = kOwParallel * sizeof(Data_t) bits (= 32 b at kOwParallel=2,
+// ap_fixed<16,8>).  Aligned to AXI_BUS_WIDTH so the writer's stride-1
+// kOwParallel-element store collapses to a single m_axi beat with full
+// WSTRB — vs the pre-§2.11 writer which emitted one 16-bit element per
+// 32-bit beat at half-WSTRB.
+// ---------------------------------------------------------------------------
+struct PackedOut {
+    Data_t lanes[kOwParallel];
+};
+
+// ---------------------------------------------------------------------------
 // poly_sqrt — fixed-point sqrt approximation for LP-Pool p=2 finalize.
 //
 // Replaces sqrtf((float)acc) → AccData_t round-trip with a fully fixed-point
@@ -907,26 +934,26 @@ static void process_pool_kernel_tile(
 }
 
 // ---------------------------------------------------------------------------
-// write_output_tile — DATAFLOW sink (post-§2.9 — kOwParallel groups).
+// reorder_acc — DATAFLOW stage (§2.11 — writer split, part 1).
 //
 // Drains acc_stream in the consumer's emit order — (ni, ct, owt, oh,
-// ow_group, p, c1) where p ∈ [0, kOwParallel), c1 ∈ [0, c_valid).  Each
-// ow-group covers kOwParallel adjacent ow positions.  Output addresses are
-// non-contiguous in C (stride = out_h * out_w per channel); y_addr is
-// advanced by a counter to avoid a multiplier inside the pipeline.
+// ow_group, p, c1) where p ∈ [0, kOwParallel), c1 ∈ [0, c_valid) — into a
+// small per-group transpose buffer.  For each group, emits c_valid
+// PackedOut entries on packed_stream in (c1 outer, p packed) order so the
+// downstream burst_writer sees kOwParallel adjacent ow positions per cycle
+// at stride 1 in DDR.
 //
-// Residual handling — when (ow_hi - ow_lo) is not a multiple of kOwParallel,
-// the last group has padded lanes (ow ≥ ow_hi).  Their values flow through
-// acc_stream in the same shape as in-range positions but we MUST NOT write
-// them to DDR — masking the write with `ow < ow_hi` keeps the read off
-// acc_stream un-conditional (so II=1 holds) while the conditional write
-// merely gates the m_axi store.
+// Per-group buffer = kOwParallel * kTileC Data_t = 32 B at default
+// kOwParallel=2 — fits in registers (ARRAY_PARTITION complete).
 //
-// Saturates AccData_t → Data_t at the boundary.
+// Saturates AccData_t → Data_t here so packed_stream carries the smaller
+// Data_t width (= kOwParallel * 16 b vs kOwParallel * 32 b for AccData_t).
+// Splitting the saturate-cast off the m_axi store path also shortens the
+// burst_writer's combinational cone.
 // ---------------------------------------------------------------------------
-static void write_output_tile(
-    Data_t*                 y,
+static void reorder_acc(
     hls::stream<AccData_t>& acc_stream,
+    hls::stream<PackedOut>& packed_stream,
     unsigned                batch,
     unsigned                channels,
     unsigned                out_h,
@@ -934,7 +961,6 @@ static void write_output_tile(
     unsigned                ow_tile
 ) {
     const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
-    const unsigned hw_stride  = out_h * out_w;
     const unsigned ow_tiles_w =
         (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
 
@@ -942,7 +968,6 @@ static void write_output_tile(
         for (unsigned ct = 0; ct < c_tiles; ct++) {
             const unsigned c_off   = ct * kTileC;
             const unsigned c_valid = std::min(kTileC, channels - c_off);
-            const unsigned y_base  = (ni * channels + c_off) * hw_stride;
 
             for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
                 const unsigned ow_lo = owt * ow_tile;
@@ -953,20 +978,192 @@ static void write_output_tile(
 
                 for (unsigned oh = 0; oh < out_h; oh++) {
                     for (unsigned g = 0; g < n_groups; g++) {
-                        const unsigned ow_g = ow_lo + g * kOwParallel;
+                        // Per-group transpose buffer — fully partitioned so
+                        // both drain (writes) and emit (reads) hit it as
+                        // registers with no array-port contention.
+                        Data_t buf[kOwParallel][kTileC];
+                        #pragma HLS ARRAY_PARTITION variable=buf complete dim=0
+
+                        // Drain phase — read in producer's (p outer, c1
+                        // inner) order, saturate to Data_t on the way in.
                         for (unsigned p = 0; p < kOwParallel; p++) {
-                            const unsigned ow      = ow_g + p;
-                            const bool     ow_ok   = (ow < ow_hi);
-                            unsigned y_addr = y_base + oh * out_w + ow;
                             for (unsigned c1 = 0; c1 < c_valid; c1++) {
                                 #pragma HLS PIPELINE II=1
-                                const Data_t v = saturate_cast<Data_t>(
+                                buf[p][c1] = saturate_cast<Data_t>(
                                     acc_stream.read());
-                                if (ow_ok) y[y_addr] = v;
+                            }
+                        }
+
+                        // Emit phase — pack kOwParallel lanes per c1 step
+                        // into one PackedOut.  c1 outer / p inner-packed
+                        // matches the burst_writer's stride-1 store order.
+                        for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                            #pragma HLS PIPELINE II=1
+                            PackedOut po;
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                po.lanes[p] = buf[p][c1];
+                            }
+                            packed_stream.write(po);
+                        }
+                    } // ow_group loop (within W-tile)
+                } // oh loop
+            } // owt loop
+        } // c_tile loop
+    } // batch loop
+}
+
+// ---------------------------------------------------------------------------
+// burst_writer — DATAFLOW sink (§2.11 — writer split, part 2).
+//
+// Drains packed_stream and emits each PackedOut as kOwParallel stride-1
+// m_axi writes at base address y_addr.  With both writes in the same II=1
+// pipeline cycle and stride 1, HLS auto-coalesces them into a single
+// kOwParallel * sizeof(Data_t) bit AXI beat with full WSTRB — vs the
+// pre-§2.11 writer which emitted one 16-bit element per 32-bit beat at
+// half-WSTRB (the half-empty beats visible in the kv260 timing diagram).
+//
+// Address pattern — (c1 outer, p inner): y_addr increments by hw_stride
+// between c1 iterations (channel stride) and by 1 between p lanes (stride
+// 1 within the inner unroll).
+//
+// Residual handling — when (ow_hi - ow_lo) is not a multiple of
+// kOwParallel, the last group has padded lanes (ow_g + p ≥ ow_hi).
+// Conditional `if (ow_ok)` gates the m_axi store; for full groups both
+// conditions are statically derivable so HLS emits the packed beat
+// unconditionally, while residual groups fall back to per-lane half-WSTRB
+// beats — same correctness, same write count as the pre-§2.11 writer for
+// the rare residual case.
+// ---------------------------------------------------------------------------
+static void burst_writer(
+    Data_t*                 y,
+    hls::stream<PackedOut>& packed_stream,
+    unsigned                batch,
+    unsigned                channels,
+    unsigned                out_h,
+    unsigned                out_w,
+    unsigned                ow_tile
+) {
+    // ------------------------------------------------------------------
+    // Manual port widening via AP-type reinterpret cast.
+    //
+    // HLS won't widen the m_axi data path automatically (UG1399, "Port
+    // Width": *"If the size and number of iterations are variable at
+    // compile time, then the tool will not automatically widen port
+    // widths"* — our out_h, out_w, channels are all s_axilite runtime
+    // registers).  Instead, we write through `y_packed`, an aliased view
+    // of y at PackedWord granularity, so HLS sees natively-aligned
+    // wide stores and emits a single 32-bit beat with full WSTRB per c1
+    // iteration in the fast path.  Bursting width on gmem1 becomes
+    // kOwParallel * sizeof(Data_t) * 8 = 32 b (vs 16 b without).
+    //
+    // Safety preconditions for the packed path:
+    //   (a) y_base + oh*out_w + ow_g is divisible by kOwParallel.
+    //   (b) hw_stride is divisible by kOwParallel.
+    // Hoist them to a single `can_pack` flag computed per (ni, ct, oh).
+    // y_base is always divisible by kOwParallel because c_off is a
+    // multiple of kTileC=8 (≥ kOwParallel=2) and PS DDR allocations are
+    // page-aligned.  ow_g = g * kOwParallel always divides.  The only
+    // runtime-dependent term is oh*out_w — if out_w is divisible by
+    // kOwParallel, every (oh, g) start is aligned; if not, parity
+    // alternates with oh.  When can_pack is false, fall through to the
+    // scalar fast path (HLS infers Length=2 bursts of 16-b beats — same
+    // as the §2.11 first-pass result).
+    // ------------------------------------------------------------------
+    PackedWord* y_packed = reinterpret_cast<PackedWord*>(y);
+
+    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
+    const unsigned hw_stride  = out_h * out_w;
+    const unsigned ow_tiles_w =
+        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+
+    const bool out_w_aligned    = (out_w   % kOwParallel) == 0u;
+    const bool hw_stride_aligned = (hw_stride % kOwParallel) == 0u;
+    const unsigned hw_stride_w  = hw_stride / kOwParallel;
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+        for (unsigned ct = 0; ct < c_tiles; ct++) {
+            const unsigned c_off   = ct * kTileC;
+            const unsigned c_valid = std::min(kTileC, channels - c_off);
+            const unsigned y_base  = (ni * channels + c_off) * hw_stride;
+            const bool y_base_aligned = (y_base % kOwParallel) == 0u;
+            const bool can_pack = y_base_aligned
+                               && out_w_aligned
+                               && hw_stride_aligned;
+
+            for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
+                const unsigned ow_lo = owt * ow_tile;
+                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+                const unsigned ow_span  = ow_hi - ow_lo;
+                const unsigned n_full_groups = ow_span / kOwParallel;
+                const bool     has_residual  =
+                    (ow_span % kOwParallel) != 0u;
+
+                for (unsigned oh = 0; oh < out_h; oh++) {
+
+                    // Fast path — full groups, unconditional writes.
+                    if (can_pack) {
+                        // Packed 32-bit path: one PackedWord store per c1
+                        // iteration → m_axi gmem1 widens to 32 b/beat
+                        // with full WSTRB.
+                        for (unsigned g = 0; g < n_full_groups; g++) {
+                            const unsigned ow_g = ow_lo + g * kOwParallel;
+                            unsigned y_word_addr =
+                                (y_base + oh * out_w + ow_g) / kOwParallel;
+
+                            for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                                #pragma HLS PIPELINE II=1
+                                const PackedOut po = packed_stream.read();
+                                PackedWord word;
+                                for (unsigned p = 0; p < kOwParallel; p++) {
+                                    #pragma HLS UNROLL
+                                    word.range(
+                                        (p + 1u) * sizeof(Data_t) * 8u - 1u,
+                                        p * sizeof(Data_t) * 8u) =
+                                            po.lanes[p].range(
+                                                sizeof(Data_t) * 8u - 1u, 0);
+                                }
+                                y_packed[y_word_addr] = word;
+                                y_word_addr += hw_stride_w;
+                            }
+                        }
+                    } else {
+                        // Scalar fallback: kOwParallel stride-1 16-b writes
+                        // per c1; HLS infers Length=2 bursts of 16-b beats.
+                        for (unsigned g = 0; g < n_full_groups; g++) {
+                            const unsigned ow_g = ow_lo + g * kOwParallel;
+                            unsigned y_addr = y_base + oh * out_w + ow_g;
+
+                            for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                                #pragma HLS PIPELINE II=1
+                                const PackedOut po = packed_stream.read();
+                                for (unsigned p = 0; p < kOwParallel; p++) {
+                                    #pragma HLS UNROLL
+                                    y[y_addr + p] = po.lanes[p];
+                                }
                                 y_addr += hw_stride;
                             }
                         }
-                    } // ow_group loop (within W-tile)
+                    }
+
+                    // Slow path — residual group with OOR lanes masked.
+                    // Always scalar: the OOR-lane mask blocks burst widening
+                    // and the residual is at most 1 group per W-tile so the
+                    // perf impact is small.
+                    if (has_residual) {
+                        const unsigned ow_g  = ow_lo + n_full_groups * kOwParallel;
+                        unsigned y_addr = y_base + oh * out_w + ow_g;
+                        for (unsigned c1 = 0; c1 < c_valid; c1++) {
+                            #pragma HLS PIPELINE II=1
+                            const PackedOut po = packed_stream.read();
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                if (ow_g + p < ow_hi)
+                                    y[y_addr + p] = po.lanes[p];
+                            }
+                            y_addr += hw_stride;
+                        }
+                    }
                 } // oh loop
             } // owt loop
         } // c_tile loop
@@ -1104,6 +1301,14 @@ void PoolingKernel(
     hls::stream<AccData_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kOwParallel*kTileC
 
+    // packed_stream carries c_valid PackedOut entries per
+    // (ni, ct, owt, oh, ow_group) — one PackedOut per c1, each holding
+    // kOwParallel adjacent ow lanes pre-packed in writer-order so
+    // burst_writer hits stride-1 m_axi writes.  Depth covers one group's
+    // emit burst.
+    hls::stream<PackedOut> packed_stream;
+    #pragma HLS STREAM variable=packed_stream depth=kTileC
+
     row_loader(
         x, row_data_pipe,
         batch, channels, in_h, in_w, out_h, out_w,
@@ -1123,7 +1328,11 @@ void PoolingKernel(
         batch, channels, out_h, out_w,
         pool_h, pool_w, pool_type, lp_order, ow_tile);
 
-    write_output_tile(
-        y, acc_stream,
+    reorder_acc(
+        acc_stream, packed_stream,
+        batch, channels, out_h, out_w, ow_tile);
+
+    burst_writer(
+        y, packed_stream,
         batch, channels, out_h, out_w, ow_tile);
 }

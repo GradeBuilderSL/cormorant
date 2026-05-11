@@ -28,6 +28,14 @@ set(AXI_BUS_WIDTH 32 CACHE STRING
     "AXI master bus data width in bits (32, 64, 128, 256, 512)")
 set_property(CACHE AXI_BUS_WIDTH PROPERTY STRINGS 32 64 128 256 512)
 
+# Pointer-base alignment guarantee for m_axi interfaces — derived from
+# AXI_BUS_WIDTH so the hint Vitis HLS receives via
+# `config_interface -m_axi_alignment_byte_size` always matches the bus
+# data width.  PS DDR allocations are page-aligned at runtime so any
+# value up to a page is safe, but the meaningful upper bound for HLS
+# widening analysis is the bus width.
+math(EXPR AXI_ALIGNMENT_BYTES "${AXI_BUS_WIDTH} / 8")
+
 # Collect platform files once; kernels iterate over this list.
 file(GLOB AXI_PLATFORM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platforms/*.json")
 if(NOT AXI_PLATFORM_FILES)

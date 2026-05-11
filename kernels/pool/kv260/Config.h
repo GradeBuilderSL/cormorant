@@ -1,0 +1,99 @@
+#pragma once
+
+#include <cstdint>
+#include "ap_fixed.h"
+#define POOL_HAVE_APFIXED
+
+// ---------------------------------------------------------------------------
+// Element and accumulator types — configured by CMake.
+//
+// Default (Vitis HLS available):
+//   Data_t    = ap_fixed<16,8>   range [-128, 127.996], 1/256 LSB
+//   AccData_t = ap_fixed<32,16>  range [-32768, 32767.999]
+//
+// Fallback (no Vitis HLS):
+//   Data_t    = float
+//   AccData_t = float
+// ---------------------------------------------------------------------------
+using Data_t    = ap_fixed<16,8>;
+using AccData_t = ap_fixed<32,16>;
+
+// ---------------------------------------------------------------------------
+// Tile-size and window-limit constants — compile-time parameters for HLS.
+//
+// kTileC     Channel tile.  Must be a power of two so that
+//            ri & (kTileC-1) compiles to a bitwise AND for the II=1 lane
+//            rotation, and so that the dependency distance for acc[c1] equals
+//            kTileC >= operation latency (compare ~1 cycle, add ~2 cycles).
+//
+// kMaxPoolH  Compile-time upper bound on pool window height.
+// kMaxPoolW  Compile-time upper bound on pool window width.
+//            These bound the on-chip win_buf dimensions.
+//            Models with pool_h > kMaxPoolH or pool_w > kMaxPoolW are
+//            rejected by the inference scheduler at validation time.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kTileC    = 8;
+static constexpr unsigned kMaxPoolH = 7;
+static constexpr unsigned kMaxPoolW = 7;
+
+// ---------------------------------------------------------------------------
+// kOwParallel — output-position unroll factor.
+//
+// The consumer's reduce loop processes kOwParallel adjacent ow positions in
+// lockstep: kOwParallel independent acc[][kTileC] lanes accumulate in
+// parallel, fed by a MultiWindow stream that bundles kOwParallel × kTileC
+// pixels per (khi, kwi) cycle.  Reduce cycle count drops from
+// `pool_h × pool_w` per output to `pool_h × pool_w` per kOwParallel outputs
+// — a linear speedup on consumer-bound tests up to the line-buffer's
+// read-port budget.
+//
+// Hardware constraint — line_buf must service kOwParallel reads per channel
+// per cycle.  At kOwParallel=2 this maps to true-dual-port BRAM (BIND_STORAGE
+// ram_t2p on the partitioned banks); higher values require manual bank
+// replication.  Must be a power of 2 (so ow-group rounding compiles to a
+// bitwise AND).
+//
+// Edge-case handling — when (ow_hi - ow_lo) is not a multiple of
+// kOwParallel, the producer emits identity-padded lanes for the residual
+// positions; the writer skips writes for ow ≥ ow_hi so the padded results
+// never reach DDR.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kOwParallel = 2;
+
+// ---------------------------------------------------------------------------
+// Line-buffer dimensions — used by input_window_producer to cache input rows
+// across the oh sweep within a single channel tile.
+//
+// kMaxLineBufRows  Power-of-2 upper bound on the vertical span of a pool
+//                  window: (pool_h - 1) * dil_h + 1.  The producer hashes
+//                  the input row index modulo kMaxLineBufRows to pick a
+//                  slot, so this MUST be a power of two.  Models violating
+//                  the bound are rejected by the inference scheduler.
+//
+// kMaxLineBufCols  Line buffer's innermost column dimension — caps the
+//                  width of one W-tile.  When in_w <= kMaxLineBufCols the
+//                  whole row fits in cache and there are no duplicate DDR
+//                  reads.  When in_w > kMaxLineBufCols the producer
+//                  splits out_w into multiple W-tiles; boundary input
+//                  columns are re-read once per tile transition.  Only
+//                  hard constraint: (pool_w-1)*dil_w + 1 <= kMaxLineBufCols
+//                  (a single pool window must fit horizontally).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxLineBufRows = 16;
+static constexpr unsigned kMaxLineBufCols = 64;
+
+// Pool type codes (match pool_type AXI-Lite register value).
+static constexpr unsigned kPoolMax = 0u;
+static constexpr unsigned kPoolAvg = 1u;
+static constexpr unsigned kPoolLp  = 2u;
+
+// Sentinel values for MAX pool initialisation.
+// kDataMin must equal the minimum representable Data_t value so that any
+// valid input beats the sentinel in the first comparison.
+// kAccMin is the same bound widened to the accumulator range.
+//   ap_fixed<16,8>:  minimum = -128;   ap_fixed<32,16>: minimum = -32768
+//   float fallback:  use -1e30 (no representable-range constraint)
+static constexpr float kDataMin = -128.0f;
+static constexpr float kAccMin  = -32768.0f;
+
+static constexpr unsigned kSeed = 42;

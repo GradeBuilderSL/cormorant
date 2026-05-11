@@ -9,30 +9,30 @@
 #   POOL_TARGET_CLOCK_TCL   — target clock frequency in MHz
 #   POOL_IP_OUTPUT_DIR      — output directory for the exported IP catalog
 
-open_project @POOL_HLS_PROJECT_NAME@
+open_project pool_kv260
 open_solution solution1 -flow_target vivado
 
-@POOL_BOARD_OPTION@
+set_part {xck26-sfvc784-2LV-c} -board {xilinx.com:kv260_som:part0:1.4}
 
-add_files -cflags "@POOL_SYNTHESIS_FLAGS@" "@POOL_SRC_SYNTHESIS@"
+add_files -cflags "-O3 -I/home/ivan/projects/axi_demo/kernels/pool/include -I/home/ivan/projects/axi_demo/kernels/pool/kv260" "/home/ivan/projects/axi_demo/kernels/pool/kernel/PoolingKernel.cpp"
 set_top PoolingKernel
 
-create_clock -period @POOL_TARGET_CLOCK_TCL@MHz -name default
+create_clock -period 300MHz -name default
 
 # 64-bit AXI addresses for systems with >4 GB address space (e.g. KV260 PS DDR).
 config_interface -m_axi_addr64
 # Set m_axi bus width (controlled by CMake AXI_BUS_WIDTH).
-config_interface -m_axi_max_widen_bitwidth @AXI_BUS_WIDTH@
+config_interface -m_axi_max_widen_bitwidth 32
 # Declare base-address alignment of m_axi pointer arguments (in bytes).
 # Derived from AXI_BUS_WIDTH at CMake-configure time (= AXI_BUS_WIDTH / 8),
 # so the alignment hint always matches the bus width — necessary for HLS
 # to widen the gmem1 data path up to the full bus width when synthesising
 # the §2.11 burst_writer.  PS DDR allocations are page-aligned so the
 # guarantee always holds at runtime.
-config_interface -m_axi_alignment_byte_size @AXI_ALIGNMENT_BYTES@
+config_interface -m_axi_alignment_byte_size 4
 config_rtl -reset_level low
 
 csynth_design
-export_design -format ip_catalog -output @POOL_IP_OUTPUT_DIR@
+export_design -format ip_catalog -output /home/ivan/projects/axi_demo/kernels/pool/kv260/ip_catalog
 
 exit
