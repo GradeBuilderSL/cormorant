@@ -7,12 +7,28 @@ allowed-tools: Bash Read
 
 Four sequential gates. **If any gate fails, stop immediately and report the failure** — do not run later gates on a broken build.
 
-The project root is `/home/ivan/projects/axi_demo` and all `make` commands run from `/home/ivan/projects/axi_demo/build`.
+## Locate the build directory
+
+The user may have placed `build/` inside the repo or anywhere else (out-of-source builds are common). Before running any gate, locate it once:
+
+```bash
+# Prefer the conventional in-repo location; fall back to a shallow find.
+if [ -f build/CMakeCache.txt ]; then
+    BUILD_DIR=$(pwd)/build
+else
+    BUILD_DIR=$(find . -maxdepth 4 -name CMakeCache.txt -path '*/build/CMakeCache.txt' | head -n 1 | xargs -r dirname)
+fi
+echo "BUILD_DIR=$BUILD_DIR"
+```
+
+If `BUILD_DIR` ends up empty, ask the user where the build tree is and stop. Otherwise `cd "$BUILD_DIR"` and run all `make` commands from there.
+
+Note `BUILD_DIR` in your scratch state for Gate 4's report-path argument.
 
 ## Gate 1 — C-simulation
 
 ```bash
-cd /home/ivan/projects/axi_demo/build
+cd "$BUILD_DIR"
 make TestPoolingSim
 ./kernels/pool/TestPoolingSim
 ```
@@ -28,10 +44,10 @@ make synthesize_pool_kv260
 
 - Wait for it (~45 s on this machine, sometimes longer). The final line must be `[100%] Built target synthesize_pool_kv260`.
 - The bash exit code must be 0. Any `ERROR:` line in the tool output is a hard failure.
-- After it succeeds, glance at the synthesis summary for new violations:
+- After it succeeds, glance at the synthesis summary for new violations (path is relative to the build directory):
 
   ```bash
-  sed -n '15,70p' /home/ivan/projects/axi_demo/build/kernels/pool/kv260/pool_kv260/solution1/syn/report/csynth.rpt
+  sed -n '15,70p' kernels/pool/kv260/pool_kv260/solution1/syn/report/csynth.rpt
   ```
 
   Report any of these against the prior run:
@@ -51,18 +67,22 @@ make behavior_test_pool
 
   ```
   [ts] kernel=PoolingKernel  total=31  passed=31  failed=0  all_passed=True
-  [ck] PoolingKernel: PASS  (31/31)  /home/ivan/projects/axi_demo/build/kernels/pool/kv260/pooling_test_report.json
+  [ck] PoolingKernel: PASS  (31/31)  …/pooling_test_report.json
   ```
 
 - `failed=0` and `all_passed=True` are mandatory. **If anything else, stop here.**
 
 ## Gate 4 — Timing comparison vs most-recent run
 
+The report and baseline live under `$BUILD_DIR/kernels/pool/kv260/`. Pass `--report` so the script doesn't assume the conventional in-repo build location:
+
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/compare_pool_timing.py
+python3 "${CLAUDE_SKILL_DIR}/scripts/compare_pool_timing.py" \
+    --report   "$BUILD_DIR/kernels/pool/kv260/pooling_test_report.json" \
+    --baseline "$BUILD_DIR/kernels/pool/kv260/pool_timing_last.json"
 ```
 
-The script reads `build/kernels/pool/kv260/pooling_test_report.json` (just written by Gate 3), compares per-test `duration_ns` against `build/kernels/pool/kv260/pool_timing_last.json` (the previous run's snapshot), prints a delta table sorted by absolute movement, and overwrites `pool_timing_last.json` with the current run so the next invocation has a fresh baseline.
+The script reads the freshly-written `pooling_test_report.json`, compares per-test `duration_ns` against `pool_timing_last.json` (the previous run's snapshot), prints a delta table sorted by absolute movement, and overwrites `pool_timing_last.json` with the current run so the next invocation has a fresh baseline.
 
 - First-ever run: there's no baseline yet, the script prints absolute values and saves a snapshot. Note this in your reply so the user knows the next run will produce a real diff.
 - Add `--no-save` if you want a one-off comparison without overwriting the baseline (e.g. to keep a known-good reference while testing a speculative change). Use this when the user explicitly says "don't update the baseline".
@@ -78,8 +98,18 @@ After all four gates pass, summarise in this order:
 
 Keep the report tight: one short paragraph per section, no extra prose.
 
+## When `make` reports an unknown target
+
+If any gate prints `make: *** No rule to make target '<X>'. Stop.` (e.g. `behavior_test_pool` is missing), the build tree was configured against a different branch — its cached files predate a CMakeLists addition/removal. From inside `$BUILD_DIR`, refresh once and retry the same `make` command:
+
+```bash
+cmake .
+```
+
+`cmake .` re-runs configure in place using the existing cache; targets that exist on the current branch get registered. Don't fall back to deleting the build tree — that loses the synthesis cache and forces a full ~45 s HLS re-run.
+
 ## What to skip
 
 - Don't rebuild dependencies the user hasn't touched (other kernels, the inference scheduler, etc.).
-- Don't re-run cmake unless a CMakeLists or `platforms/*.json` was edited — the tcl is auto-regenerated on those changes via `CMAKE_CONFIGURE_DEPENDS`, so `make` alone picks it up.
+- Don't proactively re-run cmake unless a CMakeLists or `platforms/*.json` was edited — the tcl is auto-regenerated on those changes via `CMAKE_CONFIGURE_DEPENDS`, so `make` alone picks it up. (Exception: the unknown-target case above, where the cmake refresh is the targeted fix.)
 - Don't read the full `csynth.rpt` (it's >450 KB) — slice with `sed -n` or grep for what you need.
