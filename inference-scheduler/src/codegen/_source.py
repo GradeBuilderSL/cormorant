@@ -3,9 +3,10 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes  import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode, PoolNode, ReshapeNode
-from ..tensor import LARGE_WEIGHT_THRESHOLD
-from ._banners import _banner, _file_banner
+from ..nodes    import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode, PoolNode, ReshapeNode
+from ..schedule import Dag
+from ..tensor   import LARGE_WEIGHT_THRESHOLD
+from ._banners  import _banner, _file_banner
 
 
 class _SourceMixin:
@@ -24,6 +25,8 @@ class _SourceMixin:
             self._weight_arrays(),
             self._buffer_declarations(),
             self._kernel_instance(),
+            self._kernel_wait_helper(),
+            self._layer_names_table(),
             self._run_op_helper(),
             self._init_function(),
             self._inference_function(),
@@ -40,6 +43,8 @@ class _SourceMixin:
         return (
             _banner("Includes") +
             '#include "inference.h"\n'
+            '#include "inference_prof.h"  /* INFERENCE_PROF_BEGIN/END (no-ops unless'
+            ' INFERENCE_PROFILING is set) */\n'
             f'{kernel_headers}'
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
@@ -130,6 +135,121 @@ class _SourceMixin:
             lines.append(f"static {kd.c_type} {kd.c_var};")
         return "\n".join(lines) + "\n"
 
+    # Stable map from a kernel's registry name to its kernel_id_t enum literal.
+    # Both _kernel_wait_helper() and the inference_run() body emitter use this.
+    _KERNEL_ID_ENUM = {
+        "VectorOPKernel": "KERNEL_VECTOROP",
+        "MatmulKernel":   "KERNEL_MATMUL",
+        "ConvKernel":     "KERNEL_CONV",
+        "PoolKernel":     "KERNEL_POOL",
+    }
+
+    def _kernel_wait_helper(self) -> str:
+        """Emit kernel_id_t and a weak kernel_wait() polling default.
+
+        Only enumerates kernels the model actually uses, so single-kernel
+        projects don't pull in references to undeclared driver instances.
+        The function is __weak so deployments that prefer interrupt-driven
+        waiting (UIO/IRQ on Linux, GIC under bare-metal) can override it at
+        link time without touching the generated source.
+        """
+        active = list(self._active_kernels)
+        if not active:
+            return ""
+
+        enum_lines = ["typedef enum {"]
+        for i, kd in enumerate(active):
+            enum_lines.append(f"    {self._KERNEL_ID_ENUM[kd.name]} = {i}u,")
+        enum_lines.append(f"    KERNEL_COUNT = {len(active)}u")
+        enum_lines.append("} kernel_id_t;")
+
+        case_lines = []
+        for kd in active:
+            case_lines.append(
+                f"        case {self._KERNEL_ID_ENUM[kd.name]}:\n"
+                f"            while (!{kd.c_type}_IsDone(&{kd.c_var})) {{}}\n"
+                f"            break;"
+            )
+
+        return (
+            _banner("Kernel synchronization (split start / wait)") +
+            "/*\n"
+            " * kernel_wait(k) — block until the most-recent Start on lane k completes.\n"
+            " *\n"
+            " * The codegen emits NON-BLOCKING run_*() helpers; inference_run() calls\n"
+            " * kernel_wait() lazily — only when the next op needs the result of an\n"
+            " * earlier op, or when a lane must be reused.  This lets different lanes\n"
+            " * (Conv ‖ Pool ‖ VectorOP ‖ Matmul) overlap without threading.\n"
+            " *\n"
+            " * The default implementation polls IsDone() in a tight loop.  It is\n"
+            " * declared __weak so deployments that prefer interrupt-driven waiting\n"
+            " * can override it at link time:\n"
+            " *\n"
+            " *     void kernel_wait(kernel_id_t k) { ... wait-for-IRQ ... }\n"
+            " */\n"
+            + "\n".join(enum_lines) + "\n\n"
+            "__attribute__((weak))\n"
+            "void kernel_wait(kernel_id_t k)\n"
+            "{\n"
+            "    switch (k) {\n"
+            + "\n".join(case_lines) + "\n"
+            "        default: break;\n"
+            "    }\n"
+            "}\n"
+        )
+
+    @staticmethod
+    def _c_string_escape(s: str) -> str:
+        """Escape a Python string for use as a C string literal body."""
+        out = []
+        for ch in s:
+            o = ord(ch)
+            if ch == '\\':   out.append('\\\\')
+            elif ch == '"':  out.append('\\"')
+            elif ch == '\n': out.append('\\n')
+            elif ch == '\r': out.append('\\r')
+            elif ch == '\t': out.append('\\t')
+            elif o < 0x20 or o == 0x7f:
+                out.append(f"\\x{o:02x}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def _layer_names_table(self) -> str:
+        """Emit the static name table consumed by inference_prof and the
+        accessors declared in inference.h.  Always emitted, even when
+        profiling is off — the table is tiny and gives host code a stable
+        way to introspect the graph."""
+        names = self._layer_display_names()
+        n     = len(names)
+
+        parts = [_banner("Per-layer name table (used by inference_prof)")]
+        if n > 0:
+            parts.append(
+                f"static const char *const inference_layer_names[{n}] = {{"
+            )
+            for i, name in enumerate(names):
+                parts.append(f'    "{self._c_string_escape(name)}",'
+                             f"  /* [{i}] */")
+            parts.append("};")
+        else:
+            parts.append("/* (no scheduled nodes — layer-name table is empty) */")
+        parts.append("")
+        parts.append("unsigned inference_num_layers(void)")
+        parts.append("{")
+        parts.append(f"    return {n}u;")
+        parts.append("}")
+        parts.append("")
+        parts.append("const char *const *inference_layer_names_ptr(void)")
+        parts.append("{")
+        if n > 0:
+            parts.append("    return inference_layer_names;")
+        else:
+            parts.append("    return (const char *const *)0;")
+        parts.append("}")
+        parts.append("")
+        return "\n".join(parts)
+
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
         # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
@@ -174,7 +294,13 @@ class _SourceMixin:
         if need_run_op:
             parts.append(
                 "/*\n"
-                " * run_op() — program AXI-Lite registers, start the kernel, and poll.\n"
+                " * run_op() — program AXI-Lite registers and start the kernel.\n"
+                " *\n"
+                " * NON-BLOCKING: returns immediately after Start.  The caller must\n"
+                " * drain the kernel via kernel_wait(KERNEL_VECTOROP) before reading\n"
+                " * the output buffer or reusing the lane for another op.  Waits are\n"
+                " * interleaved by inference_run() based on the data-flow DAG so\n"
+                " * different-lane kernels can overlap.\n"
                 " *\n"
                 " * The kernel's AXI master reads/writes DDR using PHYSICAL addresses;\n"
                 " * inference_buf_phys() provides the address to program into the registers.\n"
@@ -214,15 +340,16 @@ class _SourceMixin:
                 f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
                 f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
                 f"    XVectoropkernel_Start(&{vop_var});\n"
-                f"    while (!XVectoropkernel_IsDone(&{vop_var})) {{}}\n"
                 "}\n"
             )
 
         if need_run_matmul:
             parts.append(
                 "/*\n"
-                " * run_matmul() — program XMatmulkernel AXI-Lite registers,\n"
-                " * start the kernel, and poll until done.\n"
+                " * run_matmul() — program XMatmulkernel AXI-Lite registers and start.\n"
+                " *\n"
+                " * NON-BLOCKING: caller must kernel_wait(KERNEL_MATMUL) before\n"
+                " * reading c or reusing the Matmul lane.\n"
                 " *\n"
                 " *   a / b / c   DMA buffer pointers (physical addresses via\n"
                 " *                inference_buf_phys())\n"
@@ -255,7 +382,6 @@ class _SourceMixin:
                 f"    XMatmulkernel_Set_b_batch_stride(&{mm_var}, b_stride);\n"
                 f"    XMatmulkernel_Set_c_batch_stride(&{mm_var}, c_stride);\n"
                 f"    XMatmulkernel_Start(&{mm_var});\n"
-                f"    while (!XMatmulkernel_IsDone(&{mm_var})) {{}}\n"
                 "}\n"
             )
 
@@ -263,6 +389,11 @@ class _SourceMixin:
             parts.append(
                 "/*\n"
                 " * run_matmul_at() — offset-based dispatch for outer-loop broadcasting.\n"
+                " *\n"
+                " * BLOCKING: each iteration of the calling outer loop reuses the same\n"
+                " * Matmul lane registers, so this helper polls IsDone() before returning.\n"
+                " * Nodes that emit run_matmul_at therefore drain the Matmul lane themselves;\n"
+                " * inference_run() treats them as synchronous on the Matmul lane.\n"
                 " *\n"
                 " * Used when one input has a leading batch dimension absent from the\n"
                 " * other.  The outer loop advances the larger-rank operand by one\n"
@@ -303,8 +434,10 @@ class _SourceMixin:
         if need_run_conv:
             parts.append(
                 "/*\n"
-                " * run_conv() — program XConvkernel AXI-Lite registers,\n"
-                " * start the kernel, and poll until done.\n"
+                " * run_conv() — program XConvkernel AXI-Lite registers and start.\n"
+                " *\n"
+                " * NON-BLOCKING: caller must kernel_wait(KERNEL_CONV) before\n"
+                " * reading y or reusing the Conv lane.\n"
                 " *\n"
                 " *   x / weight / bias / y   DMA buffer pointers\n"
                 " *                            (physical addresses via inference_buf_phys()).\n"
@@ -359,15 +492,16 @@ class _SourceMixin:
                 f"    XConvkernel_Set_has_bias    (&{conv_var}, has_bias);\n"
                 f"    XConvkernel_Set_is_depthwise(&{conv_var}, is_depthwise);\n"
                 f"    XConvkernel_Start(&{conv_var});\n"
-                f"    while (!XConvkernel_IsDone(&{conv_var})) {{}}\n"
                 "}\n"
             )
 
         if need_run_pool:
             parts.append(
                 "/*\n"
-                " * run_pool() — program XPoolingkernel AXI-Lite registers,\n"
-                " * start the kernel, and poll until done.\n"
+                " * run_pool() — program XPoolingkernel AXI-Lite registers and start.\n"
+                " *\n"
+                " * NON-BLOCKING: caller must kernel_wait(KERNEL_POOL) before\n"
+                " * reading y or reusing the Pool lane.\n"
                 " *\n"
                 " *   x / y       DMA buffer pointers (physical addresses via\n"
                 " *                inference_buf_phys())\n"
@@ -417,7 +551,6 @@ class _SourceMixin:
                 f"    XPoolingkernel_Set_lp_order          (&{pool_var}, lp_order);\n"
                 f"    XPoolingkernel_Set_count_include_pad (&{pool_var}, count_include_pad);\n"
                 f"    XPoolingkernel_Start(&{pool_var});\n"
-                f"    while (!XPoolingkernel_IsDone(&{pool_var})) {{}}\n"
                 "}\n"
             )
 
@@ -677,11 +810,58 @@ class _SourceMixin:
             for t in outputs
         ]
 
-        body_lines = []
-        for sn in graph.nodes:
-            body_lines.append(sn.emit_comment())
-            body_lines.append(sn.emit_call(self._layouts))
-            body_lines.append("")
+        # ---- Interleaved start / wait emission --------------------------- #
+        # The schedule is built once by _compute_event_stream() (in _core)
+        # and consumed verbatim here.  The same stream drives _compute_
+        # live_intervals(), so the buffer-slot colouring and the emitted
+        # kernel_wait() calls agree on which kernels are in flight at any
+        # point — buffers cannot be reused while another lane is still
+        # reading or writing them.
+        # ----------------------------------------------------------------- #
+        nodes_by_idx = {sn.index: sn for sn in graph.nodes}
+        body_lines: list = []
+        drain_started = False
+
+        for ev in self._compute_event_stream():
+            kind = ev[0]
+            if kind == 'comment':
+                sn = nodes_by_idx[ev[1]]
+                body_lines.append(sn.emit_comment())
+
+            elif kind == 'reshape':
+                sn = nodes_by_idx[ev[1]]
+                # ReshapeNode emits an empty call — keep blank for readability.
+                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append("")
+
+            elif kind == 'wait':
+                _, kid, drained = ev
+                body_lines.append(f"    kernel_wait({kid});")
+                body_lines.append(f"    INFERENCE_PROF_END({drained}u);")
+
+            elif kind == 'start':
+                sn = nodes_by_idx[ev[1]]
+                body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
+                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append("")
+
+            elif kind == 'start_sync':
+                sn = nodes_by_idx[ev[1]]
+                body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
+                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")
+                body_lines.append("")
+
+            elif kind == 'drain':
+                _, kid, drained = ev
+                if not drain_started:
+                    body_lines.append(
+                        "    /* Drain remaining in-flight kernels before output sync. */"
+                    )
+                    drain_started = True
+                body_lines.append(f"    kernel_wait({kid});")
+                body_lines.append(f"    INFERENCE_PROF_END({drained}u);")
+
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
 

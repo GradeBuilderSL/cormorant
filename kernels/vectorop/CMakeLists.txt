@@ -104,9 +104,36 @@ target_compile_options(vadd_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragma
 add_executable(TestSimulation test/TestSimulation.cpp)
 target_link_libraries(TestSimulation PRIVATE vadd_kernel)
 target_compile_options(TestSimulation PRIVATE -Wall -Wextra -O2)
+if(VA_DATA_TYPE MATCHES "^ap_(u?)fixed<16")
+    target_compile_definitions(TestSimulation PRIVATE VA_HAVE_APFIXED)
+endif()
 
 enable_testing()
 add_test(NAME TestSimulation COMMAND TestSimulation)
+
+# ---------------------------------------------------------------------------
+# gen_vectorop_test_data — regenerate hex fixtures for the HDL testbench.
+#
+# Runs TestSimulation in --dump-data mode, writing per-test a/b/c_ref hex
+# files plus manifest.txt to ${CMAKE_BINARY_DIR}/vectorop_test_data/.  The
+# HDL testbench loads these via $readmemh, so HW-level tests stay
+# bit-identical to the C++ verification (same kSeed, same ref_op() oracle).
+#
+# Requires the 16-bit ap_fixed build (VA_HAVE_APFIXED).
+# ---------------------------------------------------------------------------
+set(VA_TEST_DATA_DIR "${CMAKE_BINARY_DIR}/vectorop_test_data"
+    CACHE PATH "Output directory for VectorOPKernel HDL testbench fixtures")
+
+if(VA_DATA_TYPE MATCHES "^ap_(u?)fixed<16")
+    add_custom_target(gen_vectorop_test_data
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${VA_TEST_DATA_DIR}"
+        COMMAND $<TARGET_FILE:TestSimulation> --dump-data "${VA_TEST_DATA_DIR}"
+        DEPENDS TestSimulation
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Generating VectorOPKernel HDL test fixtures → ${VA_TEST_DATA_DIR}"
+        VERBATIM)
+    message(STATUS "VectorOPKernel: gen_vectorop_test_data → ${VA_TEST_DATA_DIR}")
+endif()
 
 message(STATUS "VectorOPKernel: Data_t=${VA_DATA_TYPE}")
 

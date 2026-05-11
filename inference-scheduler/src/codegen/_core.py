@@ -42,8 +42,9 @@ import os
 from typing import List, Optional
 
 from ..graph   import OnnxGraph
-from ..nodes   import ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SchedulerError
-from ..kernels import KernelDesc, KERNEL_REGISTRY
+from ..nodes    import ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SchedulerError
+from ..kernels  import KernelDesc, KERNEL_REGISTRY
+from ..schedule import Dag
 from ..tensor  import TensorInfo, LARGE_WEIGHT_THRESHOLD
 from ..dtype   import DataType, AP_FIXED_16_8
 from ..layout  import TensorLayout
@@ -267,33 +268,207 @@ class _CoreMixin:
             result[t.onnx_name] = (lay.n_chunks, lay.stride)
         return result
 
+    # Map a kernel registry name → kernel_id_t enum literal used in the
+    # generated C.  Mirrors _SourceMixin._KERNEL_ID_ENUM but lives in core
+    # so the schedule walker can use it without depending on the source
+    # mixin.  Update both sites if the enum naming ever changes.
+    _KERNEL_ID_ENUM = {
+        "VectorOPKernel": "KERNEL_VECTOROP",
+        "MatmulKernel":   "KERNEL_MATMUL",
+        "ConvKernel":     "KERNEL_CONV",
+        "PoolKernel":     "KERNEL_POOL",
+    }
+
+    def _kernel_id_of(self, sched) -> Optional[str]:
+        """Return the kernel_id_t enum literal for sched's lane, or None
+        if sched does not occupy a hardware lane (ReshapeNode)."""
+        kn = getattr(type(sched), "kernel_name", "")
+        return self._KERNEL_ID_ENUM.get(kn) if kn else None
+
+    @staticmethod
+    def _is_synchronous_node(sched) -> bool:
+        """A node whose helper drains its lane internally — currently only
+        the MatmulNode 4D×3D outer loop, which calls run_matmul_at() in a
+        for-loop; each iteration polls IsDone() before returning."""
+        return isinstance(sched, MatmulNode) and sched.outer_count > 1
+
+    def _compute_event_stream(self) -> list:
+        """Build the linear event sequence inference_run() will emit.
+
+        Each event is one of:
+
+          ('comment', node_idx)             — node header (always present)
+          ('wait',    kid, drained_idx)     — kernel_wait(KERNEL_*) call
+          ('start',   node_idx)             — non-blocking Start
+          ('start_sync', node_idx)          — synchronous Start (drains
+                                               its own lane internally)
+          ('drain',   kid, drained_idx)     — final kernel_wait before
+                                               output cache sync
+          ('reshape', node_idx)             — ReshapeNode: no kernel work
+
+        ReshapeNodes are emitted as no-ops, but predecessor-wait analysis
+        walks *through* them: a consumer of a Reshape alias must wait on
+        the real producing kernel of the underlying source.
+        """
+        graph = self._graph
+        dag   = Dag.from_graph(graph)
+
+        def effective_preds(idx: int) -> set:
+            """Predecessors with their kernel_name set, traversing through
+            any chain of ReshapeNodes to the real producing op."""
+            seen: set = set()
+            out: set  = set()
+            stack = list(dag.predecessors(idx))
+            while stack:
+                p = stack.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                p_sched = dag.by_index[p].sched
+                if isinstance(p_sched, ReshapeNode):
+                    stack.extend(dag.predecessors(p))
+                else:
+                    out.add(p)
+            return out
+
+        events: list   = []
+        pending: dict  = {}   # kid -> node index of last started, not yet waited
+
+        for sn in graph.nodes:
+            events.append(('comment', sn.index))
+
+            if isinstance(sn, ReshapeNode):
+                events.append(('reshape', sn.index))
+                continue
+
+            target = self._kernel_id_of(sn)
+
+            # 1. Wait on each effective predecessor whose lane is still in flight.
+            waits: list = []
+            seen_kid: set = set()
+            for p in sorted(effective_preds(sn.index)):
+                p_kid = self._kernel_id_of(dag.by_index[p].sched)
+                if p_kid is None:
+                    continue
+                if pending.get(p_kid) == p and p_kid not in seen_kid:
+                    waits.append((p_kid, p))
+                    seen_kid.add(p_kid)
+
+            # 2. Wait on target lane if a different op is still in flight there.
+            if target is not None and target in pending and target not in seen_kid:
+                waits.append((target, pending[target]))
+                seen_kid.add(target)
+
+            for k, drained in waits:
+                events.append(('wait', k, drained))
+                pending.pop(k, None)
+
+            if self._is_synchronous_node(sn):
+                events.append(('start_sync', sn.index))
+                if target is not None:
+                    pending.pop(target, None)
+            else:
+                events.append(('start', sn.index))
+                if target is not None:
+                    pending[target] = sn.index
+
+        # Final drain — wait on every still-pending lane.
+        for k in sorted(pending):
+            events.append(('drain', k, pending[k]))
+
+        return events
+
     def _compute_live_intervals(self) -> dict:
-        """Return {onnx_name: (produce_idx, last_consume_idx)} for every
+        """Return {onnx_name: (start_event_idx, end_event_idx)} for every
         non-reshape-alias intermediate tensor.
+
+        Intervals are expressed in event-stream index space (not node-index
+        space) so that pool-slot colouring respects the actual execution
+        timeline emitted by inference_run() under the parallel-wait scheme:
+        a tensor is live from its producer's Start event until the latest
+        kernel_wait that drains a consumer's lane.
 
         Weights and graph inputs/outputs are excluded — they live for the
         entire inference call and are never candidates for buffer reuse.
         """
-        reshape_aliases = set(self._reshape_aliases)
-        intermediate_names = {
+        reshape_aliases = self._reshape_aliases
+        intermediates = {
             t.onnx_name
             for t in self._graph.intermediate_tensors
             if t.onnx_name not in reshape_aliases
         }
-        produced_at: dict = {}
-        last_consumed_at: dict = {}
-        for idx, sn in enumerate(self._graph.nodes):
+
+        # Build alias-resolution map: tensor_name → underlying intermediate.
+        # A consumer of a Reshape alias contributes to the source tensor's
+        # live interval, since both share the same DMA buffer.
+        def resolve(name: str) -> str:
+            seen = set()
+            while name in reshape_aliases and name not in seen:
+                seen.add(name)
+                # _reshape_aliases maps onnx output name → source c_name.
+                # Walk via onnx names for the live-interval graph.
+                src_node = next(
+                    (sn for sn in self._graph.nodes
+                     if isinstance(sn, ReshapeNode)
+                     and sn.output.onnx_name == name),
+                    None,
+                )
+                if src_node is None:
+                    break
+                name = src_node.inputs[0].onnx_name
+            return name
+
+        events = self._compute_event_stream()
+
+        # Map node_idx → event index of its Start (or start_sync).
+        start_event: dict = {}
+        # Map node_idx → event index of the wait that drained it.  For a
+        # synchronous node the helper drains the lane itself; we record
+        # the same event index as the Start so the interval doesn't extend
+        # past the call.
+        drain_event: dict = {}
+        for ei, ev in enumerate(events):
+            if ev[0] in ('start', 'start_sync'):
+                start_event[ev[1]] = ei
+                if ev[0] == 'start_sync':
+                    drain_event[ev[1]] = ei
+            elif ev[0] in ('wait', 'drain'):
+                drain_event[ev[2]] = ei
+
+        producer_of: dict = {}
+        consumers_of: dict = {n: [] for n in intermediates}
+        for sn in self._graph.nodes:
+            if isinstance(sn, ReshapeNode):
+                continue
             out = sn.output.onnx_name
-            if out in intermediate_names:
-                produced_at[out] = idx
+            if out in intermediates:
+                producer_of[out] = sn.index
             for inp in sn.inputs:
-                if inp.onnx_name in intermediate_names:
-                    last_consumed_at[inp.onnx_name] = idx
-        return {
-            name: (produced_at[name], last_consumed_at.get(name, produced_at[name]))
-            for name in intermediate_names
-            if name in produced_at
-        }
+                src = resolve(inp.onnx_name)
+                if src in intermediates and src != out:
+                    consumers_of[src].append(sn.index)
+
+        intervals: dict = {}
+        for name in intermediates:
+            p = producer_of.get(name)
+            if p is None:
+                continue
+            start_ei = start_event.get(p)
+            if start_ei is None:
+                continue
+            ends = []
+            for c in consumers_of.get(name, []):
+                # The buffer is held until the consumer's lane drains.
+                de = drain_event.get(c)
+                if de is None:
+                    de = start_event.get(c, start_ei)
+                ends.append(de)
+            # No consumer recorded → buffer is at least live across its
+            # own producer's drain (covers final outputs that flow only
+            # via a Reshape chain to a graph output).
+            end_ei = max(ends) if ends else drain_event.get(p, start_ei)
+            intervals[name] = (start_ei, end_ei)
+        return intervals
 
     def _compute_pool_layout(self):
         """
@@ -537,6 +712,31 @@ class _CoreMixin:
     def _has_vectorop_nodes(self) -> bool:
         """True when the graph contains at least one VectorOP ScheduledNode."""
         return any(isinstance(sn, ScheduledNode) for sn in self._graph.nodes)
+
+    def _layer_display_names(self) -> List[str]:
+        """One human-readable name per scheduled node, suitable for the
+        per-layer profiler.
+
+        Prefers the ONNX node name when present; falls back to ``op_type_index``
+        when empty.  After that, any duplicates are disambiguated by suffixing
+        every collider with ``_<index>`` so each name is unique and stable.
+        """
+        nodes = self._graph.nodes
+        candidates: List[str] = []
+        for sn in nodes:
+            raw = (sn.onnx_node.name or "").strip()
+            if not raw:
+                raw = f"{sn.onnx_node.op_type}_{sn.index}"
+            candidates.append(raw)
+
+        counts: dict = {}
+        for n in candidates:
+            counts[n] = counts.get(n, 0) + 1
+
+        return [
+            (f"{n}_{sn.index}" if counts[n] > 1 else n)
+            for sn, n in zip(nodes, candidates)
+        ]
 
     @property
     def _driver_prefix(self) -> str:

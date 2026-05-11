@@ -1,12 +1,28 @@
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
+#include <string>
 #include <type_traits>
 #include <vector>
 
 #include "VectorOP.h"
+
+// ---------------------------------------------------------------------------
+// --dump-data <dir> mode: instead of running VectorOPKernel and comparing,
+// dump the per-test a/b/c_ref tensors to hex files (one 16-bit value per
+// line, suitable for $readmemh).  A manifest.txt indexes every test with
+// its geometry so an HDL testbench can load the same fixtures.  RNG state
+// is shared with verify mode (same seed, same draw order).
+// ---------------------------------------------------------------------------
+static std::string g_dump_dir;     // empty → verify mode (default)
+static int         g_test_idx = 0;
+static FILE*       g_manifest = nullptr;
 
 // ---------------------------------------------------------------------------
 // Reference model
@@ -50,6 +66,75 @@ static double ref_op(Op op, double a, double b) {
 }
 
 // ---------------------------------------------------------------------------
+// Dump-mode helpers (only meaningful for fixed-point builds — the HDL
+// testbench reads 16-bit hex values one per line).
+// ---------------------------------------------------------------------------
+#ifdef VA_HAVE_APFIXED
+static uint16_t data_to_raw16(const Data_t& v) {
+    return static_cast<uint16_t>(v.range().to_uint());
+}
+
+static void write_hex_file(const std::string& path,
+                           const std::vector<Data_t>& vec) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        std::exit(1);
+    }
+    for (const auto& v : vec)
+        std::fprintf(f, "%04x\n", data_to_raw16(v));
+    std::fclose(f);
+}
+#endif
+
+static std::string sanitize_label(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '_' || c == '-') out.push_back(c);
+        else                                          out.push_back('_');
+    }
+    return out;
+}
+
+// Materialise c_ref (as Data_t) and write a/b/c hex files plus a manifest
+// row.  Caller has already computed the reference output as doubles.
+static void dump_one_case(const char* label,
+                          unsigned size, unsigned op_code,
+                          unsigned outer, unsigned a_inc, unsigned b_inc,
+                          const std::vector<Data_t>& a,
+                          const std::vector<Data_t>& b,
+                          const std::vector<double>& c_ref_d) {
+#ifndef VA_HAVE_APFIXED
+    (void)label; (void)size; (void)op_code;
+    (void)outer; (void)a_inc; (void)b_inc;
+    (void)a; (void)b; (void)c_ref_d;
+    std::fprintf(stderr, "--dump-data requires VA_HAVE_APFIXED build\n");
+    std::exit(1);
+#else
+    const int idx = g_test_idx++;
+    char idx_buf[16];
+    std::snprintf(idx_buf, sizeof(idx_buf), "%02d", idx);
+    const std::string prefix = g_dump_dir + "/test_" + idx_buf + "_";
+
+    std::vector<Data_t> c_ref(c_ref_d.size());
+    for (size_t i = 0; i < c_ref_d.size(); ++i)
+        c_ref[i] = saturate_cast<Data_t>(c_ref_d[i]);
+
+    write_hex_file(prefix + "a.hex", a);
+    write_hex_file(prefix + "b.hex", b);
+    write_hex_file(prefix + "c.hex", c_ref);
+
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %s\n",
+                 idx, size, op_code, outer, a_inc, b_inc,
+                 sanitize_label(label).c_str());
+    std::printf("[DUMP] test_%02d  %-30s  size=%u op=%u outer=%u a_inc=%u b_inc=%u\n",
+                idx, label, size, op_code, outer, a_inc, b_inc);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // RunTest — random values across a range that includes overflow.
 // Tolerance: 1 LSB for ap_fixed types; relative 1e-5 for float/double.
 // ---------------------------------------------------------------------------
@@ -81,6 +166,13 @@ static bool RunTest(Op op, const char* opName, unsigned size, unsigned seed) {
         c[i]     = Data_t(0);
         c_ref[i] = ref_op(op, static_cast<double>(a[i]),
                                static_cast<double>(b[i]));
+    }
+
+    if (!g_dump_dir.empty()) {
+        dump_one_case(opName, size, static_cast<unsigned>(op),
+                      /*outer*/ 1u, /*a_inc*/ 0u, /*b_inc*/ 0u,
+                      a, b, c_ref);
+        return true;
     }
 
     VectorOPKernel(a.data(), b.data(), c.data(), size, static_cast<unsigned>(op), 1u, 0u, 0u);
@@ -137,12 +229,20 @@ static bool RunSatTest(Op op, double a_val, double b_val, const char* desc) {
     std::vector<Data_t> b(kSize, Data_t(b_val));
     std::vector<Data_t> c(kSize, Data_t(0));
 
-    VectorOPKernel(a.data(), b.data(), c.data(), kSize, static_cast<unsigned>(op), 1u, 0u, 0u);
-
     // Reference uses the same saturate-cast semantics as the kernel.
     const double expected = ref_op(op,
                                    static_cast<double>(Data_t(a_val)),
                                    static_cast<double>(Data_t(b_val)));
+
+    if (!g_dump_dir.empty()) {
+        std::vector<double> c_ref(kSize, expected);
+        dump_one_case(desc, kSize, static_cast<unsigned>(op),
+                      /*outer*/ 1u, /*a_inc*/ 0u, /*b_inc*/ 0u,
+                      a, b, c_ref);
+        return true;
+    }
+
+    VectorOPKernel(a.data(), b.data(), c.data(), kSize, static_cast<unsigned>(op), 1u, 0u, 0u);
 
     bool ok = true;
     for (unsigned i = 0; i < kSize; ++i) {
@@ -379,7 +479,12 @@ static bool RunAllTests() {
     }
 
     allPassed &= RunSatTests();
-    allPassed &= RunBroadcastTests();
+    if (g_dump_dir.empty()) {
+        // Broadcast tests stage their own constants and call the kernel
+        // inline; they're skipped in dump mode.  The HDL testbench can
+        // exercise broadcasting via the random/saturation fixtures.
+        allPassed &= RunBroadcastTests();
+    }
 
     const unsigned nTotal = nRandom + sizeof(kSatTests) / sizeof(kSatTests[0]) + 2u;
     std::cout << "\n"
@@ -390,9 +495,49 @@ static bool RunAllTests() {
 }
 
 int main(int argc, char** argv) {
-    if (argc == 3) {
-        const unsigned opCode = std::stoul(argv[1]);
-        const unsigned size   = std::stoul(argv[2]);
+    // Optional --dump-data <dir>: emit per-test a/b/c_ref hex files plus a
+    // manifest, then exit (no kernel run).  Otherwise: original verify mode.
+    std::vector<const char*> rest;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a(argv[i]);
+        if ((a == "--dump-data" || a == "-d") && i + 1 < argc) {
+            g_dump_dir = argv[++i];
+        } else if (a == "--help" || a == "-h") {
+            std::cout << "Usage: " << argv[0]
+                      << " [--dump-data <dir>] [op size]\n"
+                      << "  No arguments: full verify suite.\n"
+                      << "  --dump-data <dir>: write hex fixtures + manifest "
+                         "and exit.\n"
+                      << "  op size: single random test "
+                         "(op: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6).\n";
+            return 0;
+        } else {
+            rest.push_back(argv[i]);
+        }
+    }
+
+    if (!g_dump_dir.empty()) {
+        const std::string manifest_path = g_dump_dir + "/manifest.txt";
+        g_manifest = std::fopen(manifest_path.c_str(), "w");
+        if (!g_manifest) {
+            std::cerr << "Failed to open " << manifest_path << " for writing\n";
+            return 1;
+        }
+        std::fprintf(g_manifest,
+            "# VectorOPKernel test fixture manifest\n"
+            "# idx size op outer a_inc b_inc label\n");
+
+        std::cout << "VectorOP test data dump → " << g_dump_dir << "\n";
+        const bool ok = RunAllTests();
+        std::fclose(g_manifest);
+        g_manifest = nullptr;
+        std::cout << "Dumped " << g_test_idx << " test(s) to " << g_dump_dir << "\n";
+        return ok ? 0 : 1;
+    }
+
+    if (rest.size() == 2) {
+        const unsigned opCode = std::stoul(rest[0]);
+        const unsigned size   = std::stoul(rest[1]);
         const unsigned nOps   = sizeof(kOps) / sizeof(kOps[0]);
         if (opCode >= nOps) {
             std::cerr << "op must be 0–" << (nOps - 1) << "\n";
@@ -404,11 +549,9 @@ int main(int argc, char** argv) {
         std::cout << (ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     }
-    if (argc != 1) {
-        std::cerr << "Usage: " << argv[0] << " [op size]\n"
-                  << "  No arguments: full suite.\n"
-                  << "  op size: single random test "
-                     "(op: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6).\n";
+    if (!rest.empty()) {
+        std::cerr << "Usage: " << argv[0]
+                  << " [--dump-data <dir>] [op size]\n";
         return 1;
     }
     return RunAllTests() ? 0 : 1;

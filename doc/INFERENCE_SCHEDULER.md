@@ -10,7 +10,9 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 > [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md)
 > and
 > [`inference-scheduler/doc/ARCHITECTURE.md`](../inference-scheduler/doc/ARCHITECTURE.md).
-> This file provides a quick orientation.
+> This file provides a quick orientation. For the DAG / event-stream /
+> liveness / slot-coloring algorithms in detail, see
+> [`SCHEDULER_DAG.md`](../inference-scheduler/doc/SCHEDULER_DAG.md).
 
 ---
 
@@ -47,11 +49,12 @@ python3 -m venv .venv
 .venv/bin/python test/gen_pool_models.py
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
+.venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
 
-# Run the full test suite (897 tests)
+# Run the full test suite
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -70,10 +73,13 @@ inference_scheduler.py          CLI, argument parsing
     │                           ConvNode       (ConvKernel)
     │                           PoolNode       (PoolingKernel)
     │                           ReshapeNode    (buffer alias)
+    ├── schedule.py Dag         data-flow DAG: predecessors, successors,
+    │                           topological order, independent pairs
     └── codegen/    CodeGenerator
-                    _core.py    tensor layout + DMA pool sizing
+                    _core.py    event stream, tensor layout, DMA pool sizing,
+                                event-stream liveness intervals
                     _header.py  include/inference.h
-                    _source.py  src/inference.c  (weights, init, run)
+                    _source.py  src/inference.c  (weights, init, run, kernel_wait)
                     _simulate.py  fixed-point forward simulation
                     _test.py    test/test_inference.c  (on-device smoke test)
                     _cmake.py   CMakeLists.txt
@@ -91,24 +97,55 @@ inference_scheduler.py          CLI, argument parsing
 ### Key data flow
 
 ```
-model.onnx  →  OnnxGraph  →  CodeGenerator  →  C project
-                                 │
-                    ┌────────────┤
-                    │            │
-               TensorLayout   emit:
-               (alloc sizes,   run_op()    VectorOPKernel calls
-                strides,       run_matmul() MatmulKernel calls
-                n_chunks)      run_conv()   ConvKernel calls
-                               run_pool()   PoolingKernel calls
+model.onnx  →  OnnxGraph  →  Dag  →  CodeGenerator  →  C project
+                                          │
+                       ┌──────────────────┼──────────────────┐
+                       │                  │                  │
+                  event stream      tensor layout         emit:
+                  (Start/Wait      (alloc sizes,         run_*()      Start kernel
+                   per node)        strides,             kernel_wait  Block on lane
+                                    pool slots from
+                                    event-stream
+                                    liveness intervals)
 ```
+
+### Parallel kernel execution
+
+Each hardware lane (`Conv`, `Pool`, `Matmul`, `VectorOP`) is a single IP
+on the FPGA, and the codegen overlaps work across **different** lanes.
+The `run_*()` helpers are non-blocking — they program AXI-Lite
+registers, call `XKernel_Start()`, and return. Synchronisation is a
+single weak-symbol primitive emitted into the generated source:
+
+```c
+typedef enum { KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL,
+               KERNEL_COUNT } kernel_id_t;
+__attribute__((weak))
+void kernel_wait(kernel_id_t k);   /* default: poll IsDone */
+```
+
+Override at link time to swap in IRQ-driven waiting (UIO/Linux,
+GIC/bare-metal) without touching the generated code.
+
+`inference_run()` emits a `kernel_wait` only when (a) some predecessor
+is still in flight on its lane, or (b) the target lane has a different
+op pending. Predecessor analysis walks **through** ReshapeNode chains
+to reach the real producing kernel, so a `Pool → Squeeze → MatMul`
+chain still drains the Pool lane before MatMul reads the alias.
 
 ### DMA buffer management
 
 - All buffers allocated in `inference_init()` from a contiguous DMA pool.
 - `Reshape` output buffers are pointer-assigned (= source), never independently allocated.
-- `inference_run()` flushes all graph inputs to DDR at the top, invalidates all
-  graph outputs at the bottom. Internal intermediate buffers are never synced —
-  the PL kernels access DDR directly via their AXI master ports.
+- Pool slots are coloured by **event-stream liveness intervals**: a tensor
+  is live from its producer's Start event until the latest `kernel_wait`
+  that drains a consumer's lane (consumers reached via Reshape aliases
+  count). Two tensors share a slot only if their event intervals are
+  strictly disjoint — necessary for correctness under cross-lane parallelism.
+- `inference_run()` flushes all graph inputs to DDR at the top, drains
+  every still-pending lane, and invalidates all graph outputs at the bottom.
+  Internal intermediate buffers are never synced — the PL kernels access
+  DDR directly via their AXI master ports.
 - Weights are synced once at init; they never change.
 
 ---

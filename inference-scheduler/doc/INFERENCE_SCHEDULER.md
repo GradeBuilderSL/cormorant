@@ -20,8 +20,10 @@ per-layer execution loop — all without any Python or ONNX runtime on the targe
 8. [Large Tensor Handling](#8-large-tensor-handling)
 9. [Building the Generated Project](#9-building-the-generated-project)
 10. [Running Tests](#10-running-tests)
+11. [Generated Report (`report.md`)](#11-generated-report-reportmd)
 
-**Related:** [Buffer Reuse — Live-Interval Optimisation](BUFFER_REUSE.md)
+**Related:** [Buffer Reuse — Live-Interval Optimisation](BUFFER_REUSE.md) ·
+[Scheduler DAG — Algorithm Reference](SCHEDULER_DAG.md)
 
 ---
 
@@ -181,6 +183,7 @@ python inference_scheduler.py <model.onnx> [options]
 | `--driver-dir DIR` | *(none)* | Copy XVectoropkernel driver sources from this path into `driver/`. If omitted, `driver/` is left empty with a README. |
 | `--embed-large-weights` | off | Inline all weight tensors as C arrays, even those exceeding the 4096-element threshold that would normally be written to external `.dat` files. |
 | `--embed-large-expected` | off | Inline all GT expected arrays in `test_inference.c` instead of writing them to `expected/*.dat` files. |
+| `--no-report` | off | Skip writing `report.md`. Default is to always emit a human-readable model summary alongside the C project — see [§11](#11-generated-report-reportmd). |
 
 ### Examples
 
@@ -220,6 +223,7 @@ Generated project:
   /tmp/single_add_inference/test/test_inference.c
   /tmp/single_add_inference/scripts/check_inference_setup.sh
   /tmp/single_add_inference/driver/
+  /tmp/single_add_inference/report.md
 ```
 
 ---
@@ -689,3 +693,107 @@ bundling, CMake build, and result comparison, reporting a PASSED/FAILED summary
 for each model.
 
 See **[doc/REMOTE_TESTING.md](REMOTE_TESTING.md)** for full setup and usage.
+
+---
+
+## 11. Generated Report (`report.md`)
+
+Every generated project includes a `report.md` file — a self-contained,
+human-readable summary of what the scheduler did with the input model.
+Disable with `--no-report`.
+
+The report opens with a metadata table (model basename, full path,
+SHA-256, timestamp, output directory, active dtype, hardware lanes
+used) followed by these sections:
+
+| Section | Contents |
+|---------|----------|
+| Inputs and outputs | Per-tensor shape, element count, byte count |
+| Parameters | Total weight tensors / parameters / bytes; inline-vs-external `.dat` split |
+| Weight quantization error *(fixed-point only)* | Per-weight `Max \|abs\|` / `NRMSE` / `SQNR (dB)`, with a "Used by" column linking each tensor to the consuming layer and role |
+| Activation memory | Pool slot count after coloring, total pool size, naive baseline, saving in elements/bytes/percent |
+| Hardware lanes | Per-lane usage check (`✓` / `–`) and node count |
+| Applied transformations | Gemm decomposition count, ReshapeNode folding count, buffer-pool reuse summary, cross-lane parallelism (overlapping starts / total starts) |
+| Layers | One row per `ScheduledNode` with op-specific notes (Conv: `k=⋯·s=⋯·p=⋯`, Pool: type+window, Matmul: shape sizes) plus, for fixed-point dtypes, per-layer truncation `Max \|abs\|` / `NRMSE` / `SQNR (dB)` |
+| Generated artifacts | Every file written for this run |
+
+### Quantization metrics
+
+For fixed-point dtypes (`ap_fixed<W,I>`), the report measures encoding
+quality with three magnitude-weighted residual statistics on each
+constant tensor and each kernel-bearing layer's output:
+
+- **`Max |abs|`** — absolute upper bound on the residual `r` between the
+  full-precision (float64) value and the value the kernel actually
+  reads/writes. Round-to-nearest weights are bounded by ½ LSB; floor-
+  truncation activations by 1 LSB.
+- **`NRMSE`** — normalised RMS error, `‖r‖₂ / ‖signal‖₂`, expressed as
+  a percentage. Magnitude-weighted, so a single near-zero element
+  rounding across zero cannot inflate it the way per-element max-
+  relative error does. This is the metric to track for end-to-end
+  accuracy impact.
+- **`SQNR (dB)`** — signal-to-quantisation-noise ratio,
+  `20·log₁₀(‖signal‖₂ / ‖r‖₂)`. Standard fixed-point quality metric;
+  higher is better. Round-to-nearest 16-bit on roughly-Gaussian
+  weights typically yields ≥ 60 dB; values below ~30 dB indicate
+  quantisation is starting to hurt accuracy.
+
+The Layers table includes the same three columns for activations.
+Layers whose output stays on the fixed-point grid (`Relu`, `MaxPool`,
+integer `Add`/`Sub`) report `0` residual and `∞` SQNR.
+
+For Float32 dtypes the quantisation columns and the weight-quant
+sub-section are omitted entirely.
+
+### Applied-transformations summary
+
+The transformations section enumerates everything the scheduler did to
+reshape the input graph before code generation:
+
+- **Gemm decomposition** count — Gemm nodes rewritten to `MatMul + Add`
+  by `OnnxGraph._preprocess_model`.
+- **Reshape folding** count — `ReshapeNode` outputs aliased to their
+  source buffer (no kernel call, no allocation).
+- **Buffer-pool reuse** — number of intermediates packed into how many
+  pool slots, with shared-slot pair count. See
+  [`BUFFER_REUSE.md`](BUFFER_REUSE.md) for the algorithm.
+- **Cross-lane parallelism** — `<X> of <N> kernel starts dispatched
+  while another lane was still in flight (overlap windows)`. Pulls
+  directly from the event stream computed by
+  `CodeGenerator._compute_event_stream`. See
+  [`SCHEDULER_DAG.md`](SCHEDULER_DAG.md) for what counts as overlap.
+
+### Sample
+
+A truncated fragment from the report for `parallel_two_chains.onnx`:
+
+```markdown
+| Field             | Value                                |
+|-------------------|--------------------------------------|
+| Model             | `parallel_two_chains.onnx`           |
+| Data type         | `ap_fixed<16,8>` (2 byte/elem)       |
+| Hardware lanes    | VectorOPKernel, ConvKernel, PoolKernel |
+
+…
+
+### Weight quantization error (vs original float32)
+
+| Tensor | Shape     | Elements | Used by           | Max |abs|  | NRMSE    | SQNR (dB) |
+|--------|-----------|----------|-------------------|------------|----------|-----------|
+| **All weights (worst)**       | -                 |`1.905e-03` | `0.417%` | `47.6 dB` |
+| `Wa`   | [4,4,1,1] | 16       | [0] Conv (weight) |`1.905e-03` | `0.417%` | `47.6 dB` |
+| `Wb`   | [4,4,1,1] | 16       | [3] Conv (weight) |`1.786e-03` | `0.408%` | `47.8 dB` |
+
+…
+
+| # | Op       | Lane             | Inputs     | Output | Notes | Out max |abs|| NRMSE    | SQNR (dB) |
+|---|----------|------------------|------------|--------|-------|--------------|----------|-----------|
+| 0 | `Conv`   | `ConvKernel`     | …          | `ca0`  | …     | `3.891e-03`  | `0.738%` | `42.6 dB` |
+| 1 | `Relu`   | `VectorOPKernel` | …          | `ca1`  | …     | `0.000e+00`  | `0.000%` | `∞`       |
+| 2 | `MaxPool`| `PoolKernel`     | …          | `ca2`  | …     | `0.000e+00`  | `0.000%` | `∞`       |
+```
+
+The report is regenerated on every scheduler run — there is no need
+to delete `report.md` before re-running. It can also be inspected
+without checking out the project: it's just markdown, viewable in any
+editor or git web UI.

@@ -315,7 +315,11 @@ by the scheduler setting `pool_h=in_h`, `pool_w=in_w`, `stride=1`, `pad=0`.
 │   └── inference_buf.c    DMA buffer alloc/sync (Linux XRT or bare-metal Xil)
 ├── test/test_inference.c  On-device smoke test: ramp fill → run → compare GT
 ├── scripts/check_inference_setup.sh
-└── driver/                Kernel driver sources (copied from HLS output)
+├── driver/                Kernel driver sources (copied from HLS output)
+└── report.md              Human-readable summary: model metadata, parameters,
+                           applied transformations, per-layer table, and (for
+                           fixed-point dtypes) per-tensor / per-layer
+                           quantization error
 ```
 
 ### Quick start
@@ -334,6 +338,28 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py path/to/model.onnx --out-dir /tmp/out \
     --driver-dir build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src
 ```
+
+### Report
+
+Every run also produces `report.md` in the output directory — a
+self-contained, human-readable summary covering the input model
+(name, SHA-256, dtype, lanes used), parameter count and storage
+breakdown, activation pool slot reuse, applied transformations
+(Gemm decomposition, Reshape folding, buffer reuse, cross-lane
+parallelism), and a full per-layer table. For fixed-point dtypes it
+adds per-tensor weight-quantization and per-layer activation-truncation
+metrics: `Max |abs|`, `NRMSE` (normalised RMS error), and
+`SQNR (dB)` — the standard signal-to-quantisation-noise figure.
+
+```bash
+.venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
+# → /tmp/out/report.md  (open in any markdown viewer)
+
+# Suppress with --no-report when scripting throwaway builds.
+```
+
+See [`inference-scheduler/doc/INFERENCE_SCHEDULER.md §11`](inference-scheduler/doc/INFERENCE_SCHEDULER.md#11-generated-report-reportmd)
+for the full layout and the quantization-metric definitions.
 
 ### Generated C API
 
@@ -624,6 +650,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 | `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
 | `demo/mnist/README.md` | End-to-end MNIST inference demo (download → generate → deploy → benchmark) |
 | `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
+| `doc/PROFILER.md` | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
 | `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
 | `doc/POOLING_KERNEL.md` | PoolingKernel architecture |
 | `doc/SIMULATION_ISSUES.md` | PS VIP simulation quirks and workarounds |

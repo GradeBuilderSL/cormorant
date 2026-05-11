@@ -51,14 +51,53 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tile sizes and window limits
+# Tile sizes and window limits — sourced from the platform JSON
+# (platforms/<AXI_PLATFORM>.json, "kernels.pool" object).  These are the
+# kernel's compile-time bounds: pool_h ≤ POOL_MAX_KH, line_buf rows ≥
+# (pool_h-1)*dil_h+1, etc.  See doc/POOL_OPTIMIZATION.md §4.
+#
+# No CACHE defaults — the JSON is the single source of truth so the C++
+# kernel build and the Python validator (inference-scheduler) cannot drift
+# apart.  To bump a value, edit the JSON; CMake re-reads on the next
+# configure.  pool_load_constants() below errors out if any field is
+# missing rather than silently defaulting.
 # ---------------------------------------------------------------------------
-set(POOL_TILE_C  8  CACHE STRING
-    "Channel tile (must be power-of-two; controls II=1 lane rotation depth)")
-set(POOL_MAX_KH  7  CACHE STRING
-    "Compile-time pool window height limit; models with pool_h > MAX_KH are rejected")
-set(POOL_MAX_KW  7  CACHE STRING
-    "Compile-time pool window width limit; models with pool_w > MAX_KW are rejected")
+function(pool_load_constants platform_json out_var_prefix)
+    if(NOT EXISTS "${platform_json}")
+        message(FATAL_ERROR
+            "PoolingKernel: platform file not found: ${platform_json}")
+    endif()
+    file(READ "${platform_json}" _pjson)
+    set(_keys "tile_c;max_kh;max_kw;max_line_buf_rows;max_line_buf_cols;ow_parallel")
+    set(_var_names "TILE_C;MAX_KH;MAX_KW;MAX_LINE_BUF_ROWS;MAX_LINE_BUF_COLS;OW_PARALLEL")
+    foreach(_k _vn IN ZIP_LISTS _keys _var_names)
+        string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels pool "${_k}")
+        if(_err)
+            message(FATAL_ERROR
+                "PoolingKernel: '${platform_json}' is missing "
+                "kernels.pool.${_k} (CMake error: ${_err})")
+        endif()
+        set("${out_var_prefix}_${_vn}" "${_val}" PARENT_SCOPE)
+    endforeach()
+endfunction()
+
+pool_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" POOL)
+message(STATUS "PoolingKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
+               "TILE_C=${POOL_TILE_C} MAX_KH=${POOL_MAX_KH} MAX_KW=${POOL_MAX_KW} "
+               "MAX_LINE_BUF_ROWS=${POOL_MAX_LINE_BUF_ROWS} "
+               "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS} "
+               "OW_PARALLEL=${POOL_OW_PARALLEL}")
+
+# Re-run cmake configure automatically if the platform JSON changes.  The
+# generated Config.h, the per-platform synth Config.h, and `make`-time
+# rebuilds all depend on JSON values; without this, edits would not
+# regenerate Config.h until the user reruns cmake by hand.
+set_property(DIRECTORY APPEND PROPERTY
+    CMAKE_CONFIGURE_DEPENDS "${AXI_DEFAULT_PLATFORM_JSON}")
+foreach(_PF IN LISTS AXI_PLATFORM_FILES)
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${_PF}")
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -143,11 +182,39 @@ target_compile_options(TestPoolingSim PRIVATE -Wall -Wextra -O2)
 enable_testing()
 add_test(NAME TestPoolingSim COMMAND TestPoolingSim)
 
+# ---------------------------------------------------------------------------
+# gen_pool_test_data — regenerate hex fixtures for the HDL testbench.
+#
+# Runs TestPoolingSim in --dump-data mode, writing per-test x/y_ref hex
+# files plus manifest.txt to ${CMAKE_BINARY_DIR}/pool_test_data/.  The
+# HDL testbench loads these via $readmemh, so HW-level tests stay
+# bit-identical to the C++ verification (same kSeed, same ref_pool_elem()
+# oracle).
+#
+# Requires the ap_fixed build (POOL_HAVE_APFIXED=ON via Vitis HLS headers).
+# ---------------------------------------------------------------------------
+set(POOL_TEST_DATA_DIR "${CMAKE_BINARY_DIR}/pool_test_data"
+    CACHE PATH "Output directory for PoolingKernel HDL testbench fixtures")
+
+if(_POOL_HAVE_HLS)
+    add_custom_target(gen_pool_test_data
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${POOL_TEST_DATA_DIR}"
+        COMMAND $<TARGET_FILE:TestPoolingSim> --dump-data "${POOL_TEST_DATA_DIR}"
+        DEPENDS TestPoolingSim
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Generating PoolingKernel HDL test fixtures → ${POOL_TEST_DATA_DIR}"
+        VERBATIM)
+    message(STATUS "PoolingKernel: gen_pool_test_data → ${POOL_TEST_DATA_DIR}")
+endif()
+
 message(STATUS "PoolingKernel: targets — pool_kernel, pool_kernel_float, TestPoolingSim")
 message(STATUS "PoolingKernel: Data_t=${POOL_DATA_TYPE}  "
                "AccData_t=${POOL_ACC_DATA_TYPE}  "
                "TILE_C=${POOL_TILE_C}  "
-               "MAX_KH=${POOL_MAX_KH}  MAX_KW=${POOL_MAX_KW}")
+               "MAX_KH=${POOL_MAX_KH}  MAX_KW=${POOL_MAX_KW}  "
+               "MAX_LINE_BUF_ROWS=${POOL_MAX_LINE_BUF_ROWS}  "
+               "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS}  "
+               "OW_PARALLEL=${POOL_OW_PARALLEL}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
@@ -207,11 +274,31 @@ if(POOL_VITIS_HLS)
         set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
         file(MAKE_DIRECTORY "${_p_build_dir}")
 
-        # Generate a platform-specific Config.h using the main type settings.
+        # Per-platform pool constants — drives this platform's Config.h
+        # rather than the C-sim default values, so each synthesised IP
+        # uses bounds tuned for that platform.  Stash the C-sim defaults
+        # so we can restore them after configure_file().
+        set(_save_TILE_C            "${POOL_TILE_C}")
+        set(_save_MAX_KH            "${POOL_MAX_KH}")
+        set(_save_MAX_KW            "${POOL_MAX_KW}")
+        set(_save_MAX_LINE_BUF_ROWS "${POOL_MAX_LINE_BUF_ROWS}")
+        set(_save_MAX_LINE_BUF_COLS "${POOL_MAX_LINE_BUF_COLS}")
+        set(_save_OW_PARALLEL       "${POOL_OW_PARALLEL}")
+
+        pool_load_constants("${_POOL_PLATFORM_FILE}" POOL)
+
+        # Generate a platform-specific Config.h using these constants.
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/include/Config.h.in"
             "${_p_build_dir}/Config.h"
             @ONLY)
+
+        set(POOL_TILE_C            "${_save_TILE_C}")
+        set(POOL_MAX_KH            "${_save_MAX_KH}")
+        set(POOL_MAX_KW            "${_save_MAX_KW}")
+        set(POOL_MAX_LINE_BUF_ROWS "${_save_MAX_LINE_BUF_ROWS}")
+        set(POOL_MAX_LINE_BUF_COLS "${_save_MAX_LINE_BUF_COLS}")
+        set(POOL_OW_PARALLEL       "${_save_OW_PARALLEL}")
 
         if(_p_board)
             set(POOL_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")

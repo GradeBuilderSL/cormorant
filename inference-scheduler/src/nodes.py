@@ -107,7 +107,13 @@ _ONNX_OP_MAP = {
 
 # Public sets used by graph.py to build a comprehensive "supported ops" list.
 VECTOROP_OP_TYPES: frozenset = frozenset(_ONNX_OP_MAP)
-RESHAPE_OP_TYPES: frozenset = frozenset({"Reshape", "Squeeze", "Unsqueeze", "Dropout"})
+RESHAPE_OP_TYPES: frozenset = frozenset({
+    "Reshape",
+    "Squeeze",
+    "Unsqueeze",
+    "Dropout",
+    "Flatten",   # axis-N split is irrelevant for a buffer alias — same numel
+})
 
 # ------------------------------------------------------------------ #
 # Alignment constants                                                 #
@@ -1140,6 +1146,22 @@ POOL_OP_TYPES = frozenset({
 }) | _GLOBAL_POOL_OP_TYPES
 
 
+# ---------------------------------------------------------------------------
+# Hardware-side bounds — re-exported here for callers that import them from
+# `nodes`, but the source of truth is the C++ CMake configuration.  The
+# resolver in `_pool_hw_config` parses kernels/pool/CMakeLists.txt for the
+# `set(POOL_<NAME> <N> CACHE ...)` defaults and overlays any active
+# build/CMakeCache.txt overrides, so `cmake -DPOOL_MAX_KH=...` flows through
+# to this validator without manual edits.  See doc/POOL_OPTIMIZATION.md §4.
+# ---------------------------------------------------------------------------
+from ._pool_hw_config import (
+    POOL_MAX_KH,
+    POOL_MAX_KW,
+    POOL_MAX_LINE_BUF_ROWS,
+    POOL_MAX_LINE_BUF_COLS,
+)
+
+
 @dataclass
 class PoolNode:
     """One ONNX pooling operator mapped to one XPoolingkernel invocation.
@@ -1346,6 +1368,54 @@ class PoolNode:
 
         # AveragePool / GlobalAveragePool: count_include_pad (default 0)
         cip_val = _int("count_include_pad", 0) if pool_type_val == POOL_AVG else 0
+
+        # ------------------------------------------------------------------
+        # Hardware-bound validation — see _pool_hw_config for where these
+        # constants come from (kernels/pool/CMakeLists.txt + optional
+        # build/CMakeCache.txt overrides).  PoolingKernel sizes line_buf
+        # and the unrolled per-position adders at compile time, so a
+        # window violating any of these bounds has no runtime fallback —
+        # reject at parse time rather than emit code the kernel can't
+        # service.  See doc/POOL_OPTIMIZATION.md §4 for the constraint
+        # rationale (vertical span / horizontal span fit the line buffer;
+        # pool window fits the bounded reducer adder tree).
+        # ------------------------------------------------------------------
+        node_label = node.name or op_type
+        if pool_h_val > POOL_MAX_KH:
+            raise SchedulerError(
+                f"Pool node '{node_label}' ({op_type}): pool_h={pool_h_val} "
+                f"exceeds PoolingKernel's compile-time limit "
+                f"kMaxPoolH={POOL_MAX_KH}.  Increase POOL_MAX_KH in "
+                f"kernels/pool/CMakeLists.txt (and rebuild) to support a "
+                f"taller window."
+            )
+        if pool_w_val > POOL_MAX_KW:
+            raise SchedulerError(
+                f"Pool node '{node_label}' ({op_type}): pool_w={pool_w_val} "
+                f"exceeds PoolingKernel's compile-time limit "
+                f"kMaxPoolW={POOL_MAX_KW}.  Increase POOL_MAX_KW in "
+                f"kernels/pool/CMakeLists.txt (and rebuild) to support a "
+                f"wider window."
+            )
+        v_span = (pool_h_val - 1) * dil_h_val + 1
+        if v_span > POOL_MAX_LINE_BUF_ROWS:
+            raise SchedulerError(
+                f"Pool node '{node_label}' ({op_type}): dilated vertical "
+                f"span (pool_h-1)*dil_h + 1 = ({pool_h_val}-1)*{dil_h_val} "
+                f"+ 1 = {v_span} exceeds line-buffer row capacity "
+                f"kMaxLineBufRows={POOL_MAX_LINE_BUF_ROWS}.  Reduce dil_h "
+                f"or raise POOL_MAX_LINE_BUF_ROWS (must remain a power of 2)."
+            )
+        h_span = (pool_w_val - 1) * dil_w_val + 1
+        if h_span > POOL_MAX_LINE_BUF_COLS:
+            raise SchedulerError(
+                f"Pool node '{node_label}' ({op_type}): dilated horizontal "
+                f"span (pool_w-1)*dil_w + 1 = ({pool_w_val}-1)*{dil_w_val} "
+                f"+ 1 = {h_span} exceeds line-buffer column capacity "
+                f"kMaxLineBufCols={POOL_MAX_LINE_BUF_COLS} (a single pool "
+                f"window must fit horizontally in the line buffer).  Reduce "
+                f"dil_w or raise POOL_MAX_LINE_BUF_COLS."
+            )
 
         return cls(
             onnx_node=node,

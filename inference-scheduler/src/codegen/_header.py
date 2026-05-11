@@ -317,6 +317,25 @@ class _HeaderMixin:
         lines.append("void inference_deinit(void);")
         lines.append("")
 
+        # Per-layer profiling introspection — exposes the layer-name table
+        # baked into inference.c.  The host benchmark feeds these into
+        # inference_prof_init() when INFERENCE_PROFILING is enabled.
+        n_layers = len(self._layer_display_names())
+        lines.append(_banner("Per-layer profiling introspection"))
+        lines.append(
+            "/*\n"
+            " * Number of profileable layers in this model — one entry per\n"
+            " * scheduled ONNX node (ReshapeNode aliases included; they record\n"
+            " * count=0 because they emit no kernel call).  Use the accessors\n"
+            " * below to feed inference_prof_init() at runtime.\n"
+            " */"
+        )
+        lines.append(f"#define INFERENCE_NUM_LAYERS  {n_layers}u")
+        lines.append("")
+        lines.append("unsigned             inference_num_layers(void);")
+        lines.append("const char *const   *inference_layer_names_ptr(void);")
+        lines.append("")
+
         # inference_run()
         params = []
         for t in inputs:

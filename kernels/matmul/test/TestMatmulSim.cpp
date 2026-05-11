@@ -36,14 +36,28 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "MatmulKernel.h"
+
+// ---------------------------------------------------------------------------
+// --dump-data <dir> mode: instead of running MatmulKernel and comparing,
+// dump the per-test A/B/C_ref tensors to hex files (one 16-bit value per
+// line, suitable for $readmemh).  A manifest.txt indexes every test with
+// its geometry so an HDL testbench can load the same fixtures.  RNG state
+// is shared with verify mode (same seed, same draw order).
+// ---------------------------------------------------------------------------
+static std::string g_dump_dir;     // empty → verify mode (default)
+static int         g_test_idx = 0;
+static FILE*       g_manifest = nullptr;
 
 // ---------------------------------------------------------------------------
 // Scalar limits for Data_t (derived via saturate_cast, same trick as
@@ -100,6 +114,71 @@ static void ref_matmul_batch(
         ref_matmul_2d(a + bi * a_stride, b + bi * b_stride, c + bi * c_stride,
                       n, k, m);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dump-mode helpers (only meaningful for fixed-point builds — the HDL
+// testbench reads 16-bit hex values one per line).
+// ---------------------------------------------------------------------------
+#ifdef MATMUL_HAVE_APFIXED
+static uint16_t data_to_raw16(const Data_t& v) {
+    return static_cast<uint16_t>(v.range().to_uint());
+}
+
+static void write_hex_file(const std::string& path,
+                           const std::vector<Data_t>& vec) {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
+        std::exit(1);
+    }
+    for (const auto& v : vec)
+        std::fprintf(f, "%04x\n", data_to_raw16(v));
+    std::fclose(f);
+}
+#endif
+
+static std::string sanitize_label(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '_' || c == '-') out.push_back(c);
+        else                                          out.push_back('_');
+    }
+    return out;
+}
+
+// Write A/B/C_ref hex files and a manifest row for one test case.
+static void dump_one_case(const char* label,
+                          unsigned n, unsigned k, unsigned m,
+                          unsigned batch,
+                          unsigned a_stride, unsigned b_stride,
+                          const std::vector<Data_t>& a,
+                          const std::vector<Data_t>& b,
+                          const std::vector<Data_t>& c_ref) {
+#ifndef MATMUL_HAVE_APFIXED
+    (void)label; (void)n; (void)k; (void)m;
+    (void)batch; (void)a_stride; (void)b_stride;
+    (void)a; (void)b; (void)c_ref;
+    std::fprintf(stderr, "--dump-data requires MATMUL_HAVE_APFIXED build\n");
+    std::exit(1);
+#else
+    const int idx = g_test_idx++;
+    char idx_buf[16];
+    std::snprintf(idx_buf, sizeof(idx_buf), "%02d", idx);
+    const std::string prefix = g_dump_dir + "/test_" + idx_buf + "_";
+
+    write_hex_file(prefix + "a.hex", a);
+    write_hex_file(prefix + "b.hex", b);
+    write_hex_file(prefix + "c.hex", c_ref);
+
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %s\n",
+                 idx, n, k, m, batch, a_stride, b_stride,
+                 sanitize_label(label).c_str());
+    std::printf("[DUMP] test_%02d  %-50s  N=%u K=%u M=%u batch=%u\n",
+                idx, label, n, k, m, batch);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +248,14 @@ static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
     for (auto& v : B) v = Data_t(dist(rng));
 
     ref_matmul_2d   (A.data(), B.data(), C_ref.data(), n, k, m);
+
+    if (!g_dump_dir.empty()) {
+        dump_one_case(label, n, k, m, /*batch*/1u,
+                      /*a_stride*/ n * k, /*b_stride*/ k * m,
+                      A, B, C_ref);
+        return true;
+    }
+
     MatmulKernel    (A.data(), B.data(), C_got.data(),
                      n, k, m,
                      /*batch=*/1,
@@ -201,6 +288,13 @@ static bool RunTestBatch(const char* label,
 
     ref_matmul_batch(A.data(), B.data(), C_ref.data(),
                      n, k, m, batch, a_stride, b_stride, c_stride);
+
+    if (!g_dump_dir.empty()) {
+        dump_one_case(label, n, k, m, batch, a_stride, b_stride,
+                      A, B, C_ref);
+        return true;
+    }
+
     MatmulKernel    (A.data(), B.data(), C_got.data(),
                      n, k, m, batch, a_stride, b_stride, c_stride);
 
@@ -228,6 +322,14 @@ static bool RunTestSaturation(const char* label,
     std::vector<Data_t> C_got(N * M, Data_t(0));
 
     ref_matmul_2d(A.data(), B.data(), C_ref.data(), N, k_sat, M);
+
+    if (!g_dump_dir.empty()) {
+        dump_one_case(label, N, k_sat, M, /*batch*/1u,
+                      /*a_stride*/ N * k_sat, /*b_stride*/ k_sat * M,
+                      A, B, C_ref);
+        return true;
+    }
+
     MatmulKernel (A.data(), B.data(), C_got.data(),
                   N, k_sat, M,
                   /*batch=*/1,
@@ -253,7 +355,32 @@ static bool RunTestSaturation(const char* label,
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-int main() {
+int main(int argc, char** argv) {
+    // Optional --dump-data <dir>: write per-test A/B/C_ref hex files plus a
+    // manifest, then exit (no kernel run).  Otherwise: original verify mode.
+    for (int i = 1; i < argc; ++i) {
+        const std::string a(argv[i]);
+        if ((a == "--dump-data" || a == "-d") && i + 1 < argc) {
+            g_dump_dir = argv[++i];
+        } else if (a == "--help" || a == "-h") {
+            std::printf("Usage: %s [--dump-data <dir>]\n", argv[0]);
+            return 0;
+        }
+    }
+
+    if (!g_dump_dir.empty()) {
+        const std::string manifest_path = g_dump_dir + "/manifest.txt";
+        g_manifest = std::fopen(manifest_path.c_str(), "w");
+        if (!g_manifest) {
+            std::fprintf(stderr, "Failed to open %s for writing\n",
+                         manifest_path.c_str());
+            return 1;
+        }
+        std::fprintf(g_manifest,
+            "# MatmulKernel test fixture manifest\n"
+            "# idx n k m batch a_stride b_stride label\n");
+    }
+
     bool all_ok = true;
     int  total  = 0;
     int  passed = 0;
@@ -369,6 +496,15 @@ int main() {
     // -----------------------------------------------------------------------
     // Summary
     // -----------------------------------------------------------------------
+    if (!g_dump_dir.empty()) {
+        if (g_manifest) {
+            std::fclose(g_manifest);
+            g_manifest = nullptr;
+        }
+        printf("\nDumped %d test(s) to %s\n", g_test_idx, g_dump_dir.c_str());
+        return 0;
+    }
+
     printf("\n%d/%d tests passed\n", passed, total);
     if (!all_ok) {
         printf("TestMatmulSim FAILED\n");

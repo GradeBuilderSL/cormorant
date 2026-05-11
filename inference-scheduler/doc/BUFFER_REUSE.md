@@ -502,15 +502,47 @@ opt_total = 2 × align_up(N × 64 × 112 × 112)
 The ratio `opt_total / naive_total ≈ 0.159` is independent of N, giving the
 consistent 84.1 % saving across all batch sizes.
 
-### Context: KV260 u-dma-buf Constraint
+### Context: KV260 DMA-pool sizing
 
-The KV260 platform allocates DMA-capable memory through the Linux
-[u-dma-buf](https://github.com/ikwzm/udmabuf) driver.  The driver requires a
-single contiguous physical region declared at boot time in the device-tree
-overlay.  This makes minimising the pool size critical:
+The KV260 has 4 GiB of PS-side DDR, so total DRAM is never the binding
+constraint.  What matters is the size of the **physically-contiguous**
+region from which the framework's DMA pool is carved — kernels access
+DDR by physical address through their AXI master ports and cannot
+follow Linux page tables.
 
-- **Without reuse, batch=1:** 27.3 MiB must be reserved at boot.
-- **With reuse, batch=1:** 11.1 MiB — fits within a 16 MiB u-dma-buf node with room to spare.
-- **Without reuse, batch=16:** 315.9 MiB — exceeds the 256 MiB region commonly
-  configured for the KV260 PS-side DDR.
-- **With reuse, batch=16:** 57.1 MiB — comfortably allocatable.
+The framework allocates DMA-capable memory through
+[u-dma-buf](https://github.com/ikwzm/udmabuf), which exposes one of
+two backing paths chosen at module-load / device-tree time:
+
+1. **CMA-backed (default).** `u_dma_buf` calls `dma_alloc_coherent()`,
+   which on ARM64 Linux pulls from the kernel's
+   [Contiguous Memory Allocator](https://www.kernel.org/doc/html/latest/admin-guide/mm/cma_debugfs.html).
+   The CMA pool size is set at boot via the
+   [`cma=N`](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)
+   kernel parameter (or the `CONFIG_CMA_SIZE_MBYTES` build default).
+   PetaLinux/Yocto images for the KV260 commonly default to a few
+   hundred MiB; lifting the cap only requires a kernel-cmdline change
+   and a reboot.
+2. **Reserved-memory region.** When the device-tree overlay points the
+   `u_dma_buf` node at a `reserved-memory` block (carved out via
+   `no-map` in DT), allocations come from that fixed region instead.
+   This is what the upstream
+   [`udmabuf` README](https://github.com/ikwzm/udmabuf#device-tree-overlay)
+   calls a "reserved memory area" device node.
+
+Either path can be sized to whatever the bitstream needs — there is no
+hardware-imposed cap of "16 MiB" or "256 MiB".  What pool reuse buys
+is **portability**: a smaller pool fits within typical default CMA
+sizes and modest DT reservations without anyone having to change boot
+parameters or re-flash a device tree.
+
+| Scenario | Naive pool | Reused pool | Practical implication |
+|----------|-----------:|------------:|-----------------------|
+| batch=1   | 27.3 MiB  | 11.1 MiB    | fits within a 16 MiB DT reservation; reuse is convenient but not strictly required |
+| batch=16  | 315.9 MiB | 57.1 MiB    | naive needs CMA / DT reservation enlarged past common defaults; reused fits within ~256 MiB |
+
+The numbers above are not a hardware ceiling — they describe how much
+*reconfiguration* the deployer would otherwise need to do.  Reuse is
+still worth it (it cuts DDR bandwidth pressure too, since there are
+fewer cache lines for the kernel's AXI master to chase), but the
+framing is "ergonomics" rather than "must fit or fails to allocate".

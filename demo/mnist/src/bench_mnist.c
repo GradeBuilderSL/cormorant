@@ -40,6 +40,8 @@
 #include <time.h>
 
 #include "inference.h"
+#include "inference_prof.h"
+#include "inference_ddr.h"
 #include "bench_glue.h"
 
 #ifndef BENCH_DATA_DIR
@@ -250,6 +252,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#if INFERENCE_PROFILING
+    /*
+     * Per-layer profiler + whole-run DDR PMU counters — both opt-in at
+     * compile time (cmake -DINFERENCE_PROFILING=ON).  DDR probing emits
+     * its own warning if the host has no PMU; we just continue.
+     */
+    if (inference_prof_init(inference_num_layers(),
+                            inference_layer_names_ptr()) != 0) {
+        fprintf(stderr, "warning: inference_prof_init failed; "
+                        "continuing without per-layer stats\n");
+    } else {
+        fprintf(stderr,
+                "bench_mnist: per-layer profiling ENABLED (%u layers)\n",
+                inference_num_layers());
+    }
+    (void)inference_ddr_init();   /* warns + degrades to "available:false" */
+#endif
+
     inference_buf_t *in_buf  = inference_buf_alloc(BENCH_INPUT_NUMEL);
     inference_buf_t *out_buf = inference_buf_alloc(BENCH_OUTPUT_NUMEL);
     if (!in_buf || !out_buf) {
@@ -281,9 +301,18 @@ int main(int argc, char **argv) {
     double t_start = now_ms();
     double t_timed_start = 0.0;
 
+#if INFERENCE_PROFILING
+    /* DDR counters span the same iterations as inference_prof — every
+     * kernel call, warmup included.  Latency stats below still drop the
+     * warmup window. */
+    inference_ddr_start();
+#endif
+
     for (unsigned i = 0; i < want_iters; ++i) {
         const uint8_t *pix = imgs.pixels + (size_t)i * BENCH_IMAGE_BYTES;
         encode_image(pix, in_ptr);
+
+        if (i == warmup) t_timed_start = now_ms();
 
         double t0 = now_ms();
         bench_inference_run(in_buf, out_buf);
@@ -292,7 +321,20 @@ int main(int argc, char **argv) {
         unsigned pred = argmax_class(out_ptr);
         if (pred == lbls.labels[i]) correct++;
 
-        if (i == warmup) t_timed_start = now_ms();
+#if INFERENCE_PROFILING
+        /* Sample the DDR counters once per inference so backends with
+         * narrow native counters (e.g. the 32-bit Xilinx APM byte
+         * counters) can fold deltas into a 64-bit total before the
+         * hardware wraps.  No-op if the active backend doesn't need
+         * sampling, or if init failed. */
+        inference_ddr_sample();
+#endif
+
+        /* Per-layer counters cover EVERY kernel call (warmup included) so
+         * each layer's `calls` field equals want_iters — i.e. one bump per
+         * input sample.  Per-image latency stats below still exclude the
+         * warmup window so mean/p50/p99 reflect steady-state behaviour. */
+
         if (i >= warmup) {
             latencies[timed_n++] = dt;
             t_total += dt;
@@ -319,6 +361,10 @@ int main(int argc, char **argv) {
     }
     (void)t_timed_start;
 
+#if INFERENCE_PROFILING
+    inference_ddr_stop();
+#endif
+
     qsort(latencies, timed_n, sizeof(double), cmp_double);
     double mean_ms = (timed_n > 0u) ? (t_total / (double)timed_n) : 0.0;
     double p50_ms  = (timed_n > 0u) ? latencies[timed_n / 2u]            : 0.0;
@@ -336,6 +382,18 @@ int main(int argc, char **argv) {
         "\"throughput_ips\":%.2f}\n",
         BENCH_MODEL_NAME, want_iters, warmup, timed_n,
         correct, acc, mean_ms, p50_ms, p99_ms, tput);
+
+#if INFERENCE_PROFILING
+    /* Two extra JSON lines, each prefixed with its own marker — the host
+     * parser keys off the marker to associate the stats with the model
+     * summary above.  DDR_JSON is emitted unconditionally; when no PMU
+     * was found it carries {"available":false,"reason":...} so the host
+     * still records why the counters are missing. */
+    inference_prof_dump_json(stdout);
+    inference_ddr_dump_json (stdout);
+    inference_prof_deinit();
+    inference_ddr_deinit();
+#endif
 
     free(latencies);
     free(imgs.pixels);

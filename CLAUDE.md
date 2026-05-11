@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AXI-stream vector operation IP core for Xilinx FPGAs, implemented in Vitis HLS. The kernel reads up to two equal-length element arrays, applies a runtime-selected element-wise operation, and writes the results to a third array. Six operations are supported (Add, Sub, Mul, Div, Relu, Relu6); the selector is a runtime AXI-Lite register. The vector length and element data type are also configurable at runtime and CMake configure time respectively.
 
-The repository also contains **`inference-scheduler/`**, a Python code-generator that parses an ONNX model and emits a self-contained C file that drives `VectorOPKernel` sequentially for every supported layer using the generated XVectoropkernel driver API and the Xil bare-metal library.
+The repository also contains **`inference-scheduler/`**, a Python code-generator that parses an ONNX model and emits a self-contained C project that drives all four hardware IPs (VectorOPKernel, MatmulKernel, ConvKernel, PoolingKernel) using the generated Xilinx driver APIs and the Xil bare-metal library. The codegen overlaps work across different kernel lanes — ops on distinct lanes (e.g. Conv ‖ Pool) run concurrently, with synchronisation funnelled through a single weak-symbol `kernel_wait()` primitive that defaults to polling but can be link-overridden for IRQ/UIO waiting. Pool-slot colouring uses event-stream liveness intervals so two tensors share a slot only when one is fully drained before the other's producer starts.
 
 ## Build System
 
@@ -52,10 +52,28 @@ make synthesize_vectorop_kv260
 
 ### Per-platform HLS synthesis
 
-Each `kernels/<kernel>/platforms/<name>.json` file defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.
+Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.  The top-level `AXI_PLATFORM` cache var (default `kv260`) also selects which platform's bounds drive the C-sim Config.h for each kernel.
 
 **Required JSON fields:** `part`
 **Optional JSON fields:** `board`, `clock` (default 300 MHz)
+
+**Per-kernel constants** live under `kernels.<kernel>` in the same JSON.  Today only `kernels.pool` is populated:
+
+```jsonc
+{
+  "part": "...", "clock": 300,
+  "kernels": {
+    "pool": {
+      "tile_c":            8,
+      "max_kh":            7,   "max_kw":            7,
+      "max_line_buf_rows": 16,  "max_line_buf_cols": 64,
+      "ow_parallel":       2
+    }
+  }
+}
+```
+
+The C++ build reads these via `string(JSON …)` (see `kernels/pool/CMakeLists.txt::pool_load_constants`) and the Python validator in `inference-scheduler/src/_pool_hw_config.py` reads the same file via `resolve(platform_name)` — single source of truth, no `set(POOL_* CACHE …)` defaults.  `CMAKE_CONFIGURE_DEPENDS` makes `make` auto-rerun cmake when the JSON changes.  See `doc/POOL_OPTIMIZATION.md` §4 for the full field reference and `inference-scheduler/CLAUDE.md` for the validation flow.
 
 Adding a new platform requires only a JSON file and a re-run of cmake.
 
@@ -89,7 +107,7 @@ HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
 - **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across multiple sizes plus saturation boundary cases. Tolerance: relative 1e-5 for FP, exact for integers.
 - **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
-- **`kernels/vectorop/platforms/kv260.json`** — KV260 Starter Kit platform config.
+- **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
 ### Inference Scheduler
 
@@ -129,9 +147,10 @@ Key source files:
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
 - **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `PoolNode`, `ReshapeNode`
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations
+- **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (predecessors, topological order, independent pairs)
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake)
 
-See `doc/INFERENCE_SCHEDULER.md` for the full technical reference.
+See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
 
 ### HLS Pragmas Used
 

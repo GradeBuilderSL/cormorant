@@ -44,6 +44,7 @@ from src.codegen          import CodeGenerator
 from src.codegen._simulate import LARGE_EXPECTED_THRESHOLD
 from src.kernels           import KERNEL_REGISTRY, mixed_driver_readme
 from src.nodes            import SchedulerError
+from src.report           import ReportGenerator
 from src.tensor           import LARGE_WEIGHT_THRESHOLD
 
 
@@ -109,6 +110,12 @@ def parse_args(argv=None):
             f"would normally be written to external expected/*.dat files. "
             f"Produces a larger but fully self-contained test file."
         ),
+    )
+    p.add_argument(
+        "--no-report",
+        action="store_true",
+        default=False,
+        help="Skip writing report.md (the human-readable model summary).",
     )
     return p.parse_args(argv)
 
@@ -213,6 +220,25 @@ def main(argv=None):
     _write(os.path.join(out_dir, "test",    "test_inference.c"), test_src)
 
     # ---------------------------------------------------------------- #
+    # 5a. Runtime helper sources (static templates copied verbatim)     #
+    # ---------------------------------------------------------------- #
+    runtime_src = os.path.join(os.path.dirname(__file__), "runtime")
+    runtime_files = [
+        ("inference_prof.h",         os.path.join("include", "inference_prof.h")),
+        ("inference_prof.c",         os.path.join("src",     "inference_prof.c")),
+        ("inference_ddr.h",          os.path.join("include", "inference_ddr.h")),
+        ("inference_ddr.c",          os.path.join("src",     "inference_ddr.c")),
+        ("inference_ddr_backend.h",  os.path.join("src",     "inference_ddr_backend.h")),
+        # DDR backends — one .c per platform under src/ddr/.
+        ("ddr/zuplus_apm.c",         os.path.join("src", "ddr", "zuplus_apm.c")),
+    ]
+    for src_name, rel_dst in runtime_files:
+        sp = os.path.join(runtime_src, src_name)
+        dp = os.path.join(out_dir,    rel_dst)
+        os.makedirs(os.path.dirname(dp), exist_ok=True)
+        shutil.copy2(sp, dp)
+
+    # ---------------------------------------------------------------- #
     # 5b. External weight .dat files (large tensors)                    #
     # ---------------------------------------------------------------- #
     large_weights = gen.large_weight_tensors
@@ -285,15 +311,20 @@ def main(argv=None):
               file=sys.stderr)
 
     # ---------------------------------------------------------------- #
-    # 7. Report                                                         #
+    # 7. Generated-files summary on stderr                              #
     # ---------------------------------------------------------------- #
     print("", file=sys.stderr)
     print("Generated project:", file=sys.stderr)
     report_items = [
         "CMakeLists.txt",
         "include/inference.h",
+        "include/inference_prof.h",
+        "include/inference_ddr.h",
         "src/inference.c",
         "src/inference_buf.c",
+        "src/inference_prof.c",
+        "src/inference_ddr.c",
+        "src/ddr/",
         "test/test_inference.c",
         "scripts/check_inference_setup.sh",
         "driver/",
@@ -302,6 +333,25 @@ def main(argv=None):
         report_items.append("weights/")
     if large_expected:
         report_items.append("expected/")
+
+    # ---------------------------------------------------------------- #
+    # 8. Markdown report (model summary, transformations, layers)      #
+    # ---------------------------------------------------------------- #
+    if not args.no_report:
+        report_items.append("report.md")
+        try:
+            md = ReportGenerator(
+                graph=graph, codegen=gen,
+                model_path=args.model, out_dir=out_dir,
+                generated_files=report_items,
+            ).render_markdown()
+            _write(os.path.join(out_dir, "report.md"), md)
+        except Exception as e:
+            # The report is informational; never let a formatting bug
+            # break a successful project generation.
+            print(f"warning: report.md not written ({e})", file=sys.stderr)
+            report_items.remove("report.md")
+
     for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)
 

@@ -48,7 +48,16 @@
     "use_sudo": true,
     "iters": 0,
     "_iters_note": "Number of test images per benchmark run. 0 = use all 10 000 from the MNIST test set.",
-    "warmup": 50
+    "warmup": 50,
+    "profile_layers": false,
+    "_profile_layers_note": "Enable per-layer wall-clock stats. Cross-build adds -DINFERENCE_PROFILING=ON; bench_mnist appends a 'LAYERS_JSON: {...}' line that lands under metrics.layer_stats in build/results.json. Override per-run with deploy_and_run.py --profile-layers.",
+
+    "env": {
+      "_comment": "Per-run environment variables forwarded to bench_mnist on the board (via `env K=V ./bench_mnist ...`, after sudo). Used to tune the inference_ddr backend without recompiling.",
+      "_INFERENCE_DDR_APM_BASE":  "Override the APM base address (default 0xFD490000 = ZU+ DDR APM)",
+      "_INFERENCE_DDR_APM_SLOTS": "Comma-separated DDRC port slots to monitor, up to 5 (e.g. \"3,4\"; default \"0\")",
+      "_INFERENCE_DDR_BACKEND":   "Force a specific backend, or 'disabled' to skip DDR sampling"
+    }
   },
 
   "models": [

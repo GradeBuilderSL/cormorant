@@ -46,6 +46,9 @@ def main(argv=None) -> int:
                    help="re-download even if cached files exist")
     p.add_argument("--check-only", action="store_true",
                    help="run preflight checks for every stage and exit")
+    p.add_argument("--profile-layers", action="store_true",
+                   help="forward --profile-layers to deploy_and_run.py "
+                        "(per-layer wall-clock stats)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
 
@@ -78,6 +81,8 @@ def main(argv=None) -> int:
             cmd.append("--verbose")
         if args.check_only:
             cmd.append("--check-only")
+        if args.profile_layers:
+            cmd.append("--profile-layers")
         rc = _run("deploy_and_run", cmd)
         if rc != 0:
             return rc
