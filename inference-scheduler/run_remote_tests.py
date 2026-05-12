@@ -45,7 +45,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -487,7 +487,7 @@ def _step_print(model: str, step: str, msg: str) -> None:
 def _step_done(ok: bool, dur: float, extra: str = "") -> None:
     tag   = _green("OK")  if ok else _red("FAIL")
     extra = f"  {_dim(extra)}" if extra else ""
-    print(f"\r  \033[K  " + " " * 40 +  # clear line
+    print("\r  \033[K  " + " " * 40 +  # clear line
           f"  → {tag}  {dur:.1f}s{extra}")
 
 
@@ -637,7 +637,7 @@ def main(argv=None) -> int:
                         (s for s in result.steps if s.name == "run"), None
                     )
                     if run_step and run_step.output.strip():
-                        print(f"    ─── run output ───")
+                        print("    ─── run output ───")
                         for line in run_step.output.strip().splitlines():
                             print(f"    {_dim(line)}")
                         print()
