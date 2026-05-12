@@ -20,7 +20,6 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_pool_models.py
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
-.venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 
 # Run all tests
 .venv/bin/python -m pytest test/ -v
