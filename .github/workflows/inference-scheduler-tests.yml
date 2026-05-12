@@ -1,0 +1,58 @@
+name: inference-scheduler tests
+
+# Cheap, no-hardware checks for the Python code generator.  Runs on GitHub's
+# free hosted Ubuntu runners — no Vitis HLS, no FPGA tools, no self-hosted
+# infra needed.  Heavier kernel verification (HLS synthesis, RTL behavior,
+# on-device tests) belongs in separate workflows targeting self-hosted
+# runners.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'inference-scheduler/**'
+      - 'platforms/**'
+      - '.github/workflows/inference-scheduler-tests.yml'
+  pull_request:
+    paths:
+      - 'inference-scheduler/**'
+      - 'platforms/**'
+      - '.github/workflows/inference-scheduler-tests.yml'
+  workflow_dispatch:
+
+# Cancel an in-flight run when a newer commit lands on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12']
+    defaults:
+      run:
+        working-directory: inference-scheduler
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: inference-scheduler/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate test ONNX models
+        # All gen_*_models.py invocations bundled — see test/gen_all_models.py.
+        run: python test/gen_all_models.py
+
+      - name: Run pytest
+        run: python -m pytest test/ -v --tb=short
