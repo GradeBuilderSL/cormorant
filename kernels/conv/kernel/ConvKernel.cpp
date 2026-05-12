@@ -9,12 +9,13 @@
 // Top-level dataflow (HLS DATAFLOW):
 //
 //   ConvKernel
-//     bias_producer           ──bias_stream──►  process_conv_kernel_tile
-//     input_patch_producer    ──patch_stream──►        │
-//                                                      └──acc_stream──► write_output_tile
-//                                                                              │
-//     x/bias (DDR gmem0/2)                                                     ▼
-//                                                                       y (DDR gmem3)
+//     bias_producer           ──bias_stream────►  process_conv_kernel_tile
+//     input_patch_producer    ──patch_pipe─────►  broadcast_patches  ──patch_stream──►   │
+//     stream_load_weights     ──weight_stream──►                                         │
+//                                                                                        └──acc_stream──► write_output_tile
+//                                                                                                                │
+//     x/weight/bias (DDR gmem0/1/2)                                                                              ▼
+//                                                                                                         y (DDR gmem3)
 //
 // mt-hoist (the m_tile loop is INSIDE the spatial nest):
 //   * input_patch_producer_standard reads each unique x[] pixel from DDR
@@ -99,46 +100,6 @@ typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
 #endif /* DEBUG_LOAD_DATA_CACHING */
 
 // ---------------------------------------------------------------------------
-// Standard: load weight tile for (m_tile, ic_tile).
-//
-// Weight layout: [out_ch][in_ch][kh][kw].  Per lane offset:
-//   (m_off+m1)*in_ch*kh*kw + ic_off*kh*kw
-// w_buf is the local 4-D buffer owned by the standard tile compute.
-// ---------------------------------------------------------------------------
-static void load_standard_weights(
-    const Data_t* weight,
-    Data_t        w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
-    unsigned      m_off,
-    unsigned      m_valid,
-    unsigned      ic_off,
-    unsigned      ic_valid,
-    unsigned      in_ch,
-    unsigned      kh,
-    unsigned      kw
-) {
-    #pragma HLS INLINE
-
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        const Data_t* w_ptr = weight
-            + (m_off + m1) * in_ch * kh * kw
-            + ic_off * kh * kw;
-        unsigned ic_l = 0, khi_l = 0, kwi_l = 0;
-        const unsigned wt_len = ic_valid * kh * kw;
-        for (unsigned r = 0; r < wt_len; r++) {
-            #pragma HLS PIPELINE II=1
-            w_buf[m1][ic_l][khi_l][kwi_l] = w_ptr[r];
-            if (++kwi_l == kw) {
-                kwi_l = 0;
-                if (++khi_l == kh) {
-                    khi_l = 0;
-                    ++ic_l;
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM.
 //
 // ri runs 0 .. ic_valid*kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles
@@ -171,36 +132,6 @@ static void accumulate_standard(
                     khi_cnt = 0;
                     ++ic_cnt;
                 }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Depthwise: load per-lane weight slices.
-//
-// Weight layout: [out_ch][1][kh][kw].  Offset for lane m: (m_off+m1)*kh*kw.
-// w_buf is the local 3-D buffer owned by the depthwise tile compute.
-// ---------------------------------------------------------------------------
-static void load_depthwise_weights(
-    const Data_t* weight,
-    Data_t        w_buf[kTileM][kMaxKH][kMaxKW],
-    unsigned      m_off,
-    unsigned      m_valid,
-    unsigned      kh,
-    unsigned      kw
-) {
-    #pragma HLS INLINE
-
-    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-        const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
-        unsigned khi_l = 0, kwi_l = 0;
-        for (unsigned r = 0; r < kh * kw; r++) {
-            #pragma HLS PIPELINE II=1
-            w_buf[m1][khi_l][kwi_l] = w_ptr[r];
-            if (++kwi_l == kw) {
-                kwi_l = 0;
-                ++khi_l;
             }
         }
     }
@@ -711,6 +642,96 @@ static void input_patch_producer(
 }
 
 // ---------------------------------------------------------------------------
+// stream_load_weights — DATAFLOW source for the weight m_axi port.
+//
+// Streams weights from DDR (gmem1) to process_conv_kernel_tile via
+// weight_stream in the exact order the consumer reads them.  The win is
+// not fewer DDR transactions but overlap: the weight loads now run
+// concurrently with bias_producer, input_patch_producer,
+// broadcast_patches, and the consumer's accumulate / partial_outputs
+// passes, instead of serialising inside the (oh, ow, mt) inner nest.
+//
+// Standard path (is_depthwise=0):
+//   Iteration order matches process_conv_kernel_tile's Phase 2a nest —
+//   (ni, ict, oh, ow, mt) — so per (oh, ow, mt) the producer emits
+//   m_valid * ic_valid * kh * kw values in (m1, ic_l, khi, kwi) order
+//   (kwi fastest).  Each m1 stripe is read from a contiguous DDR region
+//   (m_axi infers bursts).  The same (ict, mt) slice is replayed
+//   out_h * out_w times — bandwidth-equivalent to the previous inline
+//   load, but now overlapped.
+//
+// Depthwise path (is_depthwise=1):
+//   Iteration order matches Phase 2b's once-per-mt hoist — (ni, mt) —
+//   so per (ni, mt) the producer emits m_valid * kh * kw values in
+//   (m1, khi, kwi) order.  Weights are NOT replayed across the inner
+//   (oh, ow) sweep.
+// ---------------------------------------------------------------------------
+static void stream_load_weights(
+    const Data_t*           weight,
+    hls::stream<Data_t>&    weight_stream,
+    unsigned ic_tiles,
+    unsigned m_tiles,
+    unsigned in_ch,
+    unsigned out_ch,
+    unsigned out_w,
+    unsigned out_h,
+    unsigned kw,
+    unsigned kh,
+    unsigned batch,
+    unsigned is_depthwise
+)
+{
+    for (unsigned ni = 0; ni < batch; ni++) {
+        if (!is_depthwise) {
+            // -------- Standard: replay per (oh, ow, mt) --------
+            for (unsigned ict = 0; ict < ic_tiles; ict++) {
+                const unsigned ic_off   = ict * kTileIC;
+                const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+
+                for (unsigned oh = 0; oh < out_h; oh++) {
+                    for (unsigned ow = 0; ow < out_w; ow++) {
+                        for (unsigned mt = 0; mt < m_tiles; mt++) {
+                            const unsigned m_off   = mt * kTileM;
+                            const unsigned m_valid = std::min(kTileM,
+                                                              out_ch - m_off);
+
+                            // Push m_valid * ic_valid * kh * kw values
+                            // in (m1, ic_l, khi, kwi) order.
+                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                                const Data_t* w_ptr = weight
+                                    + (m_off + m1) * in_ch * kh * kw
+                                    + ic_off * kh * kw;
+                                const unsigned wt_len = ic_valid * kh * kw;
+                                for (unsigned r = 0; r < wt_len; r++) {
+                                    #pragma HLS PIPELINE II=1
+                                    weight_stream.write(w_ptr[r]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } // ict
+        } else {
+            // -------- Depthwise: once per (ni, mt) --------
+            for (unsigned mt = 0; mt < m_tiles; mt++) {
+                const unsigned m_off   = mt * kTileM;
+                const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+                // Push m_valid * kh * kw values in (m1, khi, kwi) order.
+                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
+                    const unsigned wt_len = kh * kw;
+                    for (unsigned r = 0; r < wt_len; r++) {
+                        #pragma HLS PIPELINE II=1
+                        weight_stream.write(w_ptr[r]);
+                    }
+                }
+            } // mt
+        } // depthwise
+    } // batch
+}
+
+// ---------------------------------------------------------------------------
 // process_conv_kernel_tile — DATAFLOW consumer.
 //
 // Both paths share a persistent partial-output accumulator that survives
@@ -739,7 +760,7 @@ static void input_patch_producer(
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<Data_t>&    patch_stream,
-    const Data_t*           weight,
+    hls::stream<Data_t>&    weight_stream,
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
     unsigned                batch,
@@ -813,10 +834,21 @@ static void process_conv_kernel_tile(
                                 }
                             }
 
-                            load_standard_weights(weight, w_buf,
-                                                  m_off, m_valid,
-                                                  ic_off, ic_valid,
-                                                  in_ch, kh, kw);
+                            // Read m_valid * ic_valid * kh * kw weight
+                            // values from stream (order: m1, ic_l, khi,
+                            // kwi — matches stream_load_weights' standard
+                            // path).
+                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                                for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
+                                    for (unsigned khi = 0; khi < kh; khi++) {
+                                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                            #pragma HLS PIPELINE II=1
+                                            w_buf[m1][ic_l][khi][kwi] =
+                                                weight_stream.read();
+                                        }
+                                    }
+                                }
+                            }
 
                             const unsigned idx_base = (oh * out_w + ow) * out_ch
                                                       + m_off;
@@ -847,9 +879,18 @@ static void process_conv_kernel_tile(
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
                 // Load weights ONCE per mt (held in BRAM across the
-                // entire (oh, ow) sweep below).
+                // entire (oh, ow) sweep below).  Read m_valid * kh * kw
+                // values from stream (order: m1, khi, kwi — matches
+                // stream_load_weights' depthwise path).
                 Data_t w_buf[kTileM][kMaxKH][kMaxKW];
-                load_depthwise_weights(weight, w_buf, m_off, m_valid, kh, kw);
+                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    for (unsigned khi = 0; khi < kh; khi++) {
+                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                            #pragma HLS PIPELINE II=1
+                            w_buf[m1][khi][kwi] = weight_stream.read();
+                        }
+                    }
+                }
 
                 for (unsigned oh = 0; oh < out_h; oh++) {
                     for (unsigned ow = 0; ow < out_w; ow++) {
@@ -1017,6 +1058,14 @@ void ConvKernel(
     hls::stream<AccData_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
 
+    // weight_stream carries one Data_t per cycle from stream_load_weights
+    // to process_conv_kernel_tile.  Depth is one full max-tile (kTileM *
+    // kTileIC * kMaxKH * kMaxKW = 6272 at defaults) so the producer can
+    // pre-fetch the next iteration's weight slice while the consumer is
+    // still in accumulate — full producer/consumer overlap.
+    hls::stream<Data_t> weight_stream;
+    #pragma HLS STREAM variable=weight_stream depth=kTileM*kTileIC*kMaxKH*kMaxKW
+
     bias_producer(bias, bias_stream,
                   out_ch, bias_rep_count, has_bias);
 
@@ -1028,8 +1077,12 @@ void ConvKernel(
     broadcast_patches(patch_pipe, patch_stream,
                       broadcast_iters, input_per_iter, broadcast_factor);
 
+    stream_load_weights(weight, weight_stream,
+                        ic_tiles, m_tiles, in_ch, out_ch, out_w, out_h,
+                        kw, kh, batch, is_depthwise);
+
     process_conv_kernel_tile(
-        patch_stream, weight, bias_stream, acc_stream,
+        patch_stream, weight_stream, bias_stream, acc_stream,
         batch, in_ch, in_h, in_w, out_ch, out_h, out_w,
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise);
