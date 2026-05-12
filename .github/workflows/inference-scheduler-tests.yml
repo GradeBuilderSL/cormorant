@@ -48,7 +48,9 @@ jobs:
           cache-dependency-path: inference-scheduler/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
 
       - name: Generate test ONNX models
         # All gen_*_models.py invocations bundled — see test/gen_all_models.py.
