@@ -24,6 +24,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run all tests
 .venv/bin/python -m pytest test/ -v
 
+# Lint — same invocation CI uses; configuration lives in pyproject.toml.
+# Run from inference-scheduler/ (the dot scopes ruff to the whole package,
+# including the top-level run_remote_*.py / upload_bitstream.py scripts).
+.venv/bin/pip install 'ruff>=0.15,<0.16'
+.venv/bin/ruff check .
+
 # Generate a C inference project
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 ```

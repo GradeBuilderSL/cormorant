@@ -68,9 +68,9 @@ class RemoteSession:
             stdout = stdout_ch.read().decode("utf-8", errors="replace")
             stderr = stderr_ch.read().decode("utf-8", errors="replace")
             rc     = stdout_ch.channel.recv_exit_status()
-        except socket.timeout:
+        except socket.timeout as exc:
             raise TimeoutError(
-                f"Remote command timed out after {timeout}s:\n  {command}")
+                f"Remote command timed out after {timeout}s:\n  {command}") from exc
         return stdout, stderr, rc
 
     def exec_checked(self, command: str, timeout: int = 120) -> Tuple[str, str]:
@@ -120,7 +120,8 @@ class RemoteSession:
         current = ""
         for part in parts:
             if part == "/":
-                current = "/"; continue
+                current = "/"
+                continue
             current = current.rstrip("/") + "/" + part
             try:
                 sftp.stat(current)

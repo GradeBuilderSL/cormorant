@@ -84,23 +84,23 @@ class _TestMixin:
                 fill_lines += [
                     f"    {{  /* '{t.c_name}' — broadcast input, fill data chunks only */",
                     f"        Data_t   *p = inference_buf_ptr({t.c_name});",
-                    f"        unsigned  _chunk, _off;",
+                    "        unsigned  _chunk, _off;",
                     f"        for (_chunk = 0u; _chunk < {n}u; _chunk++) {{",
                     f"            _off = _chunk * {stride_macro};",
                     f"            for (i = 0u; i < {chunk_macro}; i++)",
                     f"                p[_off + i] = {rhs};",
-                    f"        }}",
-                    f"    }}",
+                    "        }",
+                    "    }",
                 ]
             else:
                 macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
                 rhs   = dtype.c_fill_rhs("i")
                 fill_lines += [
-                    f"    {{",
+                    "    {",
                     f"        Data_t *p = inference_buf_ptr({t.c_name});",
                     f"        for (i = 0u; i < {macro}; i++)",
                     f"            p[i] = {rhs};",
-                    f"    }}",
+                    "    }",
                 ]
 
         # --- inference_run() call ---------------------------------------- #
@@ -117,33 +117,33 @@ class _TestMixin:
                     f"    {{  /* '{t.c_name}' — broadcast output, print data chunks only */",
                     f"        Data_t   *p     = inference_buf_ptr({t.c_name});",
                     f"        unsigned  numel = {n}u * {chunk_macro};",
-                    f"        unsigned  lim   = (numel < 8u) ? numel : 8u;",
-                    f"        unsigned  shown = 0u, _chunk, _off;",
+                    "        unsigned  lim   = (numel < 8u) ? numel : 8u;",
+                    "        unsigned  shown = 0u, _chunk, _off;",
                     f"        printf(\"Output '{t.onnx_name}' (%u elem, first %u):\\n\","
                     f" numel, lim);",
                     f"        for (_chunk = 0u; _chunk < {n}u && shown < lim; _chunk++) {{",
                     f"            _off = _chunk * {stride_macro};",
                     f"            for (i = 0u; i < {chunk_macro} && shown < lim;"
                     f" i++, shown++) {{",
-                    f"                printf(\"  [%u] (%.4f)\\n\",",
+                    "                printf(\"  [%u] (%.4f)\\n\",",
                     f"                       shown, {display});",
-                    f"            }}",
-                    f"        }}",
-                    f"    }}",
+                    "            }",
+                    "        }",
+                    "    }",
                 ]
             else:
                 macro   = f"INFERENCE_{t.c_name.upper()}_SIZE"
                 display = dtype.c_display("p", "i")
                 print_lines += [
-                    f"    {{",
+                    "    {",
                     f"        Data_t   *p   = inference_buf_ptr({t.c_name});",
                     f"        unsigned  lim = ({macro} < 8u) ? {macro} : 8u;",
                     f"        printf(\"Output '{t.onnx_name}'"
                     f" (%u elem, first %u):\\n\", (unsigned){macro}, lim);",
-                    f"        for (i = 0u; i < lim; i++) {{",
+                    "        for (i = 0u; i < lim; i++) {",
                     f"            printf(\"  [%u] (%.4f)\\n\", i, {display});",
-                    f"        }}",
-                    f"    }}",
+                    "        }",
+                    "    }",
                 ]
 
         # --- GT comparison: output vs expected_<name>[] ------------------ #
@@ -160,22 +160,22 @@ class _TestMixin:
                 verify_lines += [
                     f"    {{  /* [GT] '{t.c_name}' — broadcast output, data chunks only */",
                     f"        const Data_t *p = (const Data_t *)inference_buf_ptr({t.c_name});",
-                    f"        unsigned _chunk, j, _off;",
+                    "        unsigned _chunk, j, _off;",
                     f"        for (_chunk = 0u; _chunk < {n}u; _chunk++) {{",
                     f"            _off = _chunk * {stride_macro};",
                     f"            for (j = 0u; j < {chunk_macro}; j++) {{",
                     f"                if (p[_off + j] != expected_{t.c_name}[_off + j]) {{",
-                    f"                    fprintf(stderr,",
+                    "                    fprintf(stderr,",
                     f"                            \"FAIL {t.onnx_name}[chunk=%u,j=%u]: \"",
-                    f"                            \"got %.4f expected %.4f\\n\",",
-                    f"                            _chunk, j,",
+                    "                            \"got %.4f expected %.4f\\n\",",
+                    "                            _chunk, j,",
                     f"                            {got_disp},",
                     f"                            {exp_disp});",
-                    f"                    rc = 1;",
-                    f"                }}",
-                    f"            }}",
-                    f"        }}",
-                    f"    }}",
+                    "                    rc = 1;",
+                    "                }",
+                    "            }",
+                    "        }",
+                    "    }",
                 ]
             else:
                 alloc_size = self._alloc_sizes[t.onnx_name]
@@ -184,19 +184,19 @@ class _TestMixin:
                 verify_lines += [
                     f"    {{  /* [GT] '{t.c_name}' */",
                     f"        const Data_t *p = (const Data_t *)inference_buf_ptr({t.c_name});",
-                    f"        unsigned k;",
+                    "        unsigned k;",
                     f"        for (k = 0u; k < {alloc_size}u; k++) {{",
                     f"            if (p[k] != expected_{t.c_name}[k]) {{",
-                    f"                fprintf(stderr,",
+                    "                fprintf(stderr,",
                     f"                        \"FAIL {t.onnx_name}[%u]: \"",
-                    f"                        \"got %.4f expected %.4f\\n\",",
-                    f"                        k,",
+                    "                        \"got %.4f expected %.4f\\n\",",
+                    "                        k,",
                     f"                        {got_disp},",
                     f"                        {exp_disp});",
-                    f"                rc = 1;",
-                    f"            }}",
-                    f"        }}",
-                    f"    }}",
+                    "                rc = 1;",
+                    "            }",
+                    "        }",
+                    "    }",
                 ]
 
         # --- Large expected: load step before GT check ------------------- #

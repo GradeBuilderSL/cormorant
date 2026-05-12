@@ -1,7 +1,5 @@
 """Tests for inference.c source file generation (TestSourceGen)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

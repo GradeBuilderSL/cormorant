@@ -18,7 +18,6 @@ import re
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 import onnx
 from onnx import helper as oh, TensorProto
@@ -26,7 +25,7 @@ from onnx import helper as oh, TensorProto
 from helpers    import _model, _models_exist
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
-from src.nodes   import ScheduledNode, ReshapeNode
+from src.nodes   import ReshapeNode
 
 
 def _build_named_model(node_names):

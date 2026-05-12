@@ -425,8 +425,6 @@ class ReportGenerator:
         # candidates for reuse.  The "intermediates region" is the part the
         # interval coloring affects.
         weight_names = {t.onnx_name for t in self.graph.weight_tensors}
-        weight_alloc = sum(alloc for name, _, alloc in layout
-                           if name in weight_names)
         # Intermediates region size = total minus weights' raw allocs,
         # rounded for alignment within the pool.  Approximating from the
         # layout entries:
@@ -502,7 +500,6 @@ class ReportGenerator:
     # ----- §6 transformations --------------------------------------- #
 
     def _transformations(self) -> str:
-        bpe = self.codegen._dtype.bytes_per_elem
         events = self.codegen._compute_event_stream()
         overlapping = _count_overlapping_starts(events)
         starts = sum(1 for ev in events if ev[0] in ("start", "start_sync"))

@@ -10,7 +10,6 @@ from .xclbin import build_xclbin
 from .board import (
     _FIRMWARE_DIR,
     upload_file,
-    upload_bytes,
     remove_overlay,
     load_bitstream,
     fpga_state,
@@ -75,7 +74,7 @@ def upload_bitstream(
         upload_file(session, tmp_bin, remote_bin)
     finally:
         tmp_bin.unlink(missing_ok=True)
-    print(f"          done")
+    print("          done")
 
     print(f"\n{_bold('Step 5')}   Removing existing overlay '{overlay_name}' (if any)")
     remove_overlay(session, overlay_name)
@@ -94,11 +93,11 @@ def upload_bitstream(
 
     print(f"\n{_bold('Step 8')}   Setting PS AXI port widths ({len(axi_writes)} register writes)")
     set_axi_port_widths(session, axi_writes)
-    print(f"          done")
+    print("          done")
 
     print(f"\n{_bold('Step 9')}   Loading xclbin into zocl DRM driver")
     load_xclbin(session, xclbin_data)
-    print(f"          done")
+    print("          done")
 
     print(f"\n{_bold('Step 10')}  Uploading DTBO → {remote_dtbo}")
     upload_file(session, dtbo_path, remote_dtbo)

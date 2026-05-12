@@ -205,17 +205,17 @@ def main() -> int:
 
     try:
         if args.check_only:
-            print(f"\nBoard readiness check")
+            print("\nBoard readiness check")
             ok    = check_board(session)
             state = fpga_state(session)
             print(f"\n  FPGA state:  {_dim(state)}")
             uios = list_uio_devices(session)
             if uios:
-                print(f"  UIO devices:")
+                print("  UIO devices:")
                 for name, dev in uios:
                     print(f"    {dev}  {name}")
             else:
-                print(f"  UIO devices: none")
+                print("  UIO devices: none")
             return 0 if ok else 1
 
         print(f"\n  .bit         {bit_path}")

@@ -1,7 +1,5 @@
 """Tests for Sub and Div model handling (TestSubDivModels)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

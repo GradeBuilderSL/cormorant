@@ -1,7 +1,6 @@
 """Tests for broadcasting model handling (TestBroadcast)."""
 
 import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist
@@ -250,7 +249,7 @@ class TestBroadcast(unittest.TestCase):
         )
         model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model.ir_version = 8
-        import tempfile, os
+        import tempfile
         with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
             fname = f.name
         try:
@@ -263,9 +262,7 @@ class TestBroadcast(unittest.TestCase):
 
     def test_both_inputs_smaller_raises(self):
         """Both A and B smaller than the output — not supported."""
-        import numpy as np
         import onnx.helper as oh
-        import onnx.numpy_helper as nph
         from onnx import TensorProto
 
         # A[4] + B[4] -> Y[4] is fine (no broadcast).
@@ -284,7 +281,7 @@ class TestBroadcast(unittest.TestCase):
         )
         model = oh.make_model(graph, opset_imports=[oh.make_opsetid("", 13)])
         model.ir_version = 8
-        import tempfile, os
+        import tempfile
         with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
             fname = f.name
         try:

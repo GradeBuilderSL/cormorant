@@ -202,7 +202,7 @@ def _broadcast_info(
     # AND all broadcast dims (1s) must form a contiguous LEADING block —
     # no matching dim may appear before a broadcast dim.
     found_match = False
-    for td, od in zip(t_aligned, output.shape):
+    for td, od in zip(t_aligned, output.shape, strict=False):
         if td == od:
             found_match = True
         elif td == 1:
@@ -661,7 +661,7 @@ class MatmulNode:
 
         # Validate broadcastability and compute the output batch shape.
         out_batch: list = []
-        for ad, bd in zip(a_ext, b_ext):
+        for ad, bd in zip(a_ext, b_ext, strict=True):
             if ad == bd:
                 out_batch.append(ad)
             elif ad == 1:
@@ -680,7 +680,7 @@ class MatmulNode:
         outer_a_advances: Optional[bool] = None
         split = max_len   # tentative: all dims are outer
 
-        for i, (ad, bd) in enumerate(zip(a_ext, b_ext)):
+        for i, (ad, bd) in enumerate(zip(a_ext, b_ext, strict=True)):
             if ad > 1 and bd > 1:
                 # Both present → shared block starts here
                 split = i
@@ -1154,7 +1154,7 @@ POOL_OP_TYPES = frozenset({
 # build/CMakeCache.txt overrides, so `cmake -DPOOL_MAX_KH=...` flows through
 # to this validator without manual edits.  See doc/POOL_OPTIMIZATION.md §4.
 # ---------------------------------------------------------------------------
-from ._pool_hw_config import (
+from ._pool_hw_config import (  # noqa: E402 (deferred until POOL_OP_TYPES is defined above)
     POOL_MAX_KH,
     POOL_MAX_KW,
     POOL_MAX_LINE_BUF_ROWS,

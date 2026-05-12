@@ -1,7 +1,5 @@
 """Tests for two-input model handling (TestTwoInputModels)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

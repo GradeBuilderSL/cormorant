@@ -11,7 +11,6 @@ Targets the 9 previously-uncovered lines (87, 161, 165, 193, 529, 618,
   * generate_expected_dat end-to-end.
 """
 
-import os
 import unittest
 
 import numpy as np

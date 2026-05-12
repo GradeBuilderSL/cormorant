@@ -29,7 +29,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -543,7 +543,6 @@ def main(argv=None) -> int:
               f"({len(cases)} cases across {len(kernels)} kernel(s))\n")
 
         results: List[BenchResult] = []
-        prefix = "sudo -n " if cfg["run"]["use_sudo"] else ""
 
         for case in cases:
             print(f"  {_cyan(case.kernel):<30} {case.label:<28}", end="", flush=True)
