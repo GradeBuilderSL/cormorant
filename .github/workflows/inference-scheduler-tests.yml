@@ -50,7 +50,12 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov 'ruff>=0.15,<0.16'
+
+      - name: Lint with ruff
+        # Fail fast on lint errors so we don't waste minutes on test runs
+        # that can't merge anyway.  Configuration lives in pyproject.toml.
+        run: ruff check .
 
       - name: Generate test ONNX models
         # All gen_*_models.py invocations bundled — see test/gen_all_models.py.

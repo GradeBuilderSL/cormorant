@@ -40,7 +40,7 @@ import numpy as np
 from ..nodes  import (
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
     MatmulNode, ConvNode, PoolNode, ReshapeNode,
-    POOL_MAX, POOL_AVG, POOL_LP,
+    POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
 

@@ -1,7 +1,5 @@
 """Tests for two-output model handling (TestTwoOutputModels)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

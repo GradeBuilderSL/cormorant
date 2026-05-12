@@ -226,7 +226,7 @@ class ApFixed(DataType):
     _SIGNED_NP        = {8: np.int8,  16: np.int16,  32: np.int32}
     _C_TYPES          = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t"}
 
-    def __init__(self, W: int, I: int) -> None:
+    def __init__(self, W: int, I: int) -> None:  # noqa: E741 (I = integer bits per ap_fixed convention)
         if W not in self._SUPPORTED_WIDTHS:
             raise ValueError(f"ApFixed: W={W} not supported; choose from {sorted(self._SUPPORTED_WIDTHS)}")
         if I < 1 or I >= W:

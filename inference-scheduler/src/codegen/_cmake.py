@@ -3,7 +3,6 @@
 from __future__ import annotations
 import os
 
-from ._banners import _file_banner
 
 
 class _CmakeMixin:
@@ -17,8 +16,6 @@ class _CmakeMixin:
         out_desc = ", ".join(f"{t.onnx_name}{t.shape}" for t in outputs)
         model_basename = os.path.basename(self._model_path)
         active = self._active_kernels
-        # For single-kernel projects keep the old variable names for readability
-        pfx = active[0].driver_prefix if active else "xvectoropkernel"
         kernel_names_str = " + ".join(kd.name for kd in active)
 
         # Generate per-kernel driver verification blocks

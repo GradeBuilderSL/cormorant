@@ -1,0 +1,25 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    ".venv",
+    "test/models",
+    "**/__pycache__",
+]
+
+[tool.ruff.lint]
+# Defaults (E, F) plus two additional safety nets:
+#   W  — pycodestyle warnings (whitespace, blank-line policy)
+#   B  — flake8-bugbear (likely-bug patterns: mutable defaults, …)
+# Deliberately skipping `UP` (pyupgrade) — modernising type annotations
+# (`List[X]` → `list[X]`, `Optional[X]` → `X | None`) is a separate cleanup.
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",  # line-length — enforced loosely; long literals/comments are OK
+    "B008",  # function calls in argument defaults (used by dataclass field())
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files: allow unused vars (assertions read attributes by side-effect)
+# and ambiguous names (test fixtures often use single-letter shape vars).
+"test/**/*.py" = ["F841", "E741", "B007"]

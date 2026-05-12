@@ -829,7 +829,6 @@ class TestMixedAllKernelsSimulate(unittest.TestCase):
 
     def test_matmul_relu_conv_relu6_bounds(self):
         """Final Relu6 → Y ∈ [0, 6]."""
-        import numpy as np
         arrays = self._sim("mixed_all_matmul_relu_conv.onnx")
         y = arrays["Y"]
         self.assertTrue((y >= 0).all(),   "Relu6 output must be ≥ 0")

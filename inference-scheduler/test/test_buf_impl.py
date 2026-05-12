@@ -1,7 +1,5 @@
 """Tests for inference_buf.c buffer implementation generation (TestBufImpl)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

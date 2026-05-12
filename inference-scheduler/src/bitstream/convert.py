@@ -20,21 +20,29 @@ def _parse_bit_header(data: bytes) -> dict:
     # Key–value fields until key 0x65 (the raw bitstream marker)
     result = {}
     while True:
-        key = data[offset]; offset += 1
+        key = data[offset]
+        offset += 1
         if key == 0x65:
-            length = struct.unpack(">i", data[offset:offset + 4])[0]; offset += 4
+            length = struct.unpack(">i", data[offset:offset + 4])[0]
+            offset += 4
             if length + offset != len(data):
                 raise ValueError("Bitstream length field does not match file size")
             result["data"] = data[offset:offset + length]
             break
-        length = struct.unpack(">h", data[offset:offset + 2])[0]; offset += 2
+        length = struct.unpack(">h", data[offset:offset + 2])[0]
+        offset += 2
         value  = data[offset:offset + length].decode("ascii", errors="replace").rstrip("\x00")
         offset += length
-        if   key == 0x61: result["design"] = value
-        elif key == 0x62: result["part"]   = value
-        elif key == 0x63: result["date"]   = value
-        elif key == 0x64: result["time"]   = value
-        else: raise ValueError(f"Unknown .bit header field: 0x{key:02x}")
+        if key == 0x61:
+            result["design"] = value
+        elif key == 0x62:
+            result["part"] = value
+        elif key == 0x63:
+            result["date"] = value
+        elif key == 0x64:
+            result["time"] = value
+        else:
+            raise ValueError(f"Unknown .bit header field: 0x{key:02x}")
 
     return result
 
