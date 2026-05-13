@@ -100,11 +100,73 @@ typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
 #endif /* DEBUG_LOAD_DATA_CACHING */
 
 // ---------------------------------------------------------------------------
-// Standard: II=1 pipelined K-reduction over ic_valid × kh × kw × kTileM.
+// oh-chunking helper.
 //
-// ri runs 0 .. ic_valid*kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles
-// through lanes; acc[m1] is written every kTileM cycles, so the RAW
-// dependence distance ≥ MAC latency.
+// The Option-A consumer keeps a persistent per-output accumulator in
+// partial_outputs[kMaxAccPersistEntries] that survives across the ic-tile
+// (standard) or mt-tile (depthwise) reduction.  When out_h·out_w·out_ch
+// exceeds kMaxAccPersistEntries, the full output no longer fits on-chip.
+//
+// Rather than degrading to a no-persistent-acc mode (which would re-read
+// every input pixel ic_tiles · m_tiles times per (ni, oh, ow) — bandwidth
+// catastrophe), the kernel splits the output along the oh axis into chunks
+// whose footprint fits the buffer:
+//
+//     oh_per_chunk = max(1, kMaxAccPersistEntries / (out_w · out_ch))
+//     num_chunks   = ceil(out_h / oh_per_chunk)
+//
+// Each chunk runs the full Option-A pipeline for its oh sub-range; between
+// chunks the patch producer's line_buf is invalidated so the kh-row sliding
+// window for the next chunk's first oh is reloaded from DDR (duplicate read
+// of ~kh rows per (ni, c, chunk transition)).  Weights are re-streamed per
+// chunk too — for the standard path this is just stream replay (the inline
+// load loop already replays per (oh, ow), so per-chunk replay is the same
+// bandwidth); for the depthwise path the small weight slice is reloaded
+// num_chunks times per (ni, mt).
+//
+// Relaxed constraint: out_w · out_ch  ≤  kMaxAccPersistEntries
+// (was: out_h · out_w · out_ch  ≤  kMaxAccPersistEntries).
+//
+// When out_w · out_ch > kMaxAccPersistEntries the buffer cannot hold even
+// one output row.  oh_per_chunk is clamped to 1 in that case so the kernel
+// still synthesises and (for small enough total) still works in C-sim, but
+// large layers with that property will overflow partial_outputs.  Catching
+// it remains the scheduler validator's responsibility.
+// ---------------------------------------------------------------------------
+static inline void compute_oh_chunking(
+    unsigned out_h, unsigned out_w, unsigned out_ch,
+    unsigned& oh_per_chunk, unsigned& num_chunks
+) {
+    const unsigned row_size = out_w * out_ch;
+    unsigned per = (row_size > 0) ? (kMaxAccPersistEntries / row_size) : out_h;
+    if (per == 0)        per = 1;
+    if (per > out_h)     per = out_h;
+    oh_per_chunk = per;
+    num_chunks   = (out_h + per - 1) / per;
+}
+
+// ---------------------------------------------------------------------------
+// Standard: II=1 pipelined K-reduction with PN-wide input-channel parallelism.
+//
+// Each PIPELINE iteration fires kTileIC parallel MACs that share (khi_cnt,
+// kwi_cnt, m1) and reduce across the input-channel axis through a PN-wide
+// adder tree.  Outer counter ri = (khi, kwi, m1) with m1 cycling 0..kTileM-1
+// via the bit mask; the lane rotation keeps the per-lane RAW distance on
+// acc[m1] at kTileM cycles (≥ MAC pipeline depth incl. the log2(kTileIC)
+// adder tree), avoiding any DEPENDENCE escape.
+//
+// X-propagation guard on partial IC tiles:
+//   When ic_valid < kTileIC the stream_load_weights producer only writes
+//   m_valid·ic_valid·kh·kw cells into w_buf — cells at ic_l >= ic_valid are
+//   uninitialised BRAM, which is 'X' in RTL.  Multiplying patch·X yields X
+//   (C-sim would have given 0 because patch is producer-padded with zeros,
+//   so this is an RTL-only failure mode).  The ic_l < ic_valid guard MUXes
+//   the BRAM read to 0 on invalid lanes, so the product is 0·0 = 0 and no
+//   X reaches the adder tree.  HLS keeps the multiplier — the MUX adds a
+//   single LUT per lane on the weight input, no DSP cost.
+//
+// Throughput: kTileIC MACs / cycle (vs 1 MAC / cycle previously);
+// loop bound shrinks from ic_valid·kh·kw·kTileM to kh·kw·kTileM.
 // ---------------------------------------------------------------------------
 static void accumulate_standard(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
@@ -116,21 +178,29 @@ static void accumulate_standard(
 ) {
     #pragma HLS INLINE
 
-    unsigned kwi_cnt = 0, khi_cnt = 0, ic_cnt = 0;
-    const unsigned ri_bound = ic_valid * kh * kw * kTileM;
+    unsigned kwi_cnt = 0, khi_cnt = 0;
+    const unsigned ri_bound = kh * kw * kTileM;
     for (unsigned ri = 0; ri < ri_bound; ri++) {
         #pragma HLS PIPELINE II=1
         const unsigned m1 = ri & (kTileM - 1);
-        acc[m1] +=
-            AccData_t(patch[ic_cnt][khi_cnt][kwi_cnt]) *
-            AccData_t(w_buf[m1][ic_cnt][khi_cnt][kwi_cnt]);
+
+        AccData_t lane_sum = 0;
+        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+            #pragma HLS UNROLL
+            const Data_t w_val = (ic_l < ic_valid)
+                ? w_buf[m1][ic_l][khi_cnt][kwi_cnt]
+                : Data_t(0);
+            lane_sum +=
+                AccData_t(patch[ic_l][khi_cnt][kwi_cnt]) *
+                AccData_t(w_val);
+        }
+        acc[m1] += lane_sum;
 
         if ((ri & (kTileM - 1)) == kTileM - 1) {
             if (++kwi_cnt == kw) {
                 kwi_cnt = 0;
                 if (++khi_cnt == kh) {
                     khi_cnt = 0;
-                    ++ic_cnt;
                 }
             }
         }
@@ -138,13 +208,18 @@ static void accumulate_standard(
 }
 
 // ---------------------------------------------------------------------------
-// Depthwise: II=1 kH×kW reduction with kTileM lanes.
+// Depthwise: II=1 kH×kW reduction with PM-wide channel-parallel lanes.
 //
-// ri runs 0 .. kh*kw*kTileM - 1.  m1 = ri & (kTileM - 1) cycles through
-// lanes; acc[m1] is written every kTileM cycles, so the RAW dependence
-// distance ≥ MAC latency.
+// Each PIPELINE iteration fires kTileM independent MACs — one per output
+// channel lane.  Depthwise has no input-channel reduction, so per-lane
+// accumulators acc[m1] are pairwise independent.  Loop bound shrinks from
+// kh·kw·kTileM (1 MAC / cycle) to kh·kw (kTileM MACs / cycle).
+//
+// Per-lane RAW distance on acc[m1] is 1 cycle (each iteration writes every
+// lane); the ap_fixed<32,16> adder schedules single-cycle at 300 MHz so the
+// recurrence closes without an II bump.  Pattern matches Bai et al. FPGA'18
+// channel-parallel depthwise micro-architecture.
 // ---------------------------------------------------------------------------
-//#include <iostream>
 static void accumulate_depthwise(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
     const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
@@ -155,20 +230,19 @@ static void accumulate_depthwise(
     #pragma HLS INLINE
 
     unsigned kwi_cnt = 0, khi_cnt = 0;
-    const unsigned ri_bound_dw = kh * kw * kTileM;
+    const unsigned ri_bound_dw = kh * kw;
     for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
         #pragma HLS PIPELINE II=1
-        const unsigned m1 = ri & (kTileM - 1);
-        //std::cout << "m1=" << m1 << " khi_cnt=" << khi_cnt << " kwi_cnt=" << kwi_cnt << std::endl;
-        acc[m1] +=
-            AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
-            AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
+        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+            #pragma HLS UNROLL
+            acc[m1] +=
+                AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
+                AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
+        }
 
-        if ((ri & (kTileM - 1)) == kTileM - 1) {
-            if (++kwi_cnt == kw) {
-                kwi_cnt = 0;
-                ++khi_cnt;
-            }
+        if (++kwi_cnt == kw) {
+            kwi_cnt = 0;
+            ++khi_cnt;
         }
     }
 }
@@ -263,20 +337,20 @@ static void bias_producer(
 //
 // Tiled-IC version (Option-A): the producer iterates
 //
-//     for ni: for ict: for oh: for ow: for ic_l, kh, kw
+//     for ni: for chunk: for ict: for oh_in_chunk: for ow: for ic_l, kh, kw
 //
-// with ict OUTER of oh.  This lets line_buf shrink from
-//   [kMaxInCh][rows][kMaxInW]  →  [kTileIC][rows][kMaxInW]
-// while keeping the "x read once per (ni, c)" invariant — line_buf is
-// reused across the oh loop within the same ic-tile (slid forward by
-// the load_start/last_loaded_row tracker).  When ict advances the line
-// buffer is overwritten with the next ic-tile's channels; we never
-// revisit a previous ict, so no cached row is ever needed twice.
+// with ict OUTER of oh and the chunk loop wrapping (ict, oh).  This lets
+// line_buf stay [kTileIC][rows][kMaxInW] while keeping the "x read once per
+// (ni, c)" invariant within a chunk — line_buf is reused across the
+// oh_in_chunk loop within a single (chunk, ict).  When ict advances inside
+// a chunk the line buffer is overwritten with the next ic-tile's channels;
+// at a chunk transition the (kh-1)-row overlap window is re-fetched from
+// DDR.  See compute_oh_chunking() above for the chunking rationale.
 //
-// Per (ni, ict, oh):
+// Per (ni, chunk, ict, oh):
 //   Phase 1 — load any new input rows for the current (oh, ict) window.
 //             kTileIC channels at offset ic_off..ic_off+ic_valid-1.
-// Per (ni, ict, oh, ow):
+// Per (ni, chunk, ict, oh, ow):
 //   Phase 2 — stream one ic-tile's worth of patch values
 //             (ic_valid × kh × kw entries) into patch_pipe.
 //
@@ -307,6 +381,9 @@ static void input_patch_producer_standard(
     const unsigned ic_tiles = (in_ch + kTileIC - 1) / kTileIC;
     const unsigned in_hw    = in_h * in_w;
 
+    unsigned oh_per_chunk, num_chunks;
+    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxInW];
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -314,16 +391,23 @@ static void input_patch_producer_standard(
 #endif
 
     for (unsigned ni = 0; ni < batch; ni++) {
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start = chunk * oh_per_chunk;
+        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
+
         for (unsigned ict = 0; ict < ic_tiles; ict++) {
             const unsigned ic_off   = ict * kTileIC;
             const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-            // Highest absolute input row currently resident in line_buf
-            // for THIS ic-tile.  Reset per (ni, ict) since line_buf is
-            // overwritten when ict advances.
-            int last_loaded_row = -1;
+            // Highest absolute input row currently resident in line_buf for
+            // THIS (chunk, ict).  Initialise so the first oh in this chunk
+            // triggers a fresh kh-row load — across chunks the (kh-1)-row
+            // overlap is re-fetched from DDR, which is the duplicate-read
+            // overhead the chunking accepts.
+            int last_loaded_row =
+                (int)(oh_start * stride_h) - (int)pad_top - 1;
 
-            for (unsigned oh = 0; oh < out_h; oh++) {
+            for (unsigned oh = oh_start; oh < oh_end; oh++) {
                 const int ih_window_max = (int)(oh * stride_h)
                                         - (int)pad_top
                                         + (int)((kh - 1) * dilation_h);
@@ -401,6 +485,7 @@ static void input_patch_producer_standard(
                 } // ow loop
             } // oh loop
         } // ict loop
+      } // chunk loop
     } // batch loop
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -469,18 +554,18 @@ static void broadcast_patches(
 //
 // Tiled-M version (Option-A, mirror of the standard producer):
 //
-//     for ni: for mt: for oh: for ow: for m1, kh, kw
+//     for ni: for chunk: for mt: for oh_in_chunk: for ow: for m1, kh, kw
 //
-// with mt OUTER of oh.  line_buf is sized [kTileM][rows][kMaxInW] and
-// retained across the oh loop within a single output-channel tile, so
-// each x pixel is fetched from DDR exactly once per (ni, c).  When mt
-// advances the line buffer is overwritten; we never revisit a previous
-// mt-tile so no cached row is needed twice.
+// with mt OUTER of oh and the chunk loop wrapping (mt, oh).  line_buf is
+// sized [kTileM][rows][kMaxInW] and retained across the oh_in_chunk loop
+// within a single (chunk, mt); each x pixel is fetched from DDR exactly
+// once per (ni, c, chunk).  At chunk transitions the (kh-1)-row overlap
+// is re-fetched — the duplicate-read overhead the chunking accepts.
 //
-// Per (ni, mt, oh):
+// Per (ni, chunk, mt, oh):
 //   Phase 1 — load any new rows for the current (oh, mt) window for the
 //             m_valid channels at offset m_off..m_off+m_valid-1.
-// Per (ni, mt, oh, ow):
+// Per (ni, chunk, mt, oh, ow):
 //   Phase 2 — stream a fixed kTileM × kh × kw block of patch values into
 //             patch_pipe.  Lanes m1 >= m_valid are zero-padded so the
 //             broadcaster can operate with a compile-time-fixed
@@ -509,6 +594,9 @@ static void input_patch_producer_depthwise(
     const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
     const unsigned in_hw   = in_h * in_w;
 
+    unsigned oh_per_chunk, num_chunks;
+    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+
     Data_t line_buf[kTileM][kMaxLineBufRows][kMaxInW];
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -516,16 +604,21 @@ static void input_patch_producer_depthwise(
 #endif
 
     for (unsigned ni = 0; ni < batch; ni++) {
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start = chunk * oh_per_chunk;
+        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
+
         for (unsigned mt = 0; mt < m_tiles; mt++) {
             const unsigned m_off   = mt * kTileM;
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-            // Highest absolute input row currently resident in line_buf
-            // for THIS mt-tile.  Reset per (ni, mt) since line_buf is
-            // overwritten when mt advances.
-            int last_loaded_row = -1;
+            // Highest absolute input row currently resident in line_buf for
+            // THIS (chunk, mt).  Initialise so the first oh in this chunk
+            // triggers a fresh kh-row load (see standard path for rationale).
+            int last_loaded_row =
+                (int)(oh_start * stride_h) - (int)pad_top - 1;
 
-            for (unsigned oh = 0; oh < out_h; oh++) {
+            for (unsigned oh = oh_start; oh < oh_end; oh++) {
                 const int ih_window_max = (int)(oh * stride_h)
                                         - (int)pad_top
                                         + (int)((kh - 1) * dilation_h);
@@ -591,6 +684,7 @@ static void input_patch_producer_depthwise(
                 }
             } // oh loop
         } // mt loop
+      } // chunk loop
     } // batch loop
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -653,18 +747,19 @@ static void input_patch_producer(
 //
 // Standard path (is_depthwise=0):
 //   Iteration order matches process_conv_kernel_tile's Phase 2a nest —
-//   (ni, ict, oh, ow, mt) — so per (oh, ow, mt) the producer emits
-//   m_valid * ic_valid * kh * kw values in (m1, ic_l, khi, kwi) order
-//   (kwi fastest).  Each m1 stripe is read from a contiguous DDR region
-//   (m_axi infers bursts).  The same (ict, mt) slice is replayed
-//   out_h * out_w times — bandwidth-equivalent to the previous inline
-//   load, but now overlapped.
+//   (ni, chunk, ict, oh_in_chunk, ow, mt) — so per (oh, ow, mt) the
+//   producer emits m_valid * ic_valid * kh * kw values in (m1, ic_l, khi,
+//   kwi) order (kwi fastest).  Each m1 stripe is read from a contiguous
+//   DDR region (m_axi infers bursts).  Total DDR weight reads are the
+//   same as without chunking — replay just gets sliced along the chunk
+//   axis instead of one flat (oh, ow) sweep.
 //
 // Depthwise path (is_depthwise=1):
-//   Iteration order matches Phase 2b's once-per-mt hoist — (ni, mt) —
-//   so per (ni, mt) the producer emits m_valid * kh * kw values in
-//   (m1, khi, kwi) order.  Weights are NOT replayed across the inner
-//   (oh, ow) sweep.
+//   Iteration order matches Phase 2b's once-per-(chunk, mt) hoist —
+//   (ni, chunk, mt) — so per (ni, chunk, mt) the producer emits m_valid *
+//   kh * kw values in (m1, khi, kwi) order.  Weights are re-fetched from
+//   DDR num_chunks times per (ni, mt); the per-mt slice is tiny
+//   (kTileM·kh·kw values) so this overhead is negligible.
 // ---------------------------------------------------------------------------
 static void stream_load_weights(
     const Data_t*           weight,
@@ -681,14 +776,21 @@ static void stream_load_weights(
     unsigned is_depthwise
 )
 {
+    unsigned oh_per_chunk, num_chunks;
+    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+
     for (unsigned ni = 0; ni < batch; ni++) {
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start = chunk * oh_per_chunk;
+        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
+
         if (!is_depthwise) {
-            // -------- Standard: replay per (oh, ow, mt) --------
+            // -------- Standard: replay per (oh_in_chunk, ow, mt) --------
             for (unsigned ict = 0; ict < ic_tiles; ict++) {
                 const unsigned ic_off   = ict * kTileIC;
                 const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-                for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned oh = oh_start; oh < oh_end; oh++) {
                     for (unsigned ow = 0; ow < out_w; ow++) {
                         for (unsigned mt = 0; mt < m_tiles; mt++) {
                             const unsigned m_off   = mt * kTileM;
@@ -712,7 +814,7 @@ static void stream_load_weights(
                 }
             } // ict
         } else {
-            // -------- Depthwise: once per (ni, mt) --------
+            // -------- Depthwise: once per (ni, chunk, mt) --------
             for (unsigned mt = 0; mt < m_tiles; mt++) {
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
@@ -728,35 +830,40 @@ static void stream_load_weights(
                 }
             } // mt
         } // depthwise
+      } // chunk
     } // batch
 }
 
 // ---------------------------------------------------------------------------
 // process_conv_kernel_tile — DATAFLOW consumer.
 //
-// Both paths share a persistent partial-output accumulator that survives
-// across ic-tiles (standard) or mt-tiles (depthwise):
+// Output is processed in chunks along the oh axis (see compute_oh_chunking).
+// Each chunk holds chunk_oh_count·out_w·out_ch accumulators in
+// partial_outputs[] and runs the full Option-A three-phase pipeline for its
+// sub-range:
 //
-//   Per ni:
-//     Phase 1 (init):  drain out_h*out_w*out_ch bias values into
-//                      partial_outputs[] (BRAM-resident).
-//     Phase 2 (accum): standard   — for ict OUTER, (oh, ow, mt) inner;
-//                                   load patch[kTileIC][kh][kw],
+//   Per (ni, chunk):
+//     Phase 1 (init):  drain chunk_oh_count*out_w*out_ch bias values into
+//                      partial_outputs[] (BRAM-resident), indexed by
+//                      oh_local = oh - oh_start.
+//     Phase 2 (accum): standard   — for ict OUTER, (oh_in_chunk, ow, mt)
+//                                   inner; load patch[kTileIC][kh][kw],
 //                                   weight[kTileM][kTileIC][kh][kw],
 //                                   reduce ic_valid*kh*kw*kTileM at II=1.
-//                      depthwise  — for mt OUTER, (oh, ow) inner;
+//                      depthwise  — for mt OUTER, (oh_in_chunk, ow) inner;
 //                                   load patch[kTileM][kh][kw],
-//                                   load w_buf[kTileM][kh][kw] ONCE per mt,
-//                                   reduce kh*kw*kTileM at II=1.
+//                                   load w_buf[kTileM][kh][kw] ONCE per
+//                                   (chunk, mt), reduce kh*kw*kTileM at II=1.
 //     Phase 3 (drain): push partial_outputs to acc_stream in
-//                      (oh, ow, mt, m1) order.
+//                      (oh_in_chunk, ow, mt, m1) order.  Concatenated across
+//                      chunks this is (ni, oh, ow, mt, m1) — exactly what
+//                      write_output_tile expects.
 //
-//   Both producers read each x pixel from DDR exactly once per (ni, c):
-//   the standard producer's line_buf is retained across oh within a
-//   single ic-tile; the depthwise producer's line_buf is retained
-//   across oh within a single mt-tile.
+//   Both producers read each x pixel from DDR once per (ni, c, chunk):
+//   line_buf is retained across oh WITHIN a (chunk, ict|mt) but reloads
+//   the (kh-1)-row overlap at chunk boundaries.
 //
-// Memory constraint: out_h*out_w*out_ch <= kMaxAccPersistEntries.
+// Memory constraint: out_w*out_ch <= kMaxAccPersistEntries  (one row fits).
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<Data_t>&    patch_stream,
@@ -783,19 +890,27 @@ static void process_conv_kernel_tile(
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
+    unsigned oh_per_chunk, num_chunks;
+    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+
     AccData_t partial_outputs[kMaxAccPersistEntries];
 
     for (unsigned ni = 0; ni < batch; ni++) {
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start        = chunk * oh_per_chunk;
+        const unsigned oh_end          = std::min(out_h,
+                                                  oh_start + oh_per_chunk);
+        const unsigned chunk_oh_count  = oh_end - oh_start;
 
         // -------- Phase 1: init partial_outputs from bias_stream --------
-        for (unsigned oh = 0; oh < out_h; oh++) {
+        for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
             for (unsigned ow = 0; ow < out_w; ow++) {
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
-                        const unsigned idx = (oh * out_w + ow) * out_ch
+                        const unsigned idx = (oh_local * out_w + ow) * out_ch
                                              + m_off + m1;
                         partial_outputs[idx] = bias_stream.read();
                     }
@@ -809,7 +924,8 @@ static void process_conv_kernel_tile(
                 const unsigned ic_off   = ict * kTileIC;
                 const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
 
-                for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned oh_local = 0; oh_local < chunk_oh_count;
+                     oh_local++) {
                     for (unsigned ow = 0; ow < out_w; ow++) {
                         for (unsigned mt = 0; mt < m_tiles; mt++) {
                             const unsigned m_off   = mt * kTileM;
@@ -823,6 +939,13 @@ static void process_conv_kernel_tile(
                             #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
                             Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
+                            // PN-wide read: accumulate_standard unrolls
+                            // ic_l = 0..kTileIC-1 every cycle, so the
+                            // ic-channel dim of w_buf must give kTileIC
+                            // parallel banks.  m1 is sequentially rotated
+                            // and kh/kw are runtime-shared, so dims 1, 3, 4
+                            // need no partition.
+                            #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=2
 
                             // Read kTileIC*kh*kw patch values from stream.
                             for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
@@ -850,8 +973,8 @@ static void process_conv_kernel_tile(
                                 }
                             }
 
-                            const unsigned idx_base = (oh * out_w + ow) * out_ch
-                                                      + m_off;
+                            const unsigned idx_base =
+                                (oh_local * out_w + ow) * out_ch + m_off;
                             for (unsigned m1 = 0; m1 < kTileM; m1++) {
                                 #pragma HLS UNROLL
                                 acc[m1] = AccData_t(0);
@@ -878,11 +1001,15 @@ static void process_conv_kernel_tile(
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-                // Load weights ONCE per mt (held in BRAM across the
-                // entire (oh, ow) sweep below).  Read m_valid * kh * kw
-                // values from stream (order: m1, khi, kwi — matches
+                // Load weights ONCE per (chunk, mt) (held in BRAM across the
+                // chunk's (oh_in_chunk, ow) sweep below).  Read m_valid *
+                // kh * kw values from stream (order: m1, khi, kwi — matches
                 // stream_load_weights' depthwise path).
                 Data_t w_buf[kTileM][kMaxKH][kMaxKW];
+                // PM-wide read: accumulate_depthwise unrolls
+                // m1 = 0..kTileM-1 every cycle, so the channel dim of
+                // w_buf must give kTileM parallel banks.
+                #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=1
                 for (unsigned m1 = 0; m1 < m_valid; m1++) {
                     for (unsigned khi = 0; khi < kh; khi++) {
                         for (unsigned kwi = 0; kwi < kw; kwi++) {
@@ -892,7 +1019,8 @@ static void process_conv_kernel_tile(
                     }
                 }
 
-                for (unsigned oh = 0; oh < out_h; oh++) {
+                for (unsigned oh_local = 0; oh_local < chunk_oh_count;
+                     oh_local++) {
                     for (unsigned ow = 0; ow < out_w; ow++) {
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
                         #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
@@ -912,8 +1040,8 @@ static void process_conv_kernel_tile(
                             }
                         }
 
-                        const unsigned idx_base = (oh * out_w + ow) * out_ch
-                                                  + m_off;
+                        const unsigned idx_base =
+                            (oh_local * out_w + ow) * out_ch + m_off;
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
                             acc[m1] = AccData_t(0);
@@ -935,20 +1063,21 @@ static void process_conv_kernel_tile(
         } // depthwise
 
         // -------- Phase 3: drain partial_outputs to acc_stream --------
-        for (unsigned oh = 0; oh < out_h; oh++) {
+        for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
             for (unsigned ow = 0; ow < out_w; ow++) {
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
                     const unsigned m_off   = mt * kTileM;
                     const unsigned m_valid = std::min(kTileM, out_ch - m_off);
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
-                        const unsigned idx = (oh * out_w + ow) * out_ch
+                        const unsigned idx = (oh_local * out_w + ow) * out_ch
                                              + m_off + m1;
                         acc_stream.write(partial_outputs[idx]);
                     }
                 }
             }
         }
+      } // chunk
     } // ni
 }
 
@@ -981,11 +1110,26 @@ void ConvKernel(
     // Four m_axi ports allow the tool to issue input, weight, bias, and output
     // transactions on separate AXI buses.  All scalar arguments go into the
     // s_axilite ctrl register file accessed by the PS driver.
+    //
+    // Per-port burst and outstanding-transaction tuning:
+    //   max_{read,write}_burst_length=256  — maximum AXI burst beats (AMBA
+    //                                        allows 256), so a fully widened
+    //                                        bus moves up to one 4 KB page per
+    //                                        burst, amortising address-channel
+    //                                        latency.
+    //   num_{read,write}_outstanding=8     — the m_axi adapter can have up to
+    //                                        8 in-flight bursts before
+    //                                        stalling, hiding DDR round-trip
+    //                                        latency under DATAFLOW.
+    //   m_axi_max_widen_bitwidth is set globally in scripts/Synthesis.tcl.in
+    //   via AXI_BUS_WIDTH (lets users dial it back to match a 128-bit block
+    //   design); not duplicated per-port so the global stays authoritative.
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0
-    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1
-    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2
-    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3
+    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 
+    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 
+    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 
+    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 
+
     #pragma HLS INTERFACE s_axilite port=x            bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=weight       bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=bias         bundle=ctrl
@@ -1008,6 +1152,10 @@ void ConvKernel(
     #pragma HLS INTERFACE s_axilite port=has_bias     bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=is_depthwise bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return       bundle=ctrl
+
+    #pragma HLS STABLE variable=x
+    #pragma HLS STABLE variable=weight
+    #pragma HLS STABLE variable=bias
 
     static_assert(kTileM <= kTileIC,
                   "depthwise mode reuses patch[kTileIC] for TILE_M lanes: "

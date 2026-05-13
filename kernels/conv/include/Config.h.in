@@ -56,26 +56,33 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //
 //   * line_buf   — sized kTileIC * kMaxLineBufRows * kMaxInW.  Per-channel
 //                  circular row buffer that caches the kh-row sliding
-//                  window for the CURRENT ic-tile.  Each input pixel is
-//                  still fetched from DDR exactly once per (ni, channel)
-//                  because the producer's ict loop is OUTER of oh, so
-//                  rows persist across oh iterations within the same
-//                  ic-tile (line_buf is overwritten only when ict
-//                  advances).
+//                  window for the CURRENT (chunk, ic-tile).  Within a
+//                  chunk each input pixel is fetched from DDR exactly
+//                  once per (ni, channel); at chunk transitions the
+//                  (kh-1)-row overlap is re-fetched (duplicate read).
 //   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
 //                  replayed in (r,mt,m1) order.
-//   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds
-//                  out_h*out_w*out_ch AccData_t accumulators that
-//                  survive across ic-tiles in the consumer; initialised
-//                  from bias once per ni and drained to acc_stream after
-//                  the ict loop.
+//   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds one
+//                  output CHUNK's chunk_oh_count*out_w*out_ch AccData_t
+//                  accumulators that survive across ic-tiles within the
+//                  chunk; initialised from bias at chunk start and
+//                  drained to acc_stream at chunk end.  Chunking along
+//                  the oh axis lets the kernel handle outputs larger
+//                  than the buffer; see compute_oh_chunking() in
+//                  ConvKernel.cpp for the strategy.
 //
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh
 //   out_ch   <= kMaxOutCh
 //   in_w     <= kMaxInW
 //   (kh-1)*dilation_h + 1 <= kMaxLineBufRows
-//   out_h * out_w * out_ch <= kMaxAccPersistEntries
+//   out_w * out_ch <= kMaxAccPersistEntries   (one output row must fit)
+//
+// Note: the older "out_h * out_w * out_ch <= kMaxAccPersistEntries"
+// constraint has been relaxed via oh-chunking.  When the full output
+// exceeds the buffer, the kernel transparently splits the oh axis into
+// chunks of oh_per_chunk = floor(kMaxAccPersistEntries / (out_w*out_ch))
+// rows, accepting duplicated input/weight reads at chunk boundaries.
 //
 // kMaxLineBufRows must be a power of 2 (bitmask is used in place of modulo).
 // ---------------------------------------------------------------------------

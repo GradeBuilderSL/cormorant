@@ -775,6 +775,26 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 27: oh-chunking standard.  out_h*out_w*out_ch = 32*32*32 = 32768
+    // exceeds kMaxAccPersistEntries (16384); out_w*out_ch = 1024 fits, so
+    // the kernel splits oh into 2 chunks (16 rows each).  This exercises the
+    // line-buffer reload at chunk boundaries and oh_local indexing in the
+    // consumer.  Small values keep ap_fixed<32,16> well clear of saturation.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=32; p.in_w=32; p.out_ch=32;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("oh-chunking standard (out=32x32x32, 2 chunks)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Depthwise tests (is_depthwise=1).
     // Weight layout: [ch][1][kh][kw]  (no in_ch dimension in weight)
     // -----------------------------------------------------------------------
@@ -921,6 +941,25 @@ int main(int argc, char** argv)
         auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
         total_failures += run_test("DW asymmetric stride h=2 w=1, 8ch → 4x8 out", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31 (DW): oh-chunking depthwise.  32 channels, 32x32 output.
+    // out_h*out_w*out_ch = 32768 > kMaxAccPersistEntries; out_w*out_ch = 1024
+    // fits → 2 chunks of 16 rows each.  Exercises chunk-aware weight reload
+    // in the depthwise consumer (w_buf re-streamed per (chunk, mt)).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=32; p.in_h=32; p.in_w=32; p.out_ch=32;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.3f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.3f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("DW oh-chunking (32ch, 32x32 out, 2 chunks)", p, x, w, b);
     }
 
 #ifdef CONV_HAVE_APFIXED
