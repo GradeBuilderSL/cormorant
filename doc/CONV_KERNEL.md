@@ -67,19 +67,27 @@
 | `kMaxKW` | 7 | Maximum compile-time kernel width |
 | `kMaxInCh` | 1024 | Sizes `bias_buf` (line_buf is IC-tiled, doesn't depend on this) |
 | `kMaxOutCh` | 1024 | Sizes `bias_buf` in `bias_producer` |
-| `kMaxInW` | 64 | Column dimension of `line_buf` |
-| `kMaxLineBufRows` | 16 | Circular row capacity of `line_buf`; power of 2 (used as bitmask) |
+| `kMaxLineBufCols` | 64 | Column capacity of `line_buf`; power of 2 (used as bitmask). Caps `ow_per_tile`, NOT `in_w` — wider inputs split into multiple `ow_tile`s |
+| `kMaxLineBufRows` | 16 | Row capacity of `line_buf`; power of 2 (used as bitmask) |
 | `kMaxAccPersistEntries` | 16384 | `partial_outputs[]` buffer size; one output row (`out_w·out_ch`) must fit |
+| `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab |
 
 If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`.
 
 **Runtime constraints validated by the inference scheduler:**
 
-- `in_ch ≤ kMaxInCh`, `out_ch ≤ kMaxOutCh`, `in_w ≤ kMaxInW`
-- `(kh-1)·dilation_h + 1 ≤ kMaxLineBufRows`
-- `out_w · out_ch ≤ kMaxAccPersistEntries` *(was the stricter `out_h · out_w · out_ch ≤ …` before the oh-chunking restructure)*
+- `in_ch ≤ kMaxInCh`, `out_ch ≤ kMaxOutCh`
+- `(kh-1)·dilation_h + 1 ≤ kMaxLineBufRows` *(one kernel-height window must fit)*
+- `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(one kernel-width window must fit)*
+- `out_w · out_ch ≤ kMaxAccPersistEntries` *(was the stricter `out_h · out_w · out_ch ≤ …` before oh-chunking)*
 
-When `out_h · out_w · out_ch > kMaxAccPersistEntries` the kernel transparently splits the output along the `oh` axis into chunks of `oh_per_chunk = floor(kMaxAccPersistEntries / (out_w·out_ch))` rows; see §5.3.
+`in_h`, `in_w`, and `out_h` are NOT capped — wider / taller layers are handled by transparent tiling:
+
+- `out_h · out_w · out_ch > kMaxAccPersistEntries` triggers **oh-chunking** (output split into `oh_per_chunk = floor(kMaxAccPersistEntries / (out_w·out_ch))` rows; §5.3).
+- `in_w > kMaxLineBufCols` triggers **ow-tiling** (output column axis split so each tile's iw window fits the line buffer; §5.4).
+- `m_tiles > kMaxMperGroup` triggers **M-grouping** (weight cache holds one M-group at a time; §5.5).
+
+All three split axes accept duplicate DDR reads at tile/chunk boundaries — the explicit trade-off in exchange for unbounded layer dimensions.
 
 ---
 
@@ -98,13 +106,14 @@ Data_t    patch[kTileIC][kMaxKH][kMaxKW];
 // Depthwise: patch[m1][khi][kwi]  for current (oh, ow, m_tile);
 // the [kTileIC] depth covers kTileM lanes (kTileM ≤ kTileIC).
 
-// STANDARD-path weight buffer:
-Data_t    w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
-#pragma HLS ARRAY_PARTITION variable=w_buf complete dim=2
-// dim=2 (ic_l, PN axis) partitioned complete → kTileIC parallel banks.
-// accumulate_standard reads kTileIC weights per cycle along the ic_l axis;
-// m1 is sequentially rotated and kh/kw are runtime-shared, so dims 1, 3, 4
-// stay default (no partition).
+// STANDARD-path weight cache (holds one (ict, M-group) slab):
+Data_t    w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW];
+#pragma HLS ARRAY_PARTITION variable=w_cache complete dim=3
+// dim=3 (ic_l, PN axis) partitioned complete → kTileIC parallel banks.
+// Holds mt_per_group_actual mt-tiles' weights, loaded once per
+// (chunk, ict, ow_tile, mg) and reused across the (oh, ow_in_tile) sweep.
+// accumulate_standard reads w_cache[mt_in_group][m1][0..kTileIC-1][khi][kwi]
+// — one read per bank per cycle.
 
 // DEPTHWISE-path weight buffer (different shape — no in_ch dimension):
 Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
@@ -122,14 +131,18 @@ AccData_t partial_outputs[kMaxAccPersistEntries];
 // ic-tiles (standard) or mt-tiles (depthwise) within a chunk.  Indexed
 // by (oh_local·out_w + ow)·out_ch + m_off + m1 where oh_local = oh - oh_start.
 
-// Per-(ni, chunk, ict) line buffer — lives in the standard patch producer:
-Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxInW];
-// Within a (chunk, ict) each input pixel is fetched from DDR exactly once;
-// the (kh-1)-row overlap is re-fetched at chunk boundaries.
+// Per-(ni, chunk, ict, ow_tile) line buffer — lives in the standard
+// patch producer.  Both row and column dims are circular:
+//     row_slot = ih & (kMaxLineBufRows - 1)
+//     col_slot = iw & (kMaxLineBufCols - 1)
+Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
+// Within (chunk, ict, ow_tile) each input pixel in the tile's iw range
+// is fetched from DDR exactly once.  Reloaded per ow_tile (different
+// iw range); the (kw-1)·dilation_w-col overlap is re-fetched.
 
-// Per-(ni, chunk, mt) line buffer — depthwise variant, same shape but
-// indexed by m1 instead of ic_l:
-Data_t    line_buf[kTileM][kMaxLineBufRows][kMaxInW];
+// Per-(ni, chunk, mt, ow_tile) line buffer — depthwise variant, same
+// shape but indexed by m1 instead of ic_l:
+Data_t    line_buf[kTileM][kMaxLineBufRows][kMaxLineBufCols];
 ```
 
 ---
@@ -157,22 +170,32 @@ for ni in [0, batch)
       partial_outputs[(oh_local·out_w + ow)·out_ch + m_off + m1]
          = bias_stream.read()
 
-    // PHASE 2a: accumulate (ict OUTER of oh_in_chunk)
+    // PHASE 2a: accumulate
     for ict in [0, ceil(in_ch / kTileIC))
-      for oh_local in [0, chunk_oh)
-        for ow in [0, out_w)
-          for mt in [0, ceil(out_ch / kTileM))
-            // Drain kTileIC × kh × kw patch values from patch_stream — PIPELINE II=1
-            // Drain m_valid × ic_valid × kh × kw weights from weight_stream — PIPELINE II=1
-            // acc[0..kTileM-1] := partial_outputs[idx_base + …]    (II=1)
-            // accumulate_standard():
-            //   for ri in [0, kh · kw · kTileM):                   PIPELINE II=1
-            //     m1 = ri & (kTileM - 1)                           // lane rotation
-            //     lane_sum = Σ_{ic_l = 0..kTileIC-1, UNROLL}
-            //                  patch[ic_l][khi][kwi] · w_buf[m1][ic_l][khi][kwi]
-            //                  // w_buf masked to 0 for ic_l ≥ ic_valid (X-prop guard)
-            //     acc[m1] += lane_sum
-            // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+      for ow_tile in [0, num_ow_tiles)                  // §5.4 ow-tiling
+        ow_start = ow_tile · ow_per_tile
+        ow_end   = min(out_w, ow_start + ow_per_tile)
+        for mg in [0, num_m_groups)                     // §5.5 M-grouping
+          // Load mt_per_group_actual mt-tiles' weights into w_cache ONCE
+          // per (ict, ow_tile, mg) — no per-(oh, ow) replay.
+          for mt_in_group in [0, mt_per_group_actual)
+            // Drain m_valid × ic_valid × kh × kw weights from weight_stream
+            // into w_cache[mt_in_group][m1][ic_l][khi][kwi]         (II=1)
+
+          for oh_local in [0, chunk_oh)
+            for ow in [ow_start, ow_end)
+              // Drain kTileIC × kh × kw patch values from patch_stream — II=1
+              for mt_in_group in [0, mt_per_group_actual)
+                // acc[0..kTileM-1] := partial_outputs[idx_base + …]    (II=1)
+                // accumulate_standard(patch, w_cache[mt_in_group], …):
+                //   for ri in [0, kh · kw · kTileM):                   PIPELINE II=1
+                //     m1 = ri & (kTileM - 1)                           // lane rotation
+                //     lane_sum = Σ_{ic_l = 0..kTileIC-1, UNROLL}
+                //                  patch[ic_l][khi][kwi]
+                //                · w_cache[mt_in_group][m1][ic_l][khi][kwi]
+                //                  // weight masked to 0 for ic_l ≥ ic_valid (X-prop guard)
+                //     acc[m1] += lane_sum
+                // partial_outputs[idx_base + …] := acc[m1]              (II=1)
 
     // PHASE 3: drain partial_outputs to acc_stream — PIPELINE II=1
     for oh_local, ow, mt, m1:
@@ -184,6 +207,12 @@ the unrolled `ic_l` loop).  Loop bound shrinks from
 `ic_valid · kh · kw · kTileM` to `kh · kw · kTileM`; lane rotation on `m1`
 preserves the kTileM-cycle RAW distance on `acc[m1]`.
 
+**Weight DDR replay is eliminated for `(oh, ow)`** — weights for one
+`(ict, ow_tile, M-group)` are loaded once into `w_cache` and reused
+across the entire spatial sweep of that ow_tile.  Per `(ni, chunk)` each
+weight is read from DDR `num_ow_tiles · num_m_groups` times (both
+factors are 1 in the common case).
+
 ### 5.2 Depthwise Convolution — consumer loop nest
 
 ```
@@ -191,25 +220,29 @@ for ni in [0, batch)
   for chunk in [0, num_chunks)
     // PHASE 1: identical to standard
 
-    // PHASE 2b: accumulate (mt OUTER of oh_in_chunk)
+    // PHASE 2b: accumulate
     for mt in [0, ceil(out_ch / kTileM))
       // Load w_buf[kTileM][kh][kw] ONCE per (chunk, mt) — PIPELINE II=1
-      for oh_local in [0, chunk_oh)
-        for ow in [0, out_w)
-          // Drain kTileM × kh × kw patch values from patch_stream — II=1
-          // acc[0..kTileM-1] := partial_outputs[idx_base + …]   (II=1)
-          // accumulate_depthwise():
-          //   for ri in [0, kh · kw):                            PIPELINE II=1
-          //     for m1 in [0, kTileM), UNROLL:
-          //       acc[m1] += patch[m1][khi][kwi] · w_buf[m1][khi][kwi]
-          // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+      for ow_tile in [0, num_ow_tiles)                  // §5.4 ow-tiling
+        ow_start = ow_tile · ow_per_tile
+        ow_end   = min(out_w, ow_start + ow_per_tile)
+        for oh_local in [0, chunk_oh)
+          for ow in [ow_start, ow_end)
+            // Drain kTileM × kh × kw patch values from patch_stream — II=1
+            // acc[0..kTileM-1] := partial_outputs[idx_base + …]   (II=1)
+            // accumulate_depthwise():
+            //   for ri in [0, kh · kw):                            PIPELINE II=1
+            //     for m1 in [0, kTileM), UNROLL:
+            //       acc[m1] += patch[m1][khi][kwi] · w_buf[m1][khi][kwi]
+            // partial_outputs[idx_base + …] := acc[m1]              (II=1)
 
     // PHASE 3: drain — identical to standard
 ```
 
 **Inner-MAC throughput is `kTileM` MACs/cycle** (PM-wide channel-parallel
 lanes; depthwise has no input-channel reduction).  Loop bound shrinks from
-`kh · kw · kTileM` to `kh · kw`.
+`kh · kw · kTileM` to `kh · kw`.  Depthwise weights stay cached across
+all ow_tiles within an mt — only patches see the per-ow_tile re-emission.
 
 ### 5.3 oh-chunking
 
@@ -231,15 +264,65 @@ all producers + the consumer so the linear stream order seen by
 
 **Duplicate-read overhead** at chunk boundaries:
 
-- Input: the patch producer's `line_buf` is invalidated when (chunk, ict) advances; the next chunk re-loads its first kh-row window (`(kh-1)·stride_h` rows re-fetched per (ni, ict) chunk transition).
-- Weights (standard path): unchanged — weights were already replayed per `(oh, ow, mt)`; chunking just slices the replay axis.
+- Input: `line_buf` is invalidated when `(chunk, ict, ow_tile)` advances; the next chunk re-loads its first kh-row window (`(kh-1)·stride_h` rows × tile_cols re-fetched per chunk transition).
+- Weights (standard path): re-emitted per `(chunk, ict, ow_tile, mg)` — `num_chunks` factor in DDR weight reads.
 - Weights (depthwise path): the small per-mt slice (`kTileM·kh·kw` values) is reloaded `num_chunks` times per `(ni, mt)`. Negligible.
 
 For the common case (`out_h · out_w · out_ch ≤ kMaxAccPersistEntries`)
 `num_chunks = 1` and the chunk loop adds only a few cycles of wrapper
 overhead.  See `compute_oh_chunking()` in `ConvKernel.cpp`.
 
-### 5.4 HLS pragmas
+### 5.4 ow-tiling
+
+The line buffer's column capacity `kMaxLineBufCols` (a compile-time
+power-of-2 bound) limits how many input columns are simultaneously
+resident on-chip.  `in_w` is NOT capped — the patch producers split the
+output column axis into `ow_tile`s whose iw window fits the buffer:
+
+```
+window_w     = (kw - 1) · dilation_w + 1
+ow_per_tile  = max(1, (kMaxLineBufCols - window_w) / stride_w + 1)
+num_ow_tiles = ceil(out_w / ow_per_tile)
+```
+
+Within an `ow_tile`, `line_buf` indexes both row AND column dims
+circularly:
+
+```
+row_slot = ih & (kMaxLineBufRows - 1)
+col_slot = iw & (kMaxLineBufCols - 1)
+```
+
+The `ow_tile` loop is INSIDE `ict` (standard) or `mt` (depthwise) but
+OUTSIDE `mg` and `(oh, ow_in_tile)`.  At each `ow_tile` transition the
+`(kw-1)·dilation_w-col` overlap is re-fetched from DDR — the duplicate
+read accepted in exchange for unbounded `in_w`.  For
+`out_w ≤ ow_per_tile` (the common case) `num_ow_tiles = 1` and there is
+no overhead.  See `compute_ow_tiling()` in `ConvKernel.cpp`.
+
+### 5.5 M-grouping (weight caching)
+
+To eliminate weight DDR replay across the inner `(oh, ow)` sweep, the
+consumer keeps an on-chip weight slab `w_cache` covering one
+`(ict, ow_tile, M-group)`:
+
+```
+mt_per_group = min(kMaxMperGroup, m_tiles)
+num_m_groups = ceil(m_tiles / mt_per_group)
+```
+
+When `m_tiles ≤ kMaxMperGroup` the entire ic-tile's weights fit in one
+group and each weight is read from DDR exactly once per
+`(ni, chunk, ict, ow_tile)`.  Otherwise the M-axis splits into groups,
+each loaded fresh from DDR.  Patches are streamed once per
+`(ow_tile, mg, oh, ow_in_tile)` and reused across the group's
+`mt_in_group` iterations.  See `compute_m_grouping()` in `ConvKernel.cpp`.
+
+This combines with §2.8's PN-wide adder tree to give the inner-MAC its
+throughput AND its bandwidth advantage: without M-grouping the inner
+reduction would be stream-rate-bound on `weight_stream`.
+
+### 5.6 HLS pragmas
 
 | Pragma | Location | Effect |
 |--------|----------|--------|
@@ -248,14 +331,14 @@ overhead.  See `compute_oh_chunking()` in `ConvKernel.cpp`.
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable={x,weight,bias}` | top-level | Tells HLS the base pointers don't change across DATAFLOW processes |
 | `ARRAY_PARTITION variable=patch complete dim=0` | `patch[kTileIC][kMaxKH][kMaxKW]` | All cells become registers |
-| `ARRAY_PARTITION variable=w_buf complete dim=2` | standard `w_buf[kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks for the PN unroll |
+| `ARRAY_PARTITION variable=w_cache complete dim=3` | standard `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks on the ic_l axis for the PN unroll |
 | `ARRAY_PARTITION variable=w_buf complete dim=1` | depthwise `w_buf[kTileM][kMaxKH][kMaxKW]` | kTileM banks for the PM unroll |
 | `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileM]` | All accumulators in registers |
 | `PIPELINE II=1` | every load / reduce / drain loop | One iteration per clock |
 | `UNROLL` | inner `ic_l` loop (standard) / inner `m1` loop (depthwise) | Replicates MACs across the parallel axis |
 | `STREAM depth=…` | every `hls::stream` between dataflow stages | FIFO sizing (e.g. `weight_stream` = `kTileM·kTileIC·kMaxKH·kMaxKW`) |
 
-### 5.5 II=1 achievability in the reduce loops
+### 5.7 II=1 achievability in the reduce loops
 
 **Standard (`accumulate_standard`).**  Each PIPELINE iteration fires a
 `kTileIC`-wide PN adder tree feeding one `acc[m1] += lane_sum` per cycle.
@@ -290,7 +373,7 @@ weight input; no DSP impact.
 
 ## 7. Test Coverage (`TestConvSim.cpp`)
 
-32 test cases compiled with GCC (no Vitis required). Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench currently uses pre-baked fixtures for 30 of these (the saturation and chunking tests are C-sim-only until `make gen_conv_test_data` is re-run).
+34 test cases compiled with GCC (no Vitis required). Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench currently uses pre-baked fixtures for 30 of these (the §2.9 chunking, §2.10 M-grouping, and §2.11 wide-input tests are C-sim-only until `make gen_conv_test_data` is re-run).
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
@@ -305,6 +388,8 @@ weight input; no DSP impact.
 | Standard conv — asymmetric pad/stride/dilation | 7×7 stride=2 asymmetric pad; 3×3 stride h=2 w=1; 3×3 dilation h=1 w=2 |
 | Standard conv — batch + tiling | batch=3 C=TILE_IC M=TILE_M stride=2 (ResNet-style) |
 | **Standard conv — oh-chunking** | **out=32×32×32 (2 chunks; exercises §5.3)** |
+| **Standard conv — M-grouping** | **out_ch=64 (m_tiles=8, num_m_groups=2; exercises §5.5)** |
+| **Standard conv — ow-tiling** | **in_w=128 (3 ow-tiles; exercises §5.4)** |
 | Depthwise conv | 3×3 no-bias; 3×3 pad=1+bias; partial TILE_M+3; dilation=2; stride=2 pad=1; batch=2; exact TILE_M×2 + bias; 5×5 kernel; asymmetric stride |
 | **Depthwise conv — oh-chunking** | **32 ch / 32×32 out (2 chunks)** |
 | Saturation (ap_fixed only) | std positive overflow → AP_MAX; std negative overflow → AP_MIN; DW positive overflow → AP_MAX |
@@ -371,16 +456,19 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=8 MACs/cycle |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
 | **Dataflow stages** | 6 (input_patch_producer, broadcast_patches, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
-| **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; duplicate input rows re-fetched at chunk boundaries |
+| **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
+| **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
+| **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
 | **AXI-Lite registers** | 21 scalars |
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |
 | **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time) |
-| **Persistent acc constraint** | `out_w·out_ch ≤ kMaxAccPersistEntries` *(was `out_h·out_w·out_ch ≤ …` pre-chunking)* |
+| **Persistent acc constraint** | `out_w·out_ch ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
+| **Line-buffer column constraint** | `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(in_w no longer capped — wider inputs auto-tiled along ow)* |
 | **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag |
 | **Weight layout (standard)** | `[out_ch][in_ch][kh][kw]` |
 | **Weight layout (depthwise)** | `[out_ch][1][kh][kw]` |
 | **AXI-Lite base address** | `0xA002_0000` |
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` |
-| **Test coverage** | 32 C-sim cases (30 covered by RTL fixtures pending fixture regen for the two oh-chunking tests) |
+| **Test coverage** | 34 C-sim cases (30 covered by RTL fixtures; 4 newer §2.9–§2.11 tests are C-sim-only pending fixture regen) |

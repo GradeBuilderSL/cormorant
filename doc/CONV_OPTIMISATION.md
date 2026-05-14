@@ -9,15 +9,17 @@ For the high-level kernel description see [CONV_KERNEL.md](CONV_KERNEL.md);
 this file is a complement focused on the optimization arc and the current
 final architecture.
 
-> **Status (2026-05-14).**  §2.7 (weight streaming), §2.8 (PN/PM parallel
-> MACs + X-prop guard) and §2.9 (oh-chunking) are written up against
-> measured `conv-verify` snapshots.  §2.1–§2.6 still have TODO cells —
-> structural outlines reflect the optimisation passes visible in the
-> current source (dataflow stages in `csynth.rpt`, the Option-A IC-tiling
-> design in `Config.h.in`, the existing branch history
-> `conv_optimisation_1..3`); per-step numbers and rationale for those
-> earlier steps need to come from the commit history and the original
-> author's notes.  §2.10 (URAM double-buffer) is the next planned step.
+> **Status (2026-05-15).**  §2.7 (weight streaming), §2.8 (PN/PM
+> parallel MACs + X-prop guard), §2.9 (oh-chunking), §2.10 (weight
+> caching + M-grouping), and §2.11 (ow-tiling — lifted the in_w cap)
+> are written up against measured `conv-verify` snapshots.  §2.1–§2.6
+> still have TODO cells — structural outlines reflect the optimisation
+> passes visible in the current source (dataflow stages in
+> `csynth.rpt`, the Option-A IC-tiling design in `Config.h.in`, the
+> existing branch history `conv_optimisation_1..3`); per-step numbers
+> and rationale for those earlier steps need to come from the commit
+> history and the original author's notes.  §2.12 (URAM double-buffer)
+> is the next planned step.
 
 ---
 
@@ -26,9 +28,9 @@ final architecture.
 All numbers are total `sim_time_ns` reported by the kv260 behavior testbench
 after running the full TestConvRef case list.
 
-> Latest baseline (branch `conv_optimisation_3`, 30 RTL tests, post-§2.9):
-> **sim_time_ns = 3,861,515 ns** (sum of per-test `duration_ns` =
-> 3,859,315 ns).  Captured by `conv-verify` Gate 4 on **2026-05-14** —
+> Latest baseline (branch `conv_optimisation_3`, 30 RTL tests, post-§2.11):
+> **sim_time_ns = 2,673,625 ns** (sum of per-test `duration_ns` =
+> 2,671,425 ns).  Captured by `conv-verify` Gate 4 on **2026-05-15** —
 > see `build/kernels/conv/kv260/conv_timing_last.json`.
 
 | Stage | Tests | sim_time_ns | Δ vs prior | Δ vs §2.7 |
@@ -44,11 +46,13 @@ after running the full TestConvRef case list.
 | + Weight streaming (`stream_load_weights`, §2.7) | 30 | 4,913,835 | **-5.6 %** | — |
 | **Snapshot post-§2.7 (captured 2026-05-12)** | **30** | **4,913,835** | — | reference |
 | + PN/PM parallel MACs (§2.8) | 30 | 3,844,095 | **-21.8 %** | -21.8 % |
-| + oh-chunking (§2.9, this snapshot) | 30 | 3,861,515 | +0.5 % | **-21.4 %** |
-| **Current state (post-§2.9, captured 2026-05-14)** | **30** | **3,861,515** | — | **-21.4 %** |
-| **+ Double buffering (planned — see [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md), §2.10)** | TODO | TODO | TODO | TODO |
+| + oh-chunking (§2.9) | 30 | 3,861,515 | +0.5 % | -21.4 % |
+| + Weight caching + M-grouping (§2.10) | 30 | 2,636,945 | **-31.7 %** | -46.3 % |
+| + ow-tiling (§2.11, this snapshot) | 30 | 2,673,625 | +1.4 % | **-45.6 %** |
+| **Current state (post-§2.11, captured 2026-05-15)** | **30** | **2,673,625** | — | **-45.6 %** |
+| **+ Double buffering (planned — see [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md), §2.12)** | TODO | TODO | TODO | TODO |
 
-**Net result vs §2.7 snapshot: 1.27× faster across 30 RTL tests; 21.4 %
+**Net result vs §2.7 snapshot: 1.84× faster across 30 RTL tests; 45.6 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
 (needs `conv_optimisation_1` re-run for the pre-§2.1 column).**
 
@@ -346,25 +350,159 @@ consumer's three phases.
 `kMaxAccPersistEntries`) and `kernels/conv/kernel/ConvKernel.cpp`
 (`compute_oh_chunking()` helper).
 
-### 2.10. Double buffering (planned)
+### 2.10. Weight caching + M-grouping
+
+**Problem.**  After §2.7–§2.9 the consumer's MAC reduction was no longer
+the long pole — the `weight_stream` drain was.  `stream_load_weights`
+replayed the full `(ic_valid · kh · kw)` weight slab per `(oh, ow, mt)`
+iteration, so every DDR weight was read `out_h · out_w` times per
+`(ni, chunk, ict)`.  On `batch_3 ResNet-style` (the heaviest test) this
+came to ~7M DDR weight reads for what is actually a 9 KB filter.
+
+**Change.**  Hoist the weight load out of `(oh, ow)`.  The consumer now
+caches one `(ict, M-group)` slab on-chip and reuses it across the chunk's
+spatial sweep.  When `m_tiles` exceeds the cache capacity, M-axis splits
+into groups of `mt_per_group` mt-tiles; each group's slab is loaded
+fresh from DDR.
+
+- **`compute_m_grouping()` helper:**
+  ```
+  mt_per_group = min(kMaxMperGroup, m_tiles)
+  num_m_groups = ceil(m_tiles / mt_per_group)
+  ```
+  New CMake var `CONV_MAX_M_PER_GROUP` (default 4, = up to 32 channels
+  per group at kTileM=8).
+- **`stream_load_weights` standard path:** rewritten as
+  `(ni, chunk, ict, mg, mt_in_group)` — weights emitted ONCE per
+  `(ni, chunk, ict, mg)`, no per-spatial replay.
+- **`process_conv_kernel_tile` Phase 2a:** added `mg` loop inside `ict`.
+  New `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with
+  `#pragma HLS ARRAY_PARTITION variable=w_cache complete dim=3` (kTileIC
+  banks on the ic_l axis to feed the §2.8 PN-wide adder tree).  Per
+  `(ict, mg)`: load `w_cache` once from `weight_stream`, then sweep
+  `(oh_local, ow, mt_in_group)` reusing cached weights.  Patches read
+  once per `(mg, oh_local, ow)` and reused across `mt_in_group`.
+- **`input_patch_producer_standard`:** added `mg` loop OUTER of
+  `(oh, ow)` inside `(chunk, ict)`.  line_buf retained across m_groups
+  so patches are re-emitted from on-chip BRAM without DDR re-read.
+- **`ConvKernel` top:** `broadcast_iters` multiplies by `num_m_groups`
+  for standard; `broadcast_factor = 1u` (the producer handles the
+  m_group replay so `broadcast_patches` is a passthrough).
+
+**Result.** **-31.7 % sim_time_ns** vs §2.9 (3,861,515 → 2,636,945).
+Wins concentrated on tests where the weight DDR replay dominated:
+
+| Test | Δ% | Δns |
+|---|---:|---:|
+| `1x1 IC=TILE_IC*2 M=TILE_M*2 bias exact tiles` | **-79.7 %** | -501,020 |
+| `batch_3 ResNet-style 7×7 stride=2` (heaviest) | **-69.7 %** | -550,930 |
+| `partial_M_tile out_ch=TILE_M+3` | **-37.1 %** | -84,490 |
+| `partial_IC_tile in_ch=TILE_IC+5` | -23.6 % | -47,810 |
+| `3×3 → 1×1 out` | -22.2 % | -7,560 |
+
+The 11 depthwise tests move ≤ ±60 ns (≤ 0.1 %) — depthwise already
+loaded weights once per `(chunk, mt)` so the caching has no effect
+there.  New C-sim test `M-grouping standard (out_ch=64, 2 M-groups)`
+exercises `num_m_groups = 2` (m_tiles=8, kMaxMperGroup=4) and validates
+the multi-group path.
+
+**Synthesis impact.** No II violations; top-level slack unchanged at
+**-0.90 ns**.  Resources:
+BRAM 87 (30 %) → 102 (35 %) — the new w_cache slab;
+DSP 178 → 191 (+7 %);
+FF 62,195 → 66,606 (+7 %);
+LUT 52,492 (44 %) → 55,938 (47 %, +7 %).
+
+### 2.11. ow-tiling — lift the in_w cap
+
+**Problem.**  `line_buf` was sized `[…][kMaxLineBufRows][kMaxInW]` and
+the runtime invariant required `in_w ≤ kMaxInW` (= 64 by default), which
+ruled out a lot of real-world layers (any 128- or 224-column input
+needed at minimum).  The Python scheduler validated the bound and
+rejected oversized layers up-front.
+
+**Change.**  Rename `CONV_MAX_IN_W` → `CONV_MAX_LINE_BUF_COLS`: the
+constant now bounds the line-buffer column dim, NOT `in_w`.  Wider
+inputs are handled by tiling the output column axis.
+
+- **`compute_ow_tiling()` helper:**
+  ```
+  window_w     = (kw - 1) · dilation_w + 1
+  ow_per_tile  = max(1, (kMaxLineBufCols - window_w) / stride_w + 1)
+  num_ow_tiles = ceil(out_w / ow_per_tile)
+  ```
+  Relaxed constraint: `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols`
+  (one kernel-width window must fit) — versus the old `in_w ≤ kMaxInW`.
+- **`line_buf` reshape:** `[…][kMaxLineBufRows][kMaxLineBufCols]` with
+  CIRCULAR indexing on both dims now:
+  ```
+  row_slot = ih & (kMaxLineBufRows - 1)
+  col_slot = iw & (kMaxLineBufCols - 1)
+  ```
+  Both `kMaxLineBufRows` and `kMaxLineBufCols` are static_assert'd as
+  powers of 2.
+- **Both patch producers:** ow_tile loop INSIDE `ict` (standard) /
+  `mt` (depthwise), OUTSIDE `mg` (standard) / `(oh, ow)` (depthwise).
+  `last_loaded_row` resets per `(chunk, ict|mt, ow_tile)`.  Phase 1
+  clips iw to `[max(0, iw_load_start), min(in_w-1, iw_load_last)]`,
+  loading only the tile's iw range.  Phase 2 reads via
+  `col_slot = iw & (kMaxLineBufCols-1)`.
+- **`stream_load_weights` standard path:** ow_tile loop INSIDE `ict`,
+  OUTSIDE `mg`.  Weights re-emitted per `(ict, ow_tile, mg)` —
+  multi-tile layers pay an `num_ow_tiles ×` weight DDR replay.  New
+  signature: takes `stride_w` and `dilation_w` so it can call
+  `compute_ow_tiling()`.
+- **`process_conv_kernel_tile`:**
+  - Phase 2a (standard): `(ict, ow_tile, mg, oh_local, ow_in_tile, mt_in_group)` nest.
+  - Phase 2b (depthwise): `(mt, ow_tile, oh_local, ow_in_tile)` — `w_buf` stays cached across all ow_tiles for the mt (depthwise weights are tiny, no need to re-load per tile).
+
+**Result.** **+1.4 % sim_time_ns** vs §2.10 (2,636,945 → 2,673,625).
+All 30 RTL tests have `in_w ≤ 64` so `num_ow_tiles = 1` for all of
+them; the +1.4 % is the wrapper-loop overhead (ow_start/ow_end
+arithmetic + clipped-iw range computation in Phase 1).  New C-sim test
+`wide input ow-tiling (in_w=128, 3 ow-tiles)` exercises the multi-tile
+path (default `kMaxLineBufCols=64`, kw=3, stride=1 →
+`ow_per_tile = 62`, `out_w=128 → num_ow_tiles=3`).
+
+**Synthesis impact.** No II violations; top-level slack unchanged at
+**-0.90 ns**.  Resources:
+BRAM 102 (35 %) → 102 (35 %) — unchanged (line_buf shape changed but
+total cells unchanged at the default kMaxLineBufCols=64);
+DSP 191 → 188;
+FF 66,606 → 74,726 (+12 %) — ow_tile counters, iw clipping state;
+LUT 55,938 (47 %) → 66,802 (57 %, +19 %) — Phase 1 clipped-iw range
+arithmetic + circular col-slot computation.  LUT is now the tightest
+resource; further optimisation here (e.g. shifting line_buf cols across
+tiles instead of reloading) could trim the LUT growth back.
+
+**Documentation.**  Constraint summary in `kernels/conv/include/Config.h.in`
+fully rewritten — `in_h`, `in_w`, and `out_h` are now ALL handled by
+transparent tiling (oh-chunking, ow-tiling); only the kernel-window
+fits and `out_w·out_ch ≤ kMaxAccPersistEntries` remain as hard
+constraints.
+
+### 2.12. Double buffering (planned)
 
 See [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md) for the
 full plan.  Summary: slab-level double-buffering on the URAM weight
 slab so the next ic-tile's `w_slab` loads while the current tile is
 computing.  After §2.7 the weight load is already overlapped within a
-single tile; after §2.8 the compute is PN/PM-wide; the URAM step's
-remaining wins are (a) eliminating the spatial replay on the standard
-path (1930× fewer DDR weight reads per the plan), and (b) covering
-larger ic-tiles (`TILE_IC_WIDE` ≥ 64) per outer iteration.
+single tile; after §2.8 the compute is PN/PM-wide; after §2.10 the
+weight DDR replay is eliminated; after §2.11 there is no in_w cap.
+The URAM step's remaining wins are (a) bulk weight loads into URAM at
+m_axi widening (today the inner loops are bound by stream rate, not
+DDR), and (b) larger ic-tiles (`TILE_IC_WIDE` ≥ 64) per outer
+iteration for higher arithmetic intensity.
 
-**Status.** Deferred — not yet started.  §2.7 captured the overlap win,
-§2.8 captured the inner-MAC parallelism win, §2.9 relaxed the
-output-size constraint; the DDR-bandwidth and tile-width wins of the
-URAM rework remain unrealised.
+**Status.** Deferred — not yet started.  §2.7 captured the overlap
+win, §2.8 captured the inner-MAC parallelism, §2.9 relaxed the
+output-size constraint, §2.10 eliminated weight DDR replay, §2.11
+eliminated the in_w constraint; the URAM rework's remaining wins
+(stream widening, larger ic-tiles) are unrealised.
 
 ---
 
-## 3. Current architecture (post-§2.9)
+## 3. Current architecture (post-§2.11)
 
 ```mermaid
 flowchart LR
@@ -372,11 +510,11 @@ flowchart LR
     DDR_W[("weight<br/>gmem1")]
     DDR_B[("bias<br/>gmem2")]
     DDR_Y[("y<br/>gmem3")]
-    IPP["input_patch_producer<br/><i>standard + depthwise</i><br/>owns line_buf<br/><i>oh-chunked (§2.9)</i>"]
-    BC["broadcast_patches<br/><i>IC×M broadcast</i>"]
-    SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9)</i>"]
+    IPP["input_patch_producer<br/><i>standard + depthwise</i><br/>owns line_buf<br/><i>oh-chunked (§2.9), ow-tiled (§2.11)</i>"]
+    BC["broadcast_patches<br/><i>passthrough (factor=1)</i>"]
+    SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
-    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries]</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); oh-chunked (§2.9)</i>"]
+    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] + w_cache (§2.10)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11)</i>"]
     WO["<i>output write</i>"]
 
     DDR_X -->|m_axi read| IPP
@@ -403,62 +541,64 @@ flowchart LR
 
 **Six dataflow stages**, all running concurrently:
 
-1. **`input_patch_producer`** — owns `line_buf[kTileIC][kMaxLineBufRows][kMaxInW]`;
-   reads `x[]` from `gmem0`.  Standard variant iterates
-   `(ni, chunk, ict, oh_in_chunk, ow, ic_l, khi, kwi)` with `ict` outer
-   of `oh` and chunk wrapping `(ict, oh)` (line buffer reused across
-   `oh` within one `(chunk, ic-tile)`); depthwise variant substitutes
-   `mt` for `ict`.  Within a chunk each x pixel is fetched from DDR
-   exactly once per `(ni, c)`; the `(kh-1)·stride_h`-row overlap is
-   re-fetched at chunk boundaries (§2.9 duplicated-read overhead).
+1. **`input_patch_producer`** — owns
+   `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]` (standard) or
+   `line_buf[kTileM][…][…]` (depthwise) with circular indexing on BOTH
+   row and column dims; reads `x[]` from `gmem0`.  Standard variant
+   iterates `(ni, chunk, ict, ow_tile, mg, oh, ow_in_tile, ic_l, khi,
+   kwi)` — chunk wraps (ict, oh) for §2.9, ow_tile wraps (mg, oh, ow)
+   for §2.11, mg wraps (oh, ow) for §2.10 patch re-emission;
+   depthwise variant substitutes `mt` for `ict` and skips `mg`.  Within
+   a `(chunk, ict|mt, ow_tile)` each x pixel in the tile's iw range is
+   fetched from DDR exactly once per `(ni, c)`; the
+   `(kh-1)·stride_h`-row overlap is re-fetched at chunk transitions and
+   the `(kw-1)·dilation_w`-col overlap at ow_tile transitions.
    Emits to `patch_pipe`.
-2. **`broadcast_patches`** — buffers one ic-tile's patch
-   (`kTileIC × kMaxKH × kMaxKW`) and re-emits it `m_tiles` times for
-   the standard path (passthrough for depthwise).  This is what lets
-   the patch producer read `x[]` once and the consumer see it
-   per-`mt`.  Emits to `patch_stream`.  Chunk-agnostic — sees the same
-   linear `(ni, oh, ow)` outer iteration count regardless of
-   `num_chunks`.
+2. **`broadcast_patches`** — passthrough since §2.10 (the standard
+   producer's `mg` loop already emits patches `num_m_groups` times per
+   `(ict, ow_tile, oh, ow_in_tile)`).  Kept for ABI stability with the
+   pre-§2.10 dataflow graph; degenerate `broadcast_factor=1`.
 3. **`bias_producer`** — loads `bias_buf[kMaxOutCh]` once from `gmem2`
    and replays it `batch × out_h × out_w × m_tiles` times in
    `(r, mt, m1)` order to match the consumer's Phase-1 init pattern.
-   Chunk-agnostic.
-4. **`stream_load_weights`** (§2.7, chunk-aware after §2.9) — owns the
-   `gmem1` AXI master.  Standard path replays
-   `m_valid × ic_valid × kh × kw` weights per `(oh_in_chunk, ow, mt)`
-   iteration in `(m1, ic_l, khi, kwi)` order; depthwise path emits
-   `m_valid × kh × kw` once per `(ni, chunk, mt)`.  Emits to
-   `weight_stream` (depth 6,272).
+   Chunk-/tile-agnostic.
+4. **`stream_load_weights`** (§2.7, restructured by §2.9/§2.10/§2.11)
+   — owns the `gmem1` AXI master.  Standard path emits weights in
+   `(ni, chunk, ict, ow_tile, mg, mt_in_group, m1, ic_l, khi, kwi)`
+   order — ONCE per `(ict, ow_tile, mg)`, no per-spatial replay
+   (§2.10).  Depthwise path emits `m_valid × kh × kw` once per
+   `(ni, chunk, mt)`.  Emits to `weight_stream` (depth 6,272).
 5. **`process_conv_kernel_tile`** — owns
-   `partial_outputs[kMaxAccPersistEntries]` (BRAM, ~64 KB at
-   defaults).  Per `(ni, chunk)`: Phase 1 inits the chunk's
+   `partial_outputs[kMaxAccPersistEntries]` (BRAM, ~64 KB at defaults)
+   AND `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` (§2.10).
+   Per `(ni, chunk)`: Phase 1 inits the chunk's
    `chunk_oh_count·out_w·out_ch` accumulators from `bias_stream`;
-   Phase 2a/2b accumulates over `ict`/`mt` outer with `oh_local =
-   oh - oh_start` indexing, the inner loop reading patch + weights
-   from the streams and running:
+   Phase 2a/2b accumulates with `oh_local = oh - oh_start` indexing,
+   the inner loop reading patch from `patch_stream` and weights from
+   `w_cache` (loaded once per `(ict, ow_tile, mg)`) and running:
    - Standard: an II=1 lane-rotated reduce with a `kTileIC`-wide PN
      adder tree (§2.8) → **kTileIC MACs/cycle**.
    - Depthwise: an II=1 PM-wide channel-parallel reduce (§2.8) →
      **kTileM MACs/cycle**.
    Phase 3 drains the chunk's `partial_outputs` to `acc_stream`.
 6. **`write_output_tile`** — saturates `AccData_t → Data_t` and writes
-   to `gmem3` in `(ni, oh, ow, mt, m1)` order.  Chunk-agnostic — the
-   concatenated `(ni, chunk, oh_in_chunk, ow, mt, m1)` stream order
-   flattens to the same linear order it expected pre-§2.9.
+   to `gmem3` in `(ni, oh, ow, mt, m1)` order.  Chunk-/tile-agnostic —
+   the consumer's drain phase concatenates the per-chunk sub-ranges
+   into the linear stream order this stage expects.
 
-**Loop nest** (consumer, standard path):
-`(ni, chunk outer, ict, oh_in_chunk, ow, mt)` with a PN-wide
-lane-rotated inner reduction; depthwise consumer is
-`(ni, chunk outer, mt, oh_in_chunk, ow)` with a PM-wide parallel
-reduce and the weight load hoisted out of `(oh_in_chunk, ow)`.
+**Loop nest** (consumer, standard path, post-§2.11):
+`(ni, chunk, ict, ow_tile, mg, oh_in_chunk, ow_in_tile, mt_in_group)`
+with a PN-wide lane-rotated inner reduction reading from `w_cache`.
+Depthwise consumer: `(ni, chunk, mt, ow_tile, oh_in_chunk, ow_in_tile)`
+with a PM-wide parallel reduce and `w_buf` cached across all ow_tiles.
 
 **Cycle counts per `(oh, ow, mt)` iteration** at the consumer's hot loop
-(standard path, post-§2.9):
+(standard path, post-§2.11):
 
 | Loop body | II | Cycles per iteration | Δ vs §2.7 |
 |---|---:|---:|---|
 | Patch read (`patch_stream` drain) | 1 | `kTileIC × kh × kw` | unchanged |
-| Weight read (`weight_stream` drain) | 1 | `m_valid × ic_valid × kh × kw` | unchanged |
+| Weight read (`weight_stream` drain) | 1 | **hoisted out of (oh, ow)** (§2.10) — amortised across the chunk's spatial sweep |
 | `accumulate_standard` MAC reduction | 1 | `kh × kw × kTileM` | **÷ `ic_valid` (§2.8)** |
 | Partial accumulator read/write | 1 | `2 × m_valid` | unchanged |
 
@@ -470,19 +610,17 @@ Depthwise hot loop, per `(oh, ow)`:
 | `accumulate_depthwise` MAC reduction | 1 | `kh × kw` | **÷ `kTileM` (§2.8)** |
 | Partial accumulator read/write | 1 | `2 × m_valid` | unchanged |
 
-**Current bottleneck.**  After §2.8 the inner-MAC reduction is no longer
-the long pole.  For the standard path the new dominant inner cost is
-the **weight read** (`m_valid · ic_valid · kh · kw` cycles per
-`(oh, ow, mt)`), serialised after the patch read; for the depthwise
-path it's the **patch read** (`kTileM · kh · kw` per `(oh, ow)`).  The
-remaining throughput paths are:
+**Current bottleneck.**  After §2.10 the standard path's weight read is
+no longer per-(oh, ow) and after §2.8 the MAC reduction is parallel,
+so the inner hot loop is now dominated by the **patch read** for
+standard (kTileIC · kh · kw cycles per (oh, ow, mt_in_group)) — exactly
+the same situation as depthwise.  Remaining throughput paths:
 
-- **Stream widening / `ap_uint<128>` weight packing.**  `weight_stream`
-  carries one `Data_t` per cycle; AXI-Lite global widening only helps
-  the m_axi adapter, not the stream rate.  Packing N weights per beat
-  into a wider stream type would let the consumer's read loop drop by
+- **Stream widening / `ap_uint<128>` patch packing.**  `patch_stream`
+  carries one `Data_t` per cycle.  Packing N patches per beat into a
+  wider stream type would let the consumer's patch-read loop drop by
   N×.  Risk: requires touching all four AXI clients consistently.
-- **URAM weight slab + loop inversion** — §2.10 below.
+- **URAM weight slab + loop inversion** — §2.12 below.
 
 ---
 
@@ -504,9 +642,10 @@ migration.
 | `CONV_MAX_KW` | `kMaxKW` | 7 | `kw ≤ this` | Compile-time kernel-width bound. |
 | `CONV_MAX_IN_CH` | `kMaxInCh` | 1024 | `in_ch ≤ this` | Sizes `bias_buf` only — line_buf is IC-tiled. |
 | `CONV_MAX_OUT_CH` | `kMaxOutCh` | 1024 | `out_ch ≤ this` | Sizes `bias_buf` in `bias_producer`. |
-| `CONV_MAX_IN_W` | `kMaxInW` | 64 | `in_w ≤ this` | Sizes the column dim of `line_buf`. |
+| `CONV_MAX_LINE_BUF_COLS` | `kMaxLineBufCols` | 64 | power of 2; `(kw-1)*dil_w + 1 ≤ this` *(was `in_w ≤ this` pre-§2.11)* | Column capacity of `line_buf`; bitmask for col-slot wrapping.  Wider inputs auto-split along `ow` — see §2.11 / `compute_ow_tiling()`. |
 | `CONV_MAX_LINE_BUF_ROWS` | `kMaxLineBufRows` | 16 | power of 2; `(kh-1)*dil_h + 1 ≤ this` | Circular row capacity. |
 | `CONV_MAX_ACC_PERSIST_ENTRIES` | `kMaxAccPersistEntries` | 16384 | `out_w*out_ch ≤ this`  *(was `out_h*out_w*out_ch ≤ this` pre-§2.9)* | Persistent accumulator (Option-A) size; sized to hold one output chunk.  Larger outputs auto-split along `oh` — see §2.9 / `compute_oh_chunking()`. |
+| `CONV_MAX_M_PER_GROUP` | `kMaxMperGroup` | 4 | none (runtime clamped to `m_tiles`) | Max mt-tiles cached together in the standard path's `(ict, M-group)` weight slab.  Sizes `w_cache` in `process_conv_kernel_tile`.  Larger values eliminate weight DDR replay for more layers in one group; smaller saves BRAM/LUT.  See §2.10 / `compute_m_grouping()`. |
 
 ### 4.2. How CMake reads the values
 
@@ -530,66 +669,66 @@ if not, mark as a deferred TODO.
 
 ## 5. Per-test progression highlights
 
-All 30 RTL tests, three snapshots: post-§2.7 (2026-05-12), post-§2.8
-(2026-05-13), post-§2.9 (2026-05-14, current).  Sorted by `Post-§2.7`
-descending so the structural drop from §2.8 is easy to read off.
-Source: `build/kernels/conv/kv260/conv_timing_last.json` (post-§2.9
-totals: sum-of-`duration_ns` = 3,859,315 ns; `sim_time_ns` =
-3,861,515 ns).  The `Baseline (pre-§2.1)` column is TODO — needs a
-`conv_optimisation_1` tag re-run.
+All 30 RTL tests, five snapshots: post-§2.7 (2026-05-12), post-§2.8
+(2026-05-13), post-§2.9 (2026-05-14), post-§2.10 (2026-05-14),
+post-§2.11 (2026-05-15, current).  Sorted by `Post-§2.7` descending so
+the cumulative drop is easy to read off.  Source:
+`build/kernels/conv/kv260/conv_timing_last.json` (post-§2.11 totals:
+sum-of-`duration_ns` = 2,671,425 ns; `sim_time_ns` = 2,673,625 ns).
+The `Baseline (pre-§2.1)` column is TODO.
 
-| Test | Baseline (pre-§2.1) | Post-§2.7 (ns) | Post-§2.8 (ns) | Δ§2.8 | Post-§2.9 (ns) | Δ§2.9 |
-|---|---:|---:|---:|---:|---:|---:|
-| `batch_3__C_TILE_IC_M_TILE_M_stride_2__ResNet-style_` | TODO | 1,262,520 | 790,230 | **-37.4 %** | 790,930 | +0.1 % |
-| `1x1__IC_TILE_IC_2_M_TILE_M_2_bias__exact_tiles_` | TODO | 629,550 | 628,390 | -0.2 % | 628,980 | +0.1 % |
-| `partial_IC_tile__in_ch_TILE_IC_5_` | TODO | 540,890 | 201,880 | **-62.7 %** | 202,510 | +0.3 % |
-| `partial_M_tile__out_ch_TILE_M_3_` | TODO | 227,080 | 227,220 | +0.1 % | 227,850 | +0.3 % |
-| `DW_ch_TILE_M_2__exact_tile___bias` | TODO | 211,900 | 167,310 | -21.0 % | 168,090 | +0.5 % |
-| `DW_partial_M_tile__ch_TILE_M_3_` | TODO | 192,610 | 145,170 | -24.6 % | 145,810 | +0.4 % |
-| `DW_batch_2__4ch__pad_1` | TODO | 179,020 | 131,520 | -26.5 % | 132,110 | +0.4 % |
-| `DW_3x3__4ch__pad_1__has_bias` | TODO | 161,550 | 119,320 | -26.1 % | 119,310 | -0.0 % |
-| `batch_2__3x3__pad_1` | TODO | 158,880 | 161,910 | +1.9 % | 162,510 | +0.4 % |
-| `DW_5x5_kernel__4ch_____5x5_out` | TODO | 139,500 | 97,500 | **-30.1 %** | 98,130 | +0.6 % |
-| `DW_asymmetric_stride_h_2_w_1__8ch_____4x8_out` | TODO | 109,170 | 103,950 | -4.8 % | 104,570 | +0.6 % |
-| `1x5_horizontal_filter__pad_left_pad_right_2` | TODO | 95,620 | 98,000 | +2.5 % | 98,560 | +0.6 % |
-| `DW_3x3__4ch__no_pad__no_bias` | TODO | 96,220 | 77,950 | -19.0 % | 78,650 | +0.9 % |
-| `3x3__pad_1__has_bias__2_out_ch` | TODO | 88,760 | 90,300 | +1.7 % | 90,280 | -0.0 % |
-| `3x3_dilation_2_____5x5_out` | TODO | 85,340 | 86,870 | +1.8 % | 87,490 | +0.7 % |
-| `3x3__asymmetric_dilation_h_1_w_2_____5x5_out` | TODO | 84,190 | 85,720 | +1.8 % | 86,310 | +0.7 % |
-| `3x3__pad_1__same______5x5_out` | TODO | 84,290 | 85,790 | +1.8 % | 86,380 | +0.7 % |
-| `non-square__6x8_input__3x5_kernel` | TODO | 83,970 | 84,890 | +1.1 % | 85,540 | +0.8 % |
-| `DW_stride_2__8ch__pad_1` | TODO | 77,900 | 75,250 | -3.4 % | 75,910 | +0.9 % |
-| `DW_3x3_dilation_2__4ch` | TODO | 74,980 | 64,130 | -14.5 % | 64,790 | +1.0 % |
-| `5x5_kernel_____3x3_out` | TODO | 71,670 | 72,130 | +0.6 % | 72,770 | +0.9 % |
-| `3x3_input_3x3_kernel_____1x1_out__C_TILE_IC_M_TILE_M` | TODO | 44,090 | 33,390 | -24.3 % | 34,020 | +1.9 % |
-| `1x1_kernel__1ch__no_bias` | TODO | 38,545 | 38,615 | +0.2 % | 39,245 | +1.6 % |
-| `3x3__no_pad__no_bias_____3x3_out` | TODO | 35,030 | 35,590 | +1.6 % | 36,150 | +1.6 % |
-| `7x7__stride_2__asymmetric_pad__1_1_0_0_` | TODO | 34,640 | 35,160 | +1.5 % | 35,740 | +1.6 % |
-| `3x3__asymmetric_stride_h_2_w_1_____2x4_out` | TODO | 33,140 | 33,670 | +1.6 % | 34,230 | +1.7 % |
-| `3x3__stride_2_____2x2_out` | TODO | 19,790 | 20,020 | +1.2 % | 20,640 | +3.1 % |
-| `saturation__positive_overflow_____AP_MAX` | TODO | 17,920 | 17,990 | +0.4 % | 18,600 | +3.4 % |
-| `saturation__negative_overflow_____AP_MIN` | TODO | 17,880 | 17,950 | +0.4 % | 18,550 | +3.3 % |
-| `DW_saturation__positive_overflow_____AP_MAX` | TODO | 14,990 | 14,080 | -6.1 % | 14,660 | +4.1 % |
-| **TOTAL** | **TODO** | **4,911,635** | **3,841,895** | **-21.8 %** | **3,859,315** | **+0.5 %** |
+| Test | §2.7 | §2.8 | §2.9 | §2.10 | Δ§2.10 | §2.11 | Δ§2.11 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `batch_3 ResNet-style` | 1,262,520 | 790,230 | 790,930 | 240,000 | **-69.7 %** | 243,680 | +1.5 % |
+| `1x1 IC*2 M*2 bias exact tiles` | 629,550 | 628,390 | 628,980 | 127,960 | **-79.7 %** | 129,680 | +1.3 % |
+| `partial_IC_tile in_ch=TILE_IC+5` | 540,890 | 201,880 | 202,510 | 154,700 | -23.6 % | 156,640 | +1.3 % |
+| `partial_M_tile out_ch=TILE_M+3` | 227,080 | 227,220 | 227,850 | 143,360 | **-37.1 %** | 144,690 | +0.9 % |
+| `DW_ch=TILE_M*2 exact bias` | 211,900 | 167,310 | 168,090 | 168,150 | +0.0 % | 169,080 | +0.6 % |
+| `DW_partial_M ch=TILE_M+3` | 192,610 | 145,170 | 145,810 | 145,870 | +0.0 % | 146,720 | +0.6 % |
+| `DW_batch_2 4ch pad=1` | 179,020 | 131,520 | 132,110 | 132,150 | +0.0 % | 133,710 | +1.2 % |
+| `DW_3x3 4ch pad bias` | 161,550 | 119,320 | 119,310 | 119,290 | -0.0 % | 120,090 | +0.7 % |
+| `batch_2 3x3 pad_1` | 158,880 | 161,910 | 162,510 | 158,180 | -2.7 % | 160,750 | +1.6 % |
+| `DW_5x5 4ch` | 139,500 | 97,500 | 98,130 | 98,100 | -0.0 % | 99,010 | +0.9 % |
+| `DW_asym stride 8ch` | 109,170 | 103,950 | 104,570 | 104,580 | +0.0 % | 105,370 | +0.8 % |
+| `1x5 horizontal pad=2` | 95,620 | 98,000 | 98,560 | 94,780 | -3.8 % | 96,340 | +1.6 % |
+| `DW_3x3 4ch no_pad` | 96,220 | 77,950 | 78,650 | 78,640 | -0.0 % | 79,490 | +1.1 % |
+| `3x3 pad_1 bias 2 outch` | 88,760 | 90,300 | 90,280 | 86,190 | -4.5 % | 87,500 | +1.5 % |
+| `3x3 dilation=2` | 85,340 | 86,870 | 87,490 | 84,840 | -3.0 % | 86,110 | +1.5 % |
+| `3x3 asym dilation h=1 w=2` | 84,190 | 85,720 | 86,310 | 84,140 | -2.5 % | 85,380 | +1.5 % |
+| `3x3 pad_1 same` | 84,290 | 85,790 | 86,380 | 84,210 | -2.5 % | 85,440 | +1.5 % |
+| `non-square 6x8 3x5` | 83,970 | 84,890 | 85,540 | 81,110 | -5.2 % | 82,230 | +1.4 % |
+| `DW_stride_2 8ch pad=1` | 77,900 | 75,250 | 75,910 | 75,900 | -0.0 % | 76,720 | +1.1 % |
+| `DW_3x3 dilation=2 4ch` | 74,980 | 64,130 | 64,790 | 64,770 | -0.0 % | 65,620 | +1.3 % |
+| `5x5 kernel` | 71,670 | 72,130 | 72,770 | 70,520 | -3.1 % | 71,490 | +1.4 % |
+| `3x3 → 1x1 out` | 44,090 | 33,390 | 34,020 | 26,460 | **-22.2 %** | 27,220 | +2.9 % |
+| `1x1 kernel 1ch` | 38,545 | 38,615 | 39,245 | 36,725 | -6.4 % | 37,995 | +3.5 % |
+| `3x3 no_pad no_bias` | 35,030 | 35,590 | 36,150 | 35,310 | -2.3 % | 36,250 | +2.7 % |
+| `7x7 stride_2 asym pad` | 34,640 | 35,160 | 35,740 | 35,340 | -1.1 % | 36,340 | +2.8 % |
+| `3x3 asym stride h=2 w=1` | 33,140 | 33,670 | 34,230 | 32,830 | -4.1 % | 33,770 | +2.9 % |
+| `3x3 stride_2` | 19,790 | 20,020 | 20,640 | 20,340 | -1.5 % | 21,170 | +4.1 % |
+| `saturation positive AP_MAX` | 17,920 | 17,990 | 18,600 | 17,850 | -4.0 % | 18,760 | +5.1 % |
+| `saturation negative AP_MIN` | 17,880 | 17,950 | 18,550 | 17,780 | -4.2 % | 18,710 | +5.2 % |
+| `DW saturation AP_MAX` | 14,990 | 14,080 | 14,660 | 14,670 | +0.1 % | 15,470 | +5.5 % |
+| **TOTAL** | **4,911,635** | **3,841,895** | **3,859,315** | **2,634,745** | **-31.7 %** | **2,671,425** | **+1.4 %** |
 
-Observations on the post-§2.9 snapshot:
+Observations on the post-§2.11 snapshot:
 
-- `batch_3 ResNet-style` (0.79 ms) is still the dominant test —
-  **20 %** of total sim time, down from 26 % at §2.7.  The §2.8
-  PN-wide unroll cut its inner MAC reduction by ~16×, which is the
-  bulk of the -472 k ns improvement.
-- `1x1 IC=TILE_IC*2 bias exact tiles` (629 k ns) barely moved across
-  §2.8/§2.9 because its inner reduction was already cheap (1×1 kernel
-  means `kh·kw = 1`); for this test the weight-read loop is dominant
-  and the next gains require stream widening or §2.10.
-- The 11 depthwise tests collectively: 0.91 ms (**24 %**, down from
-  30 % at §2.7).  §2.8 PM-wide unroll cut their per-`(oh, ow)`
-  reduction by `kTileM=8×`; the wins are uniform across the depthwise
-  suite (-19 % to -30 %).
-- §2.9 (chunking) adds a uniform +0.5–1.7 % wrapper-loop overhead
-  across nearly every test (no test uses `num_chunks > 1` in the RTL
-  fixture set).  Aggregate cost of the 30 chunking deltas: +17 k ns,
-  vs. the -1,069 k ns aggregate gain from §2.8.
+- `batch_3 ResNet-style` (0.24 ms) — was 1.26 ms at §2.7 (5.2× faster
+  cumulative).  §2.8 PN/PM unroll cut the MAC reduction; §2.10 weight
+  caching eliminated the `out_h·out_w` weight DDR replay.  Now **9 %**
+  of total sim time, down from 26 % at §2.7.
+- `1x1 IC*2 M*2 bias exact tiles` (0.13 ms) — was 0.63 ms at §2.7
+  (4.9× faster cumulative).  §2.10 dominates the win here (1×1 layers
+  have a cheap reduction but pay full weight DDR replay).
+- The 11 depthwise tests collectively: 1.11 ms (**41 %** of total,
+  up from 24 % at §2.9 — depthwise tests didn't benefit from §2.10
+  weight caching since they already cached weights once per (chunk,
+  mt)).  Depthwise is now the relative hot spot of the workload.
+- §2.9 (chunking) + §2.10 (M-grouping) + §2.11 (ow-tiling) add a small
+  per-test wrapper-loop overhead.  All 30 RTL tests have
+  `num_chunks=1`, `num_m_groups=1`, AND `num_ow_tiles=1`, so they pay
+  only the cost of the loop scaffolding — biggest individual mover
+  +5.5 % on the tiny `DW_saturation` test.
 
 TODO: backfill the `Baseline (pre-§2.1)` column from a
 `conv_optimisation_1`-tag re-run.
@@ -598,44 +737,61 @@ TODO: backfill the `Baseline (pre-§2.1)` column from a
 
 ## 6. Where the floor is now
 
-After §2.9 the heaviest test (`batch_3 ResNet-style`) is at 0.79 ms
-out of 3.86 ms total — the §2.8 PN/PM unroll dropped the inner-MAC
-reduction by ~16× (standard) / 8× (depthwise), shifting the bottleneck
-to the stream-read loops that feed the MAC array.  Worst-slack
-sub-block in `csynth.rpt` is `process_conv_kernel_tile` at
-**-0.90 ns** — unchanged through §2.8/§2.9, so the MAC pipeline is
-still the timing-critical path, just no longer the cycle-count
-bottleneck.
+After §2.11 the heaviest test (`batch_3 ResNet-style`) is at 0.24 ms
+out of 2.67 ms total — 5.2× faster than at §2.7.  Worst-slack
+sub-block in `csynth.rpt` is `process_conv_kernel_tile` at **-0.90 ns**
+— unchanged across §2.8 → §2.11, so the MAC pipeline is still the
+timing-critical path.  Resource pressure is now LUT-dominated: at
+57 % usage after §2.11, room for more loop scaffolding is shrinking.
 
-Two remaining throughput paths:
+Distribution of the remaining work (§2.11 snapshot):
 
-- **Stream widening (packed weight stream).**  `weight_stream` carries
-  one `Data_t` per cycle, so the consumer's weight-read loop runs at
-  `m_valid · ic_valid · kh · kw` cycles per `(oh, ow, mt)` —
-  bandwidth-bound at the stream rate.  Packing N weights per
-  `hls::stream` beat (e.g. `ap_uint<128>` carrying 8 ap_fixed<16,8>)
-  would let the consumer read N× faster.  Same widening is applicable
-  to `patch_stream`.  Risk: requires touching the producer, the
-  consumer, and the `broadcast_patches` stage consistently.
-- **URAM weight slab + loop inversion** — §2.10 below.
+- 11 depthwise tests: 1.11 ms / 2.67 ms (**41 %**) — depthwise didn't
+  benefit from §2.10 since it already had once-per-mt weight caching.
+  Now the relative hot spot.
+- 19 standard tests: 1.56 ms / 2.67 ms (**59 %**) — wide spread, with
+  `batch_3 ResNet-style` (240 k ns) and `1x1 IC*2 M*2 bias exact tiles`
+  (130 k ns) the dominant contributors after the §2.10 weight-replay
+  collapse.
+
+Remaining throughput paths:
+
+- **Stream widening (packed patch / weight streams).**  After §2.10
+  weight reads are amortised across the chunk's spatial sweep, but the
+  inner hot loop is now bound by the patch-stream drain
+  (`kTileIC · kh · kw` cycles per `(oh, ow, mt_in_group)`).  Packing
+  N patches per `hls::stream` beat (e.g. `ap_uint<128>` carrying 8
+  ap_fixed<16,8>) would let the consumer read N× faster.  Risk:
+  requires touching the producer, the consumer, and the
+  `broadcast_patches` stage consistently.
+- **Stream-rate-matched accumulator.**  The MAC reduce is now faster
+  than the patch read; reordering so the patch read overlaps multiple
+  mt_in_group accumulations would help.
+- **URAM weight slab** — §2.12 below.
+- **LUT optimisation.**  The §2.11 ow-tiling added ~10 % LUT.  Some
+  could be reclaimed by simplifying the iw-clipping arithmetic
+  (currently sign-aware int math); switching to unsigned with a
+  pre-padded virtual range might be cleaner.
 
 ### 6.1. Tried and rejected: TODO
 
 TODO — list speculative changes that were tried and discarded, with the
 measurement that ruled them out.
 
-### 6.2. Pending: double-buffered URAM weight slab (§2.10)
+### 6.2. Pending: double-buffered URAM weight slab (§2.12)
 
-See [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md).  Note that
-§2.7 captured the *overlap* portion of "Bottleneck A" from the plan,
-§2.8 captured the inner-MAC parallelism, §2.9 relaxed the
-output-buffer constraint; the remaining wins of the URAM rework are
-(a) eliminating spatial replay on the standard path (plan estimates
-**1930× reduction** in weight DDR reads for a 14×14 layer with M=8,
-C=64, K=3) and (b) larger ic-tiles per outer iteration
-(`TILE_IC_WIDE` ≥ 64).  Expected speedup: TODO × — re-estimate against
-the post-§2.9 baseline (3.86 ms), not the original plan's pre-§2.7
-model.  **Status:** deferred, not yet started.
+See [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md).  Note
+that §2.7 captured the *overlap* portion of "Bottleneck A" from the
+plan, §2.8 captured the inner-MAC parallelism, §2.9 relaxed the
+output-buffer constraint, §2.10 eliminated the spatial weight replay
+(via the (ict, ow_tile, M-group) cache), §2.11 lifted the in_w cap.
+The remaining wins of the URAM rework are (a) larger ic-tiles per
+outer iteration (`TILE_IC_WIDE` ≥ 64) for higher arithmetic intensity,
+and (b) bulk weight loads that benefit from m_axi widening — today
+the consumer is no longer weight-bound but the m_axi adapter still
+reads `Data_t`-sized cells.  Expected speedup: TODO × — re-estimate
+against the post-§2.11 baseline (2.67 ms).  **Status:** deferred, not
+yet started.
 
 ---
 
@@ -643,18 +799,25 @@ model.  **Status:** deferred, not yet started.
 
 | Configuration | C-sim (TestConvRef) | RTL sim (behavior_test_conv) |
 |---|---|---|
-| Default (kMaxInW=64, kMaxLineBufRows=16, kMaxAccPersistEntries=16384) | 32/32 PASS | 30/30 PASS |
+| Default (kMaxLineBufCols=64, kMaxLineBufRows=16, kMaxAccPersistEntries=16384, kMaxMperGroup=4) | 34/34 PASS | 30/30 PASS |
 | Reduced cache (TODO) | TODO | (not run) |
 | Increased cache (TODO) | TODO | (not run) |
 
-**C-sim (32) vs RTL (30) delta:** the two oh-chunking tests added in
-§2.9 (`oh-chunking standard (out=32×32×32)` and `DW oh-chunking 32 ch
-32×32 out`) exercise `num_chunks = 2` in C-sim but the HDL fixtures
-under `hw/test_data/conv_test_data/` are still the 30-test set
-captured before §2.9.  Regenerating with `make gen_conv_test_data` and
-re-running `make behavior_test_conv` would extend RTL coverage to 32/32
-at the cost of one extra fixture-gen run (~seconds) plus the longer
-xsim run.  Deferred until the next behavior-test sweep.
+**C-sim (34) vs RTL (30) delta:** four C-sim tests added in §2.9–§2.11
+exercise the new tiling/grouping paths but the HDL fixtures under
+`build/kernels/conv/kv260/conv_test_data/` are still the 30-test set
+captured before §2.9:
+
+| Test | Section | num_chunks | num_m_groups | num_ow_tiles |
+|---|---|---:|---:|---:|
+| `oh-chunking standard (out=32×32×32)` | §2.9 | 2 | 1 | 1 |
+| `DW oh-chunking (32ch, 32×32 out)` | §2.9 | 2 | n/a | 1 |
+| `M-grouping standard (out_ch=64)` | §2.10 | 1 | 2 | 1 |
+| `wide input ow-tiling (in_w=128)` | §2.11 | 1 | 1 | 3 |
+
+Regenerating with `make gen_conv_test_data` + re-running
+`make behavior_test_conv` would extend RTL coverage to 34/34.  Deferred
+until the next behavior-test sweep.
 
 ---
 
@@ -662,12 +825,12 @@ xsim run.  Deferred until the next behavior-test sweep.
 
 | File | What changed |
 |---|---|
-| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; `ARRAY_PARTITION variable=w_buf complete dim=2` (standard) and `dim=1` (depthwise) added inside `process_conv_kernel_tile`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop added INNER to `ni` in `input_patch_producer_standard`, `input_patch_producer_depthwise`, `stream_load_weights`, `process_conv_kernel_tile`; `last_loaded_row` initialised to `(oh_start·stride_h - pad_top) - 1` per `(ni, chunk, ict\|mt)`; `partial_outputs` indexed by `oh_local = oh - oh_start`. |
-| `kernels/conv/include/Config.h.in` | Templates `kTileM`, `kTileIC`, `kMaxKH`, `kMaxKW`, `kMaxInCh`, `kMaxOutCh`, `kMaxInW`, `kMaxLineBufRows`, `kMaxAccPersistEntries` from CMake-side variables.  **§2.9:** comment block on `kMaxAccPersistEntries` updated to document the relaxed `out_w·out_ch ≤ kMaxAccPersistEntries` constraint and the chunking strategy. |
-| `kernels/conv/CMakeLists.txt` | TODO — currently CMake `CACHE STRING`s; migrate to `kernels.conv` block in `platforms/<name>.json` to match pool (§4.1). |
+| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop INNER to `ni` in both producers + `stream_load_weights` + consumer; `last_loaded_row` per-chunk init; `partial_outputs` indexed by `oh_local`.  **§2.10:** new `compute_m_grouping()` helper; mg loop in standard producer (patch re-emission), in `stream_load_weights` standard path (once per (ict, mg)), and in consumer Phase 2a; `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with `ARRAY_PARTITION complete dim=3`; `broadcast_factor` reduced to 1.  **§2.11:** new `compute_ow_tiling()` helper; ow_tile loop in both producers + `stream_load_weights` standard path + consumer Phase 2a/2b; `line_buf` reshaped to `[…][kMaxLineBufRows][kMaxLineBufCols]` with circular indexing on BOTH dims; Phase 1 iw clipping. |
+| `kernels/conv/include/Config.h.in` | Templates `kTileM`, `kTileIC`, `kMaxKH`, `kMaxKW`, `kMaxInCh`, `kMaxOutCh`, `kMaxLineBufCols`, `kMaxLineBufRows`, `kMaxAccPersistEntries`, `kMaxMperGroup` from CMake-side variables.  **§2.9:** documented `out_w·out_ch ≤ kMaxAccPersistEntries` relaxed constraint.  **§2.10:** added `kMaxMperGroup` constant + doc block.  **§2.11:** renamed `kMaxInW` → `kMaxLineBufCols`; doc block fully rewritten — `in_h`/`in_w`/`out_h` no longer capped, only kernel-window-fits and `out_w·out_ch ≤ kMaxAccPersistEntries` remain.  Added `static_assert((kMaxLineBufCols & …) == 0)`. |
+| `kernels/conv/CMakeLists.txt` | TODO — currently CMake `CACHE STRING`s; migrate to `kernels.conv` block in `platforms/<name>.json` to match pool (§4.1).  **§2.10:** added `CONV_MAX_M_PER_GROUP` cache var.  **§2.11:** renamed `CONV_MAX_IN_W` → `CONV_MAX_LINE_BUF_COLS`. |
 | `platforms/<name>.json` | TODO — add `kernels.conv` section once the migration lands. |
 | `inference-scheduler/src/_conv_hw_config.py` | TODO — does not yet exist; create when the JSON migration lands.  Mirror `_pool_hw_config.py::resolve(platform_name)`. |
-| `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds (kH, kW, in_ch, out_ch, in_w, dilated kh span).  **§2.9:** persistent-accumulator constraint relaxed from `out_h·out_w·out_ch ≤ kMaxAccPersistEntries` to `out_w·out_ch ≤ kMaxAccPersistEntries`; scheduler validator should be updated to match. |
-| `kernels/conv/test/TestConvSim.cpp` | 32 tests (was 30 pre-§2.9).  **§2.9:** added `oh-chunking standard (out=32×32×32, 2 chunks)` and `DW oh-chunking (32ch, 32×32 out, 2 chunks)` — both exercise the multi-chunk path in C-sim. |
-| `hw/test_data/conv_test_data/` | 30-test fixtures for kv260 RTL sim.  Two §2.9 chunking tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 32/32. |
-| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll, partition pragmas, X-prop guard) and §2.9 (chunking; relaxed constraint; updated test count). |
+| `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds.  **§2.9:** persistent-accumulator constraint relaxed to `out_w·out_ch ≤ kMaxAccPersistEntries`.  **§2.11:** `in_w ≤ kMaxInW` constraint REMOVED — replaced by `(kw-1)·dil_w + 1 ≤ kMaxLineBufCols`.  Scheduler validator should be updated to match. |
+| `kernels/conv/test/TestConvSim.cpp` | 34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`. |
+| `hw/test_data/conv_test_data/` | 30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
+| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set). |
