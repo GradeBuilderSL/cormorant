@@ -46,7 +46,7 @@ static constexpr unsigned kMaxKH   = @CONV_MAX_KH@;
 static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 
 // ---------------------------------------------------------------------------
-// kMaxInCh / kMaxOutCh / kMaxInW / kMaxLineBufRows / kMaxAccPersistEntries
+// kMaxInCh / kMaxOutCh / kMaxLineBufCols / kMaxLineBufRows / kMaxAccPersistEntries
 //
 // Compile-time upper bounds for the on-chip buffers in the standard-conv
 // path.  The Option-A IC-tiling design shrinks the per-channel buffers
@@ -54,12 +54,17 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 // at the cost of keeping a persistent partial-output buffer of
 // kMaxAccPersistEntries elements that survives across ic-tiles.
 //
-//   * line_buf   — sized kTileIC * kMaxLineBufRows * kMaxInW.  Per-channel
-//                  circular row buffer that caches the kh-row sliding
-//                  window for the CURRENT (chunk, ic-tile).  Within a
-//                  chunk each input pixel is fetched from DDR exactly
-//                  once per (ni, channel); at chunk transitions the
-//                  (kh-1)-row overlap is re-fetched (duplicate read).
+//   * line_buf   — sized kTileIC * kMaxLineBufRows * kMaxLineBufCols.
+//                  Per-channel sliding window over rows (circular slot
+//                  = ih & (kMaxLineBufRows-1)) AND columns (circular
+//                  slot = iw & (kMaxLineBufCols-1)).  Within an
+//                  (ow-tile, chunk, ic-tile) each input pixel in the
+//                  tile's iw range is fetched from DDR exactly once per
+//                  (ni, channel); at tile boundaries the
+//                  (kw-1)*dilation_w-col overlap is re-fetched, and at
+//                  chunk boundaries the (kh-1)*stride_h-row overlap is
+//                  re-fetched (duplicate reads accepted in exchange for
+//                  not capping in_h or in_w).
 //   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
 //                  replayed in (r,mt,m1) order.
 //   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds one
@@ -74,27 +79,62 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh
 //   out_ch   <= kMaxOutCh
-//   in_w     <= kMaxInW
-//   (kh-1)*dilation_h + 1 <= kMaxLineBufRows
-//   out_w * out_ch <= kMaxAccPersistEntries   (one output row must fit)
+//   (kh-1)*dilation_h + 1 <= kMaxLineBufRows   (kernel-height window fits)
+//   (kw-1)*dilation_w + 1 <= kMaxLineBufCols   (kernel-width window fits)
+//   out_w * out_ch <= kMaxAccPersistEntries     (one output row fits)
 //
-// Note: the older "out_h * out_w * out_ch <= kMaxAccPersistEntries"
-// constraint has been relaxed via oh-chunking.  When the full output
-// exceeds the buffer, the kernel transparently splits the oh axis into
-// chunks of oh_per_chunk = floor(kMaxAccPersistEntries / (out_w*out_ch))
-// rows, accepting duplicated input/weight reads at chunk boundaries.
+// in_h, in_w, and out_h are NOT capped by the kernel — wider/taller layers
+// are handled by oh-chunking and ow-tiling, which split those axes into
+// units that fit on-chip and accept duplicated reads at tile/chunk
+// boundaries.  See compute_oh_chunking() and compute_ow_tiling() in
+// ConvKernel.cpp.
 //
-// kMaxLineBufRows must be a power of 2 (bitmask is used in place of modulo).
+// kMaxLineBufRows and kMaxLineBufCols must be powers of 2 (bitmasks
+// replace modulo in the slot computation).
 // ---------------------------------------------------------------------------
 static constexpr unsigned kMaxInCh             = @CONV_MAX_IN_CH@;
 static constexpr unsigned kMaxOutCh            = @CONV_MAX_OUT_CH@;
-static constexpr unsigned kMaxInW              = @CONV_MAX_IN_W@;
+static constexpr unsigned kMaxLineBufCols      = @CONV_MAX_LINE_BUF_COLS@;
 static constexpr unsigned kMaxLineBufRows      = @CONV_MAX_LINE_BUF_ROWS@;
 static constexpr unsigned kMaxAccPersistEntries = @CONV_MAX_ACC_PERSIST_ENTRIES@;
+
+// ---------------------------------------------------------------------------
+// kMaxMperGroup — max number of mt-tiles cached together in the standard
+// path's (ict, M-group) weight slab.
+//
+// The weight-caching restructure hoists the weight load out of the inner
+// (oh, ow) sweep so each DDR weight is read once per (ni, chunk, ict)
+// instead of out_h*out_w times.  When out_ch is large enough that all
+// m_tiles' weights for one ic-tile don't fit the on-chip cache, the
+// kernel processes M in groups of mt_per_group mt-tiles; each group's
+// weights are loaded once and reused across the (oh, ow) sweep, then the
+// next group reloads.  Patches are re-emitted from line_buf per m_group
+// (no DDR re-read).
+//
+// Group size at runtime:
+//   m_tiles      = ceil(out_ch / kTileM)
+//   mt_per_group = min(kMaxMperGroup, m_tiles)
+//   num_m_groups = ceil(m_tiles / mt_per_group)
+//
+// Compile-time buffer size:
+//   w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]
+//   = kMaxMperGroup · 8 · 16 · 7 · 7 = 6272·kMaxMperGroup entries.
+//
+// Trade-off: larger kMaxMperGroup → more layers run in a single group
+// (zero weight replay) but consumes more BRAM/LUT for w_cache.  When
+// m_tiles ≤ kMaxMperGroup the kernel single-groups; larger m_tiles
+// split into ceil(m_tiles / kMaxMperGroup) groups.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMaxMperGroup        = @CONV_MAX_M_PER_GROUP@;
 
 static_assert(
     (kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0,
     "kMaxLineBufRows must be a power of 2 (it is used as a bitmask)"
+);
+
+static_assert(
+    (kMaxLineBufCols & (kMaxLineBufCols - 1)) == 0,
+    "kMaxLineBufCols must be a power of 2 (it is used as a bitmask)"
 );
 
 static constexpr unsigned kSeed    = 42;

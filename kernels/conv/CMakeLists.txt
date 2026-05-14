@@ -58,12 +58,14 @@ set(CONV_MAX_IN_CH  1024 CACHE STRING
     "Compile-time input-channel limit; bias_buf only — line_buf is tiled to kTileIC channels")
 set(CONV_MAX_OUT_CH 1024 CACHE STRING
     "Compile-time output-channel limit; sizes bias_buf in bias_producer")
-set(CONV_MAX_IN_W   64  CACHE STRING
-    "Compile-time input-width limit; sizes the column dim of line_buf in input_patch_producer_standard")
+set(CONV_MAX_LINE_BUF_COLS 64 CACHE STRING
+    "Column capacity of line_buf in the input patch producers (power of 2; used as a bitmask for slot wrapping). This caps ow_per_tile, NOT in_w: larger in_w is handled by ow-tiling, with the (kw-1)*dilation_w-col overlap re-fetched at tile boundaries.")
 set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
     "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
 set(CONV_MAX_ACC_PERSIST_ENTRIES 16384 CACHE STRING
     "Compile-time bound on out_h*out_w*out_ch for the partial-output accumulator. Caps the on-chip buffer that survives across ic-tiles (Option-A tiling).")
+set(CONV_MAX_M_PER_GROUP 4 CACHE STRING
+    "Max number of mt-tiles cached together in the (ict, M-group) weight slab. Larger values fit more channels in one group (eliminating weight DDR replay), at the cost of BRAM/LUT for w_cache. When m_tiles exceeds this bound, the kernel processes M in groups of this size.")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -175,7 +177,8 @@ message(STATUS "ConvKernel: Data_t=${CONV_DATA_TYPE}  "
                "TILE_M=${CONV_TILE_M}  TILE_IC=${CONV_TILE_IC}  "
                "MAX_KH=${CONV_MAX_KH}  MAX_KW=${CONV_MAX_KW}  "
                "MAX_IN_CH=${CONV_MAX_IN_CH}  MAX_OUT_CH=${CONV_MAX_OUT_CH}  "
-               "MAX_ACC_PERSIST_ENTRIES=${CONV_MAX_ACC_PERSIST_ENTRIES}")
+               "MAX_ACC_PERSIST_ENTRIES=${CONV_MAX_ACC_PERSIST_ENTRIES}  "
+               "MAX_M_PER_GROUP=${CONV_MAX_M_PER_GROUP}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.

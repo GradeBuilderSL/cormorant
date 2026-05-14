@@ -795,6 +795,48 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 28: M-grouping standard.  out_ch=64 → m_tiles=8.  With default
+    // kMaxMperGroup=4 this triggers num_m_groups=2: weights for tiles
+    // 0..3 are cached together, processed across the entire (oh, ow)
+    // sweep, then the cache is refilled for tiles 4..7.  out_h*out_w*out_ch
+    // = 16*16*64 = 16384 = kMaxAccPersistEntries, so num_chunks=1 (this
+    // test isolates the M-grouping behaviour from chunking).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=16; p.in_w=16; p.out_ch=64;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("M-grouping standard (out_ch=64, 2 M-groups)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29: wide-input ow-tiling.  in_w=128 > kMaxLineBufCols (64), so
+    // the producers split the output column axis into multiple ow_tiles
+    // (3 at default kw=3, stride=1: ow_per_tile = 64 - 3 + 1 = 62; 128/62
+    // = 3 tiles).  out_h*out_w*out_ch = 8*128*8 = 8192 fits one chunk.
+    // This validates the line_buf circular column indexing and per-tile
+    // (kw-1)*dilation_w-col DDR overlap re-fetch.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=8; p.in_w=128; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("wide input ow-tiling (in_w=128, 3 ow-tiles)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Depthwise tests (is_depthwise=1).
     // Weight layout: [ch][1][kh][kw]  (no in_ch dimension in weight)
     // -----------------------------------------------------------------------
