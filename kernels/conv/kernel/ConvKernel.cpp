@@ -40,7 +40,7 @@
 //           accumulate  — II=1 K-reduction over ic×kH×kW with TILE_M lanes
 //         drain        — push m_valid lanes of acc[] to acc_stream
 //       write output (consumer):
-//         saturate_cast acc_stream → DDR y
+//         copy acc_stream → DDR y  (already saturated in Phase 3)
 //
 // Loop structure — depthwise conv (is_depthwise=1): same outer nest, the
 // per-tile compute swaps in compute_depthwise_conv_tile (no ic_tile loop,
@@ -346,10 +346,15 @@ static void accumulate_depthwise(
 // Loop nest matches the new consumer's drain order — (ni, oh, ow, mt, m1).
 // For each (ni, oh, ow) the m_tiles × m_valid lanes are written in
 // channel-major order; y_addr advances by ohw between m1 lanes.
+//
+// acc_stream already carries saturated Data_t — the AccData_t→Data_t
+// saturate_cast was hoisted into process_conv_kernel_tile's Phase-3
+// drain (so the inter-stage FIFO is Data_t-wide, not AccData_t-wide).
+// This stage is therefore a pure stream→DDR copy.
 // ---------------------------------------------------------------------------
 static void write_output_tile(
     Data_t*                 y,
-    hls::stream<AccData_t>& acc_stream,
+    hls::stream<Data_t>&    acc_stream,
     unsigned                out_ch,
     unsigned                out_h,
     unsigned                out_w,
@@ -368,7 +373,7 @@ static void write_output_tile(
                     unsigned       y_addr  = base + m_off * ohw;
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
-                        y[y_addr] = saturate_cast<Data_t>(acc_stream.read());
+                        y[y_addr] = acc_stream.read();
                         y_addr += ohw;
                     }
                 } // m_tile loop
@@ -807,9 +812,10 @@ static void stream_load_weights(
 //                                   load patch[kTileM][kh][kw],
 //                                   load w_buf[kTileM][kh][kw] ONCE per
 //                                   (chunk, mt), reduce kh*kw*kTileM at II=1.
-//     Phase 3 (drain): push partial_outputs to acc_stream in
-//                      (oh_in_chunk, ow, mt, m1) order.  Concatenated across
-//                      chunks this is (ni, oh, ow, mt, m1) — exactly what
+//     Phase 3 (drain): saturate_cast partial_outputs to Data_t and push
+//                      to acc_stream in (oh_in_chunk, ow, mt, m1) order.
+//                      Concatenated across chunks this is
+//                      (ni, oh, ow, mt, m1) — exactly what
 //                      write_output_tile expects.
 //
 //   Both producers read each x pixel from DDR once per (ni, c, chunk):
@@ -822,7 +828,7 @@ static void process_conv_kernel_tile(
     hls::stream<PatchVec>&  patch_stream,
     hls::stream<Data_t>&    weight_stream,
     hls::stream<AccData_t>& bias_stream,
-    hls::stream<AccData_t>& acc_stream,
+    hls::stream<Data_t>&    acc_stream,
     unsigned                batch,
     unsigned                in_ch,
     unsigned                in_h,
@@ -1075,6 +1081,8 @@ static void process_conv_kernel_tile(
         } // depthwise
 
         // -------- Phase 3: drain partial_outputs to acc_stream --------
+        // saturate_cast AccData_t→Data_t here (hoisted out of
+        // write_output_tile) so acc_stream is a Data_t-wide FIFO.
         for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
             for (unsigned ow = 0; ow < out_w; ow++) {
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
@@ -1084,7 +1092,8 @@ static void process_conv_kernel_tile(
                         #pragma HLS PIPELINE II=1
                         const unsigned idx = (oh_local * out_w + ow) * out_ch
                                              + m_off + m1;
-                        acc_stream.write(partial_outputs[idx]);
+                        acc_stream.write(
+                            saturate_cast<Data_t>(partial_outputs[idx]));
                     }
                 }
             }
@@ -1202,7 +1211,11 @@ void ConvKernel(
     hls::stream<PatchVec> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
 
-    hls::stream<AccData_t> acc_stream;
+    // acc_stream carries already-saturated Data_t — process_conv_kernel_tile
+    // applies saturate_cast in its Phase-3 drain, so this inter-stage FIFO
+    // is Data_t-wide (not AccData_t-wide) and write_output_tile is a plain
+    // stream→DDR copy.
+    hls::stream<Data_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
 
     // weight_stream carries one Data_t per cycle from stream_load_weights
