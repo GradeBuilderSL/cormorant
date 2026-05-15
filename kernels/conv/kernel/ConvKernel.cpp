@@ -1089,6 +1089,15 @@ static void process_conv_kernel_tile(
     compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
 
     AccData_t partial_outputs[kMaxAccPersistEntries];
+    // Bound to URAM: this is by far the largest on-chip buffer and the
+    // design is BRAM-bound, while the XCK26's 64 URAM blocks (288 Kbit
+    // each, 4096 AccData_t entries) are otherwise unused.  Relocating it
+    // frees ~16 BRAM and lets kMaxAccPersistEntries grow into the idle
+    // URAM pool.  RAM_2P — Phase 1/3 touch a single port (write-only /
+    // read-only) and Phase 2a's read and write run in separate II=1
+    // sub-loops, so two ports suffice and there is no tight RAW
+    // recurrence that URAM's extra read latency could stall.
+    #pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM
 
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {

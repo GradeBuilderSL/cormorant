@@ -62,8 +62,8 @@ set(CONV_MAX_LINE_BUF_COLS 64 CACHE STRING
     "Column capacity of line_buf in the input patch producers (power of 2; used as a bitmask for slot wrapping). This caps ow_per_tile, NOT in_w: larger in_w is handled by ow-tiling, with the (kw-1)*dilation_w-col overlap re-fetched at tile boundaries.")
 set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
     "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
-set(CONV_MAX_ACC_PERSIST_ENTRIES 16384 CACHE STRING
-    "Compile-time bound on out_h*out_w*out_ch for the partial-output accumulator. Caps the on-chip buffer that survives across ic-tiles (Option-A tiling).")
+set(CONV_MAX_ACC_PERSIST_ENTRIES 65536 CACHE STRING
+    "Compile-time bound on out_w*out_ch (one output row) for the partial-output accumulator that survives across ic-tiles (Option-A tiling). The buffer is bound to URAM in ConvKernel.cpp, so raising this spends URAM blocks (4096 AccData_t entries each) rather than BRAM: 65536 = 16 of the XCK26's 64 URAM blocks. oh-chunking still splits outputs whose out_h*out_w*out_ch exceeds the buffer.")
 set(CONV_MAX_M_PER_GROUP 4 CACHE STRING
     "Max number of mt-tiles cached together in the (ict, M-group) weight slab. Larger values fit more channels in one group (eliminating weight DDR replay), at the cost of BRAM/LUT for w_cache. When m_tiles exceeds this bound, the kernel processes M in groups of this size.")
 

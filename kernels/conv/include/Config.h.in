@@ -74,7 +74,10 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //                  drained to acc_stream at chunk end.  Chunking along
 //                  the oh axis lets the kernel handle outputs larger
 //                  than the buffer; see compute_oh_chunking() in
-//                  ConvKernel.cpp for the strategy.
+//                  ConvKernel.cpp for the strategy.  Bound to URAM
+//                  (BIND_STORAGE impl=URAM) so it consumes no BRAM —
+//                  kMaxAccPersistEntries is sized against the idle
+//                  URAM pool (4096 AccData_t entries per URAM block).
 //
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh
