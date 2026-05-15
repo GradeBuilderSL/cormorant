@@ -18,10 +18,10 @@
 //                                                                                                         y (DDR gmem3)
 //
 // mt-hoist (the m_tile loop is INSIDE the spatial nest):
-//   * input_patch_producer_standard reads each unique x[] pixel from DDR
-//     exactly once per (ni, oh, ow), buffers the patch on-chip, then
-//     broadcasts it m_tiles times into patch_stream — eliminating the
-//     m_tiles× DDR re-read of x.
+//   * input_patch_producer (one assembler shared by both modes, §2.14)
+//     reads each unique x[] pixel from DDR exactly once per (ni, oh, ow),
+//     buffers the patch on-chip, then broadcasts it m_tiles times into
+//     patch_stream — eliminating the m_tiles× DDR re-read of x.
 //   * bias_producer loads the entire bias vector once into bias_buf and
 //     streams it in (r, mt, m1) order to match the consumer's new nest.
 //   * process_conv_kernel_tile iterates (ni, oh, ow, mt) — same patch is
@@ -426,36 +426,53 @@ static void bias_producer(
 }
 
 // ---------------------------------------------------------------------------
-// Standard-conv input patch ASSEMBLER (DATAFLOW source).
+// input_patch_producer — unified input patch ASSEMBLER (DATAFLOW source).
 //
-// Tiled-IC (Option-A) + M-grouping + ow-tiling.  Loop nest:
+// Standard and depthwise convolution share one producer (§2.14): their
+// patch assembly differs only in the channel-parallelism axis and the
+// M-group replay, both folded into runtime values here.
 //
-//     for ni: for chunk: for ict: for ow_tile: for mg:
-//         for oh_in_chunk: for ow_in_tile: for ic_l, kh, kw
+//                         standard (is_depthwise=0)  depthwise (is_depthwise=1)
+//   channel tile width    kTileIC input channels     kTileM channels
+//   tile count ct_tiles   ceil(in_ch  / kTileIC)     ceil(out_ch / kTileM)
+//   group replay          num_m_groups (§2.10)       1 (no weight caching)
 //
-// ow_tile is OUTER of m_group so line_buf's column window for the tile is
-// loaded once per (ict, ow_tile) and reused across mg's patch re-emissions.
-// Within the tile, line_buf indexes both row and column dims circularly:
+// A single kTileIC-wide line_buf serves both modes; depthwise uses only
+// banks [0, kTileM) and the PatchVec gather masks the rest to 0 — the
+// same X-clean mask the standard partial-IC tail already relies on.
+// Merging the former input_patch_producer_standard / _depthwise pair
+// reclaims the depthwise producer's duplicate line_buf BRAM and control
+// logic.
+//
+// Tiled-IC/M (Option-A) + M-grouping + ow-tiling.  Loop nest:
+//
+//     for ni: for chunk: for ct: for ow_tile: for grp:
+//         for oh_in_chunk: for ow_in_tile: for ch_l, kh, kw
+//
+// ow_tile is OUTER of grp so line_buf's column window for the tile is
+// loaded once per (ct, ow_tile) and reused across grp's patch
+// re-emissions.  line_buf indexes both row and column dims circularly:
 //
 //     row_slot = ih & (kMaxLineBufRows - 1)
 //     col_slot = iw & (kMaxLineBufCols - 1)
 //
-// kMaxLineBufCols is a compile-time power-of-2 bound on the column window;
-// in_w itself is NOT capped, only the per-tile iw extent.  Wider inputs
-// produce more ow_tiles, with the (kw-1)·dilation_w-col overlap re-fetched
-// from DDR at each tile transition.
+// kMaxLineBufCols is a compile-time power-of-2 bound on the column
+// window; in_w is NOT capped, only the per-tile iw extent.  Wider inputs
+// produce more ow_tiles, with the (kw-1)·dilation_w-col overlap
+// re-fetched from DDR at each tile transition and the (kh-1)·stride_h
+// row overlap re-fetched at each chunk transition.
 //
-// Per (ni, chunk, ict, ow_tile, mg, oh):
-//   Phase 1 — load new rows × this ow_tile's iw range from DDR.
-//             Only fires when mg=0 (subsequent m_groups re-stream the same
-//             cached rows from line_buf).
-// Per (ni, chunk, ict, ow_tile, mg, oh, ow):
-//   Phase 2 — stream kTileIC × kh × kw patch values into patch_pipe.
+// Per (ni, chunk, ct, ow_tile, grp, oh):
+//   Phase 1 — load new rows × this ow_tile's iw range from DDR
+//             (ch_valid channels at ch_off).  Only grp=0 loads;
+//             grp>0 re-streams the cached rows from line_buf.
+// Per (ni, chunk, ct, ow_tile, grp, oh, ow):
+//   Phase 2 — stream kh × kw channel-packed PatchVecs into patch_pipe.
 //
 // Constraints: (kh-1)*dilation_h + 1 <= kMaxLineBufRows,
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
 // ---------------------------------------------------------------------------
-static void input_patch_producer_standard(
+static void input_patch_producer(
     const Data_t*           x,
     hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
@@ -472,10 +489,16 @@ static void input_patch_producer_standard(
     unsigned             dilation_h,
     unsigned             dilation_w,
     unsigned             pad_top,
-    unsigned             pad_left
+    unsigned             pad_left,
+    unsigned             is_depthwise
 ) {
-    const unsigned ic_tiles = (in_ch + kTileIC - 1) / kTileIC;
     const unsigned in_hw    = in_h * in_w;
+
+    // Channel-parallelism axis: standard tiles in_ch by kTileIC, depthwise
+    // tiles out_ch by kTileM (in_ch == out_ch in depthwise mode).
+    const unsigned ct_width = is_depthwise ? kTileM : kTileIC;
+    const unsigned total_ch = is_depthwise ? out_ch : in_ch;
+    const unsigned ct_tiles = (total_ch + ct_width - 1) / ct_width;
 
     unsigned oh_per_chunk, num_chunks;
     compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
@@ -483,14 +506,18 @@ static void input_patch_producer_standard(
     unsigned mt_per_group, num_m_groups;
     compute_m_grouping(out_ch, mt_per_group, num_m_groups);
     (void)mt_per_group;  // Producer only needs the group count (re-emission factor).
+    // Depthwise caches its weight slice once per (chunk, mt) — no M-group
+    // replay — so it runs a single group.
+    const unsigned num_groups = is_depthwise ? 1u : num_m_groups;
 
     unsigned ow_per_tile, num_ow_tiles;
     compute_ow_tiling(out_w, kw, stride_w, dilation_w,
                       ow_per_tile, num_ow_tiles);
 
+    // One kTileIC-wide line buffer for both modes; depthwise uses banks
+    // [0, kTileM).  dim=1 partitioned complete → kTileIC independent
+    // banks so Phase 2 can gather a full PatchVec per cycle.
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
-    // dim=1 (ic_l) partitioned complete → kTileIC independent banks so
-    // Phase 2 can gather a full PatchVec (kTileIC lanes) per cycle.
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -502,9 +529,9 @@ static void input_patch_producer_standard(
         const unsigned oh_start = chunk * oh_per_chunk;
         const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
 
-        for (unsigned ict = 0; ict < ic_tiles; ict++) {
-            const unsigned ic_off   = ict * kTileIC;
-            const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+        for (unsigned ct = 0; ct < ct_tiles; ct++) {
+            const unsigned ch_off   = ct * ct_width;
+            const unsigned ch_valid = std::min(ct_width, total_ch - ch_off);
 
           for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
             const unsigned ow_start = owt * ow_per_tile;
@@ -517,25 +544,24 @@ static void input_patch_producer_standard(
                                       - (int)pad_left;
 
             // Highest absolute input row currently resident in line_buf for
-            // THIS (chunk, ict, ow_tile).  Initialise so the first oh in
-            // this chunk triggers a fresh kh-row load.  Per (chunk, ict)
-            // line_buf is reloaded once per ow_tile (different iw range);
-            // within an ow_tile, rows are retained across m_groups (mg>0
-            // sees last_loaded_row already at the chunk's max and Phase 1
-            // loads nothing).
+            // THIS (chunk, ct, ow_tile).  Initialise so the first oh in this
+            // chunk triggers a fresh kh-row load.  line_buf is reloaded once
+            // per ow_tile (different iw range); within an ow_tile rows are
+            // retained across groups (grp>0 sees last_loaded_row already at
+            // the chunk's max and Phase 1 loads nothing).
             int last_loaded_row =
                 (int)(oh_start * stride_h) - (int)pad_top - 1;
 
-          for (unsigned mg = 0; mg < num_m_groups; mg++) {
+          for (unsigned grp = 0; grp < num_groups; grp++) {
             for (unsigned oh = oh_start; oh < oh_end; oh++) {
                 const int ih_window_max = (int)(oh * stride_h)
                                         - (int)pad_top
                                         + (int)((kh - 1) * dilation_h);
 
                 // -------------------------------------------------------
-                // Phase 1: load any rows the current (oh, ict) window
-                // needs that are not yet in line_buf.  Only kTileIC
-                // channels are loaded here (ic_off..ic_off+ic_valid-1),
+                // Phase 1: load any rows the current (oh, ct) window
+                // needs that are not yet in line_buf.  Only ch_valid
+                // channels are loaded here (ch_off..ch_off+ch_valid-1),
                 // and only this ow_tile's iw range (clamped to [0,in_w)).
                 // -------------------------------------------------------
                 int load_start = last_loaded_row + 1;
@@ -553,8 +579,8 @@ static void input_patch_producer_standard(
                 for (int ih = load_start; ih <= load_end; ih++) {
                     const unsigned slot =
                         (unsigned)ih & (kMaxLineBufRows - 1);
-                    for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-                        const unsigned c     = ic_off + ic_l;
+                    for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
+                        const unsigned c     = ch_off + ch_l;
                         const unsigned x_row = (ni * in_ch + c) * in_hw
                                              + (unsigned)ih * in_w;
                         for (int iw = iw_clipped_start;
@@ -563,14 +589,14 @@ static void input_patch_producer_standard(
                             const size_t addr = x_row + (unsigned)iw;
                             const unsigned col_slot =
                                 (unsigned)iw & (kMaxLineBufCols - 1);
-                            line_buf[ic_l][slot][col_slot] = x[addr];
+                            line_buf[ch_l][slot][col_slot] = x[addr];
 
 #ifdef DEBUG_LOAD_DATA_CACHING
                             CycleCounters counters;
-                            counters.mt   = 0;
+                            counters.mt   = is_depthwise ? ct : 0u;
                             counters.ni   = ni;
-                            counters.ict  = ict;
-                            counters.ic_l = ic_l;
+                            counters.ict  = is_depthwise ? (unsigned)-1 : ct;
+                            counters.ic_l = ch_l;
                             counters.oh   = oh;
                             counters.ow   = owt;
                             counters.khi  = (unsigned)ih;
@@ -589,9 +615,10 @@ static void input_patch_producer_standard(
                     // ---------------------------------------------------
                     // Phase 2: stream a kh × kw block of PatchVecs into
                     // patch_pipe — one beat per (khi, kwi), each beat
-                    // packing all kTileIC ic-lanes.  Lanes ic_l >=
-                    // ic_valid are zero-padded; the consumer's accumulate
-                    // uses the ic_valid bound and ignores the padding.
+                    // packing all kTileIC lanes.  Lanes ic_l >= ch_valid
+                    // are zero-padded (the partial-IC tail for standard,
+                    // the kTileM..kTileIC-1 tail for depthwise); the
+                    // consumer's accumulate ignores the padding.
                     // ---------------------------------------------------
                     for (unsigned khi = 0; khi < kh; khi++) {
                         const int ih = (int)(oh * stride_h + khi * dilation_h)
@@ -611,8 +638,8 @@ static void input_patch_producer_standard(
                             PatchVec v;
                             for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                                 #pragma HLS UNROLL
-                                const bool ic_ok = (ic_l < ic_valid);
-                                v.lane[ic_l] = (ic_ok && ih_ok && iw_ok)
+                                const bool ch_ok = (ic_l < ch_valid);
+                                v.lane[ic_l] = (ch_ok && ih_ok && iw_ok)
                                     ? line_buf[ic_l][slot][col_slot]
                                     : Data_t(0);
                             }
@@ -621,9 +648,9 @@ static void input_patch_producer_standard(
                     }
                 } // ow loop
             } // oh loop
-          } // m_group loop
+          } // group loop
           } // ow_tile loop
-        } // ict loop
+        } // channel-tile loop
       } // chunk loop
     } // batch loop
 
@@ -678,234 +705,6 @@ static void broadcast_patches(
             patch_stream.write(local_buf[i]);
             i = (i + 1 == input_per_iter) ? 0u : i + 1;
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Depthwise input patch ASSEMBLER (DATAFLOW source).
-//
-// Tiled-M (Option-A) + ow-tiling.  Loop nest:
-//
-//     for ni: for chunk: for mt: for ow_tile: for oh_in_chunk:
-//         for ow_in_tile: for m1, kh, kw
-//
-// line_buf is sized [kTileM][kMaxLineBufRows][kMaxLineBufCols] with
-// circular indexing on BOTH dims (row_slot = ih & (kMaxLineBufRows-1),
-// col_slot = iw & (kMaxLineBufCols-1)).  Within an ow_tile each x pixel
-// in the tile's iw range is fetched from DDR exactly once per
-// (ni, c, chunk); at ow_tile transitions the (kw-1)*dilation_w-col
-// overlap is re-fetched, and at chunk transitions the
-// (kh-1)*stride_h-row overlap is re-fetched.
-//
-// Per (ni, chunk, mt, ow_tile, oh):
-//   Phase 1 — load new rows × this ow_tile's iw range from DDR for the
-//             m_valid channels at offset m_off..m_off+m_valid-1.
-// Per (ni, chunk, mt, ow_tile, oh, ow):
-//   Phase 2 — stream a fixed kTileM × kh × kw block of patch values into
-//             patch_pipe.  Lanes m1 >= m_valid are zero-padded so the
-//             broadcaster operates with a compile-time-fixed
-//             input_per_iter (= kTileM*kh*kw).
-// ---------------------------------------------------------------------------
-static void input_patch_producer_depthwise(
-    const Data_t*           x,
-    hls::stream<PatchVec>&  patch_stream,
-    unsigned             batch,
-    unsigned             in_ch,
-    unsigned             in_h,
-    unsigned             in_w,
-    unsigned             out_ch,
-    unsigned             out_h,
-    unsigned             out_w,
-    unsigned             kh,
-    unsigned             kw,
-    unsigned             stride_h,
-    unsigned             stride_w,
-    unsigned             dilation_h,
-    unsigned             dilation_w,
-    unsigned             pad_top,
-    unsigned             pad_left
-) {
-    const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
-    const unsigned in_hw   = in_h * in_w;
-
-    unsigned oh_per_chunk, num_chunks;
-    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
-
-    unsigned ow_per_tile, num_ow_tiles;
-    compute_ow_tiling(out_w, kw, stride_w, dilation_w,
-                      ow_per_tile, num_ow_tiles);
-
-    Data_t line_buf[kTileM][kMaxLineBufRows][kMaxLineBufCols];
-    // dim=1 (m1) partitioned complete → kTileM independent banks so
-    // Phase 2 can gather a full PatchVec lane group per cycle.
-    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
-
-#ifdef DEBUG_LOAD_DATA_CACHING
-    AddressMap_t read_addresses;
-#endif
-
-    for (unsigned ni = 0; ni < batch; ni++) {
-      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
-        const unsigned oh_start = chunk * oh_per_chunk;
-        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
-
-        for (unsigned mt = 0; mt < m_tiles; mt++) {
-            const unsigned m_off   = mt * kTileM;
-            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-
-          for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
-            const unsigned ow_start = owt * ow_per_tile;
-            const unsigned ow_end   = std::min(out_w, ow_start + ow_per_tile);
-
-            const int iw_load_start = (int)(ow_start * stride_w) - (int)pad_left;
-            const int iw_load_last  = (int)((ow_end - 1) * stride_w
-                                            + (kw - 1) * dilation_w)
-                                      - (int)pad_left;
-
-            // Highest absolute input row currently resident in line_buf for
-            // THIS (chunk, mt, ow_tile).  Reset per ow_tile (different iw
-            // range invalidates the cached row × tile_col data).
-            int last_loaded_row =
-                (int)(oh_start * stride_h) - (int)pad_top - 1;
-
-            for (unsigned oh = oh_start; oh < oh_end; oh++) {
-                const int ih_window_max = (int)(oh * stride_h)
-                                        - (int)pad_top
-                                        + (int)((kh - 1) * dilation_h);
-
-                // ----- Phase 1: load new rows × tile iw range -----
-                int load_start = last_loaded_row + 1;
-                if (load_start < 0) load_start = 0;
-                int load_end = ih_window_max;
-                if (load_end >= (int)in_h) load_end = (int)in_h - 1;
-
-                int iw_clipped_start = iw_load_start;
-                if (iw_clipped_start < 0) iw_clipped_start = 0;
-                int iw_clipped_last  = iw_load_last;
-                if (iw_clipped_last >= (int)in_w)
-                    iw_clipped_last = (int)in_w - 1;
-
-                for (int ih = load_start; ih <= load_end; ih++) {
-                    const unsigned slot =
-                        (unsigned)ih & (kMaxLineBufRows - 1);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        const unsigned c     = m_off + m1;
-                        const unsigned x_row = (ni * in_ch + c) * in_hw
-                                             + (unsigned)ih * in_w;
-                        for (int iw = iw_clipped_start;
-                             iw <= iw_clipped_last; iw++) {
-                            #pragma HLS PIPELINE II=1
-                            const size_t addr = x_row + (unsigned)iw;
-                            const unsigned col_slot =
-                                (unsigned)iw & (kMaxLineBufCols - 1);
-                            line_buf[m1][slot][col_slot] = x[addr];
-
-#ifdef DEBUG_LOAD_DATA_CACHING
-                            CycleCounters counters;
-                            counters.mt   = mt;
-                            counters.ni   = ni;
-                            counters.ict  = -1;
-                            counters.ic_l = m1;
-                            counters.oh   = oh;
-                            counters.ow   = owt;
-                            counters.khi  = (unsigned)ih;
-                            counters.kwi  = (unsigned)iw;
-                            read_addresses[addr].push_back(counters);
-#endif /* DEBUG_LOAD_DATA_CACHING */
-                        }
-                    }
-                }
-                if (load_end > last_loaded_row) {
-                    last_loaded_row = load_end;
-                }
-
-                for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                    // ----- Phase 2: stream kh × kw PatchVecs -----
-                    // Each beat packs kTileM real m-lanes; lanes
-                    // kTileM..kTileIC-1 are zero (depthwise's parallel
-                    // axis is kTileM, not kTileIC).
-                    for (unsigned khi = 0; khi < kh; khi++) {
-                        const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                    - (int)pad_top;
-                        const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                        const unsigned slot = ih_ok
-                            ? ((unsigned)ih & (kMaxLineBufRows - 1))
-                            : 0u;
-                        for (unsigned kwi = 0; kwi < kw; kwi++) {
-                            #pragma HLS PIPELINE II=1
-                            const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                        - (int)pad_left;
-                            const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                            const unsigned col_slot = iw_ok
-                                ? ((unsigned)iw & (kMaxLineBufCols - 1))
-                                : 0u;
-                            PatchVec v;
-                            for (unsigned lane = 0; lane < kTileIC; lane++) {
-                                #pragma HLS UNROLL
-                                if (lane < kTileM) {
-                                    const bool m_ok = (lane < m_valid);
-                                    v.lane[lane] = (m_ok && ih_ok && iw_ok)
-                                        ? line_buf[lane][slot][col_slot]
-                                        : Data_t(0);
-                                } else {
-                                    v.lane[lane] = Data_t(0);
-                                }
-                            }
-                            patch_stream.write(v);
-                        }
-                    }
-                }
-            } // oh loop
-          } // ow_tile loop
-        } // mt loop
-      } // chunk loop
-    } // batch loop
-
-#ifdef DEBUG_LOAD_DATA_CACHING
-    for (auto it : read_addresses) {
-        if (it.second.size() > 1) {
-            std::cout << it.first << " --> " << std::endl;
-
-            for (auto l_item : it.second) {
-                std::cout << "\t" << l_item << std::endl;
-            }
-        }
-    }
-#endif /* DEBUG_LOAD_DATA_CACHING */
-}
-
-static void input_patch_producer(
-    const Data_t*           x,
-    hls::stream<PatchVec>&  patch_stream,
-    unsigned             batch,
-    unsigned             in_ch,
-    unsigned             in_h,
-    unsigned             in_w,
-    unsigned             out_ch,
-    unsigned             out_h,
-    unsigned             out_w,
-    unsigned             kh,
-    unsigned             kw,
-    unsigned             stride_h,
-    unsigned             stride_w,
-    unsigned             dilation_h,
-    unsigned             dilation_w,
-    unsigned             pad_top,
-    unsigned             pad_left,
-    unsigned             is_depthwise
-) {
-    if (!is_depthwise) {
-        input_patch_producer_standard(
-            x, patch_stream, batch, in_ch, in_h, in_w,
-            out_ch, out_h, out_w, kh, kw,
-            stride_h, stride_w, dilation_h, dilation_w,
-            pad_top, pad_left);
-    } else {
-        input_patch_producer_depthwise(
-            x, patch_stream, batch, in_ch, in_h, in_w,
-            out_ch, out_h, out_w, kh, kw,
-            stride_h, stride_w, dilation_h, dilation_w,
-            pad_top, pad_left);
     }
 }
 
