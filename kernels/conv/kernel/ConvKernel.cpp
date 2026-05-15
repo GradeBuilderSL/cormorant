@@ -10,12 +10,12 @@
 //
 //   ConvKernel
 //     bias_producer           ──bias_stream────►  process_conv_kernel_tile
-//     input_patch_producer    ──patch_pipe─────►  broadcast_patches  ──patch_stream──►   │
-//     stream_load_weights     ──weight_stream──►                                         │
-//                                                                                        └──acc_stream──► write_output_tile
-//                                                                                                                │
-//     x/weight/bias (DDR gmem0/1/2)                                                                              ▼
-//                                                                                                         y (DDR gmem3)
+//     input_patch_producer    ──patch_stream───►                              │
+//     stream_load_weights     ──weight_stream──►                              │
+//                                                              └──acc_stream──► write_output_tile
+//                                                                                      │
+//     x/weight/bias (DDR gmem0/1/2)                                                    ▼
+//                                                                               y (DDR gmem3)
 //
 // mt-hoist (the m_tile loop is INSIDE the spatial nest):
 //   * input_patch_producer (one assembler shared by both modes, §2.14)
@@ -69,8 +69,8 @@
 // ---------------------------------------------------------------------------
 // PatchVec — channel-packed patch stream element.
 //
-// The patch path (input_patch_producer → broadcast_patches → consumer)
-// previously carried one Data_t per stream beat, so the consumer's patch
+// The patch path (input_patch_producer → consumer) previously carried
+// one Data_t per stream beat, so the consumer's patch
 // drain ran at kTileIC·kh·kw cycles per (oh, ow).  PatchVec packs a full
 // channel column — kTileIC lanes — into a single beat, so the producer
 // emits and the consumer drains one beat per (khi, kwi): the patch drain
@@ -467,7 +467,7 @@ static void bias_producer(
 //             (ch_valid channels at ch_off).  Only grp=0 loads;
 //             grp>0 re-streams the cached rows from line_buf.
 // Per (ni, chunk, ct, ow_tile, grp, oh, ow):
-//   Phase 2 — stream kh × kw channel-packed PatchVecs into patch_pipe.
+//   Phase 2 — stream kh × kw channel-packed PatchVecs into patch_stream.
 //
 // Constraints: (kh-1)*dilation_h + 1 <= kMaxLineBufRows,
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
@@ -614,7 +614,7 @@ static void input_patch_producer(
 
                     // ---------------------------------------------------
                     // Phase 2: stream a kh × kw block of PatchVecs into
-                    // patch_pipe — one beat per (khi, kwi), each beat
+                    // patch_stream — one beat per (khi, kwi), each beat
                     // packing all kTileIC lanes.  Lanes ic_l >= ch_valid
                     // are zero-padded (the partial-IC tail for standard,
                     // the kTileM..kTileIC-1 tail for depthwise); the
@@ -668,55 +668,14 @@ static void input_patch_producer(
 }
 
 // ---------------------------------------------------------------------------
-// broadcast_patches — DATAFLOW stage between input_patch_producer and
-// process_conv_kernel_tile.
-//
-// Since §2.10 (weight caching) the standard producer re-emits patches
-// per m_group itself, so broadcast_factor is always 1 and this stage is
-// a pure PatchVec passthrough — kept for dataflow-graph stability.
-// Each beat is one channel-packed PatchVec; input_per_iter = kh*kw beats
-// per (ni, ict, ow_tile, mg, oh, ow).  The local_buf re-emission path is
-// retained for broadcast_factor > 1 but is dead under the current
-// caller (factor=1).
-// ---------------------------------------------------------------------------
-static void broadcast_patches(
-    hls::stream<PatchVec>& patch_pipe,
-    hls::stream<PatchVec>& patch_stream,
-    unsigned               outer_iters,
-    unsigned               input_per_iter,
-    unsigned               broadcast_factor
-) {
-    PatchVec local_buf[kMaxKH * kMaxKW];
-
-    for (unsigned r = 0; r < outer_iters; r++) {
-        for (unsigned i = 0; i < input_per_iter; i++) {
-            #pragma HLS PIPELINE II=1
-            const PatchVec val = patch_pipe.read();
-            local_buf[i] = val;
-            patch_stream.write(val);
-        }
-
-        const unsigned subsequent = (broadcast_factor > 0
-                                     ? broadcast_factor - 1
-                                     : 0) * input_per_iter;
-        unsigned i = 0;
-        for (unsigned k = 0; k < subsequent; k++) {
-            #pragma HLS PIPELINE II=1
-            patch_stream.write(local_buf[i]);
-            i = (i + 1 == input_per_iter) ? 0u : i + 1;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // stream_load_weights — DATAFLOW source for the weight m_axi port.
 //
 // Streams weights from DDR (gmem1) to process_conv_kernel_tile via
 // weight_stream in the exact order the consumer reads them.  The win is
 // not fewer DDR transactions but overlap: the weight loads now run
-// concurrently with bias_producer, input_patch_producer,
-// broadcast_patches, and the consumer's accumulate / partial_outputs
-// passes, instead of serialising inside the (oh, ow, mt) inner nest.
+// concurrently with bias_producer, input_patch_producer, and the
+// consumer's accumulate / partial_outputs passes, instead of
+// serialising inside the (oh, ow, mt) inner nest.
 //
 // Standard path (is_depthwise=0):
 //   Iteration order matches process_conv_kernel_tile's Phase 2a nest with
@@ -1232,33 +1191,14 @@ void ConvKernel(
     const unsigned ic_tiles         = (in_ch  + kTileIC - 1) / kTileIC;
     const unsigned m_tiles          = (out_ch + kTileM  - 1) / kTileM;
 
-    unsigned mt_per_group, num_m_groups;
-    compute_m_grouping(out_ch, mt_per_group, num_m_groups);
-    (void)mt_per_group;
-
-    // The patch path is channel-packed (PatchVec): one beat carries a
-    // full kTileIC-lane column, so input_per_iter is kh*kw beats per
-    // (ni, ict|mt, ow_tile, mg, oh, ow_in_tile) — same for both paths.
-    // broadcast_iters (the count of those outer iterations) is unchanged
-    // by ow-tiling: chunk_oh_count*ow_per_tile summed across
-    // (chunk, ow_tile) = out_h*out_w.
-    const unsigned input_per_iter   = kh * kw;
-    const unsigned broadcast_iters  = is_depthwise
-        ? (batch * m_tiles  * out_h * out_w)
-        : (batch * ic_tiles * num_m_groups * out_h * out_w);
-    const unsigned broadcast_factor = 1u;
-
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
-    // patch_pipe carries the producer's PatchVec emissions; patch_stream
-    // is the broadcaster's passthrough to the consumer.  Each beat is a
-    // channel-packed PatchVec (kTileIC lanes); depth is one kernel
-    // window's worth of beats (kMaxKH*kMaxKW) so the broadcaster drains
-    // patch_pipe as the assembler fills it under DATAFLOW.
-    hls::stream<PatchVec> patch_pipe;
-    #pragma HLS STREAM variable=patch_pipe depth=kMaxKH*kMaxKW
-
+    // patch_stream carries the producer's channel-packed PatchVec
+    // emissions straight to the consumer (no intermediate stage since
+    // §2.15).  Each beat is one kTileIC-lane column; depth is one
+    // kernel window's worth of beats (kMaxKH*kMaxKW) so the consumer
+    // drains it as the assembler fills it under DATAFLOW.
     hls::stream<PatchVec> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
 
@@ -1276,13 +1216,10 @@ void ConvKernel(
     bias_producer(bias, bias_stream,
                   out_ch, bias_rep_count, has_bias);
 
-    input_patch_producer(x, patch_pipe, batch, in_ch, in_h, in_w,
+    input_patch_producer(x, patch_stream, batch, in_ch, in_h, in_w,
         out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
         dilation_w, pad_top, pad_left, is_depthwise
     );
-
-    broadcast_patches(patch_pipe, patch_stream,
-                      broadcast_iters, input_per_iter, broadcast_factor);
 
     stream_load_weights(weight, weight_stream,
                         ic_tiles, m_tiles, in_ch, out_ch, out_w, out_h,
