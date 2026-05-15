@@ -214,7 +214,7 @@ Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
 ```
 
 **Channel-packed patch stream (§2.12).**  The patch path
-(`input_patch_producer → broadcast_patches → consumer`) carries a
+(`input_patch_producer → consumer`) carries a
 `PatchVec` — a `kTileIC`-lane struct (`Data_t lane[kTileIC]`, 256-bit
 at defaults) — instead of one `Data_t` per beat.  The producer gathers
 all `kTileIC` channel lanes for a `(khi, kwi)` position into one beat;
@@ -228,12 +228,12 @@ zero-pads the rest.
 
 ## 5. Loop Structure and HLS Pragmas
 
-The kernel is a top-level `#pragma HLS DATAFLOW` region with six concurrent
+The kernel is a top-level `#pragma HLS DATAFLOW` region with five concurrent
 sub-functions (see §3 of [CONV_OPTIMISATION.md](CONV_OPTIMISATION.md) for the
 dataflow diagram).  Each function owns its own m_axi port (or stream) and
-implements one of the six pipeline stages: input patch assembly, IC×M
-broadcast, weight streaming, bias streaming, the conv compute consumer, and
-the saturating output writer.
+implements one of the five pipeline stages: input patch assembly, weight
+streaming, bias streaming, the conv compute consumer, and the saturating
+output writer.
 
 ### 5.1 Standard Convolution — consumer loop nest
 
@@ -340,8 +340,8 @@ num_chunks   = ceil(out_h / oh_per_chunk)
 Each chunk runs the full three-phase pipeline above for its `oh` sub-range.
 The chunk loop is placed INNER to `ni` (and outer to everything else) in
 all producers + the consumer so the linear stream order seen by
-`bias_producer`, `broadcast_patches`, and `write_output_tile` is the same
-`(ni, oh, ow, mt, m1)` as before — those three need no chunk-awareness.
+`bias_producer` and `write_output_tile` is the same
+`(ni, oh, ow, mt, m1)` as before — those two need no chunk-awareness.
 
 **Duplicate-read overhead** at chunk boundaries:
 
@@ -407,7 +407,7 @@ reduction would be stream-rate-bound on `weight_stream`.
 
 | Pragma | Location | Effect |
 |--------|----------|--------|
-| `DATAFLOW` | top-level | Six concurrent producers/consumers |
+| `DATAFLOW` | top-level | Five concurrent producers/consumers |
 | `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable={x,weight,bias}` | top-level | Tells HLS the base pointers don't change across DATAFLOW processes |
@@ -536,7 +536,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Inner-MAC parallelism (standard)** | PN-wide adder tree: kTileIC=16 MACs/cycle, lane-rotated on m1 |
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=8 MACs/cycle |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
-| **Dataflow stages** | 6 (input_patch_producer, broadcast_patches, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
+| **Dataflow stages** | 5 (input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
