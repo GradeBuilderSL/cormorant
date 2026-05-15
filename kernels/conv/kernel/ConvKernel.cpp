@@ -66,6 +66,25 @@
 #define DEBUG_LOAD_DATA_CACHING
 #endif
 
+// ---------------------------------------------------------------------------
+// PatchVec — channel-packed patch stream element.
+//
+// The patch path (input_patch_producer → broadcast_patches → consumer)
+// previously carried one Data_t per stream beat, so the consumer's patch
+// drain ran at kTileIC·kh·kw cycles per (oh, ow).  PatchVec packs a full
+// channel column — kTileIC lanes — into a single beat, so the producer
+// emits and the consumer drains one beat per (khi, kwi): the patch drain
+// drops to kh·kw cycles.
+//
+// The standard path fills all kTileIC lanes; the depthwise path fills the
+// first kTileM lanes (its parallel axis) and zero-pads the rest — every
+// lane is written so no 'X' reaches RTL.  At kTileIC=16, ap_fixed<16,8>
+// this is a 256-bit FIFO element.
+// ---------------------------------------------------------------------------
+struct PatchVec {
+    Data_t lane[kTileIC];
+};
+
 #ifdef DEBUG_LOAD_DATA_CACHING
 #include <map>
 #include <list>
@@ -437,8 +456,8 @@ static void bias_producer(
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
 // ---------------------------------------------------------------------------
 static void input_patch_producer_standard(
-    const Data_t*        x,
-    hls::stream<Data_t>& patch_stream,
+    const Data_t*           x,
+    hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
     unsigned             in_ch,
     unsigned             in_h,
@@ -470,6 +489,9 @@ static void input_patch_producer_standard(
                       ow_per_tile, num_ow_tiles);
 
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
+    // dim=1 (ic_l) partitioned complete → kTileIC independent banks so
+    // Phase 2 can gather a full PatchVec (kTileIC lanes) per cycle.
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     AddressMap_t read_addresses;
@@ -565,34 +587,36 @@ static void input_patch_producer_standard(
                 for (unsigned ow = ow_start; ow < ow_end; ow++) {
 
                     // ---------------------------------------------------
-                    // Phase 2: stream a fixed kTileIC × kh × kw block of
-                    // patch values into patch_pipe.  Lanes ic_l >=
-                    // ic_valid are zero-padded so the broadcaster can
-                    // operate with a compile-time-fixed input_per_iter
-                    // (= kTileIC*kh*kw); the consumer's accumulate uses
-                    // ic_valid bound and ignores the padding lanes.
+                    // Phase 2: stream a kh × kw block of PatchVecs into
+                    // patch_pipe — one beat per (khi, kwi), each beat
+                    // packing all kTileIC ic-lanes.  Lanes ic_l >=
+                    // ic_valid are zero-padded; the consumer's accumulate
+                    // uses the ic_valid bound and ignores the padding.
                     // ---------------------------------------------------
-                    for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                        const bool ic_ok = (ic_l < ic_valid);
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                        - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned slot = ih_ok
-                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                    for (unsigned khi = 0; khi < kh; khi++) {
+                        const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                    - (int)pad_top;
+                        const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                        const unsigned slot = ih_ok
+                            ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                            : 0u;
+                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                            #pragma HLS PIPELINE II=1
+                            const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                        - (int)pad_left;
+                            const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
+                            const unsigned col_slot = iw_ok
+                                ? ((unsigned)iw & (kMaxLineBufCols - 1))
                                 : 0u;
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                            - (int)pad_left;
-                                const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                                const unsigned col_slot = iw_ok
-                                    ? ((unsigned)iw & (kMaxLineBufCols - 1))
-                                    : 0u;
-                                patch_stream.write((ic_ok && ih_ok && iw_ok)
+                            PatchVec v;
+                            for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                                #pragma HLS UNROLL
+                                const bool ic_ok = (ic_l < ic_valid);
+                                v.lane[ic_l] = (ic_ok && ih_ok && iw_ok)
                                     ? line_buf[ic_l][slot][col_slot]
-                                    : Data_t(0));
+                                    : Data_t(0);
                             }
+                            patch_stream.write(v);
                         }
                     }
                 } // ow loop
@@ -620,34 +644,27 @@ static void input_patch_producer_standard(
 // broadcast_patches — DATAFLOW stage between input_patch_producer and
 // process_conv_kernel_tile.
 //
-// Per outer iteration (standard path: one (ni, ict, oh, ow); depthwise
-// passthrough: one full per-mt patch):
-//   First pass:   read input_per_iter values from patch_pipe into local_buf
-//                 AND simultaneously forward them to patch_stream.  This
-//                 single II=1 pipeline absorbs the assembler's output and
-//                 emits the first broadcast copy with no extra cycle.
-//   Subsequent:   write (broadcast_factor - 1) more copies of local_buf to
-//                 patch_stream, flattened into one continuous II=1 pipeline.
-//
-// broadcast_factor = m_tiles for the standard path, = 1 for depthwise.
-// input_per_iter   = kTileIC * kh * kw for the standard path.
-// local_buf is sized for one ic-tile worth of patch values
-// (kTileIC * kMaxKH * kMaxKW), down from the full-image kMaxInCh-sized
-// buffer in the pre-Option-A design.
+// Since §2.10 (weight caching) the standard producer re-emits patches
+// per m_group itself, so broadcast_factor is always 1 and this stage is
+// a pure PatchVec passthrough — kept for dataflow-graph stability.
+// Each beat is one channel-packed PatchVec; input_per_iter = kh*kw beats
+// per (ni, ict, ow_tile, mg, oh, ow).  The local_buf re-emission path is
+// retained for broadcast_factor > 1 but is dead under the current
+// caller (factor=1).
 // ---------------------------------------------------------------------------
 static void broadcast_patches(
-    hls::stream<Data_t>& patch_pipe,
-    hls::stream<Data_t>& patch_stream,
-    unsigned             outer_iters,
-    unsigned             input_per_iter,
-    unsigned             broadcast_factor
+    hls::stream<PatchVec>& patch_pipe,
+    hls::stream<PatchVec>& patch_stream,
+    unsigned               outer_iters,
+    unsigned               input_per_iter,
+    unsigned               broadcast_factor
 ) {
-    Data_t local_buf[kTileIC * kMaxKH * kMaxKW];
+    PatchVec local_buf[kMaxKH * kMaxKW];
 
     for (unsigned r = 0; r < outer_iters; r++) {
         for (unsigned i = 0; i < input_per_iter; i++) {
             #pragma HLS PIPELINE II=1
-            const Data_t val = patch_pipe.read();
+            const PatchVec val = patch_pipe.read();
             local_buf[i] = val;
             patch_stream.write(val);
         }
@@ -690,8 +707,8 @@ static void broadcast_patches(
 //             input_per_iter (= kTileM*kh*kw).
 // ---------------------------------------------------------------------------
 static void input_patch_producer_depthwise(
-    const Data_t*        x,
-    hls::stream<Data_t>& patch_stream,
+    const Data_t*           x,
+    hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
     unsigned             in_ch,
     unsigned             in_h,
@@ -719,6 +736,9 @@ static void input_patch_producer_depthwise(
                       ow_per_tile, num_ow_tiles);
 
     Data_t line_buf[kTileM][kMaxLineBufRows][kMaxLineBufCols];
+    // dim=1 (m1) partitioned complete → kTileM independent banks so
+    // Phase 2 can gather a full PatchVec lane group per cycle.
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     AddressMap_t read_addresses;
@@ -800,28 +820,38 @@ static void input_patch_producer_depthwise(
                 }
 
                 for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                    // ----- Phase 2: stream kTileM × kh × kw values -----
-                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                        const bool m_ok = (m1 < m_valid);
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            const int ih = (int)(oh * stride_h + khi * dilation_h)
-                                        - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned slot = ih_ok
-                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                    // ----- Phase 2: stream kh × kw PatchVecs -----
+                    // Each beat packs kTileM real m-lanes; lanes
+                    // kTileM..kTileIC-1 are zero (depthwise's parallel
+                    // axis is kTileM, not kTileIC).
+                    for (unsigned khi = 0; khi < kh; khi++) {
+                        const int ih = (int)(oh * stride_h + khi * dilation_h)
+                                    - (int)pad_top;
+                        const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                        const unsigned slot = ih_ok
+                            ? ((unsigned)ih & (kMaxLineBufRows - 1))
+                            : 0u;
+                        for (unsigned kwi = 0; kwi < kw; kwi++) {
+                            #pragma HLS PIPELINE II=1
+                            const int iw = (int)(ow * stride_w + kwi * dilation_w)
+                                        - (int)pad_left;
+                            const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
+                            const unsigned col_slot = iw_ok
+                                ? ((unsigned)iw & (kMaxLineBufCols - 1))
                                 : 0u;
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                            - (int)pad_left;
-                                const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                                const unsigned col_slot = iw_ok
-                                    ? ((unsigned)iw & (kMaxLineBufCols - 1))
-                                    : 0u;
-                                patch_stream.write((m_ok && ih_ok && iw_ok)
-                                    ? line_buf[m1][slot][col_slot]
-                                    : Data_t(0));
+                            PatchVec v;
+                            for (unsigned lane = 0; lane < kTileIC; lane++) {
+                                #pragma HLS UNROLL
+                                if (lane < kTileM) {
+                                    const bool m_ok = (lane < m_valid);
+                                    v.lane[lane] = (m_ok && ih_ok && iw_ok)
+                                        ? line_buf[lane][slot][col_slot]
+                                        : Data_t(0);
+                                } else {
+                                    v.lane[lane] = Data_t(0);
+                                }
                             }
+                            patch_stream.write(v);
                         }
                     }
                 }
@@ -845,8 +875,8 @@ static void input_patch_producer_depthwise(
 }
 
 static void input_patch_producer(
-    const Data_t*        x,
-    hls::stream<Data_t>& patch_stream,
+    const Data_t*           x,
+    hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
     unsigned             in_ch,
     unsigned             in_h,
@@ -1031,7 +1061,7 @@ static void stream_load_weights(
 // Memory constraint: out_w*out_ch <= kMaxAccPersistEntries  (one row fits).
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
-    hls::stream<Data_t>&    patch_stream,
+    hls::stream<PatchVec>&  patch_stream,
     hls::stream<Data_t>&    weight_stream,
     hls::stream<AccData_t>& bias_stream,
     hls::stream<AccData_t>& acc_stream,
@@ -1150,11 +1180,15 @@ static void process_conv_kernel_tile(
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
                         #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
 
-                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    patch_stream.read(patch[ic_l][khi][kwi]);
+                        // Drain kh*kw channel-packed PatchVec beats and
+                        // unpack each into the kTileIC ic-lanes.
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const PatchVec v = patch_stream.read();
+                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                                    #pragma HLS UNROLL
+                                    patch[ic_l][khi][kwi] = v.lane[ic_l];
                                 }
                             }
                         }
@@ -1235,14 +1269,17 @@ static void process_conv_kernel_tile(
                         AccData_t acc[kTileM];
                         #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-                        // Read kTileM*kh*kw patch values from stream.
-                        // Stored in patch[0..kTileM-1] (depthwise reuses
-                        // the [kTileIC]-deep buffer; kTileM <= kTileIC).
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    patch_stream.read(patch[m1][khi][kwi]);
+                        // Drain kh*kw channel-packed PatchVec beats and
+                        // unpack the kTileM depthwise m-lanes (lanes
+                        // kTileM..kTileIC-1 carry the producer's zero pad
+                        // and are unused by accumulate_depthwise).
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const PatchVec v = patch_stream.read();
+                                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                    #pragma HLS UNROLL
+                                    patch[m1][khi][kwi] = v.lane[m1];
                                 }
                             }
                         }
@@ -1391,19 +1428,13 @@ void ConvKernel(
     compute_m_grouping(out_ch, mt_per_group, num_m_groups);
     (void)mt_per_group;
 
-    // Total patch emissions equal the consumer's read count.  ow-tiling
-    // changes ordering but not totals — chunk_oh_count*ow_per_tile summed
-    // across (chunk, ow_tile) = out_h*out_w.  So broadcast_iters formulae
-    // are unchanged.
-    //
-    //   Standard:  kTileIC*kh*kw per (ni, ict, ow_tile, mg, oh, ow_in_tile);
-    //              producer replays patches num_m_groups times per
-    //              (ict, ow_tile, oh, ow_in_tile); passthrough (factor=1).
-    //   Depthwise: kTileM *kh*kw per (ni, mt, ow_tile, oh, ow_in_tile);
-    //              passthrough.
-    const unsigned input_per_iter   = is_depthwise
-        ? (kTileM  * kh * kw)
-        : (kTileIC * kh * kw);
+    // The patch path is channel-packed (PatchVec): one beat carries a
+    // full kTileIC-lane column, so input_per_iter is kh*kw beats per
+    // (ni, ict|mt, ow_tile, mg, oh, ow_in_tile) — same for both paths.
+    // broadcast_iters (the count of those outer iterations) is unchanged
+    // by ow-tiling: chunk_oh_count*ow_per_tile summed across
+    // (chunk, ow_tile) = out_h*out_w.
+    const unsigned input_per_iter   = kh * kw;
     const unsigned broadcast_iters  = is_depthwise
         ? (batch * m_tiles  * out_h * out_w)
         : (batch * ic_tiles * num_m_groups * out_h * out_w);
@@ -1412,16 +1443,16 @@ void ConvKernel(
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
-    // patch_pipe carries the producer's emissions; patch_stream is the
-    // broadcaster's passthrough to the consumer (broadcast_factor=1 now,
-    // since the standard producer already replays per m_group).  patch_pipe
-    // depth is one ic-tile's patch (kTileIC*kh*kw) — the broadcaster drains
-    // it as the assembler fills it under DATAFLOW.
-    hls::stream<Data_t> patch_pipe;
-    #pragma HLS STREAM variable=patch_pipe depth=kTileIC*kMaxKH*kMaxKW
+    // patch_pipe carries the producer's PatchVec emissions; patch_stream
+    // is the broadcaster's passthrough to the consumer.  Each beat is a
+    // channel-packed PatchVec (kTileIC lanes); depth is one kernel
+    // window's worth of beats (kMaxKH*kMaxKW) so the broadcaster drains
+    // patch_pipe as the assembler fills it under DATAFLOW.
+    hls::stream<PatchVec> patch_pipe;
+    #pragma HLS STREAM variable=patch_pipe depth=kMaxKH*kMaxKW
 
-    hls::stream<Data_t> patch_stream;
-    #pragma HLS STREAM variable=patch_stream depth=kTileIC
+    hls::stream<PatchVec> patch_stream;
+    #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
 
     hls::stream<AccData_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
