@@ -283,9 +283,13 @@ static void accumulate_standard(
             const Data_t w_val = (ic_l < ic_valid)
                 ? w_buf[m1][ic_l][khi_cnt][kwi_cnt]
                 : Data_t(0);
-            lane_sum +=
-                AccData_t(patch[ic_l][khi_cnt][kwi_cnt]) *
-                AccData_t(w_val);
+            // Multiply Data_t × Data_t (16×16 → a single DSP48).  The
+            // ap_fixed product of two ap_fixed<16,8> is natively
+            // ap_fixed<32,16> = AccData_t and holds patch·w exactly, so
+            // widening the OPERANDS to AccData_t first — which forced a
+            // 32×32 DSP cascade and lengthened the MAC critical path —
+            // is unnecessary.  Result is bit-identical.
+            lane_sum += patch[ic_l][khi_cnt][kwi_cnt] * w_val;
         }
         acc[m1] += lane_sum;
 
@@ -328,9 +332,10 @@ static void accumulate_depthwise(
         #pragma HLS PIPELINE II=1
         for (unsigned m1 = 0; m1 < kTileM; m1++) {
             #pragma HLS UNROLL
-            acc[m1] +=
-                AccData_t(patch[m1][khi_cnt][kwi_cnt]) *
-                AccData_t(w_buf[m1][khi_cnt][kwi_cnt]);
+            // 16×16 Data_t multiply (single DSP48) — see the operand-
+            // width note in accumulate_standard.
+            acc[m1] += patch[m1][khi_cnt][kwi_cnt]
+                     * w_buf[m1][khi_cnt][kwi_cnt];
         }
 
         if (++kwi_cnt == kw) {
