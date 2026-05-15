@@ -69,7 +69,7 @@
 | `kMaxOutCh` | 1024 | Sizes `bias_buf` in `bias_producer` |
 | `kMaxLineBufCols` | 64 | Column capacity of `line_buf`; power of 2 (used as bitmask). Caps `ow_per_tile`, NOT `in_w` — wider inputs split into multiple `ow_tile`s |
 | `kMaxLineBufRows` | 16 | Row capacity of `line_buf`; power of 2 (used as bitmask) |
-| `kMaxAccPersistEntries` | 16384 | `partial_outputs[]` buffer size; one output row (`out_w·out_ch`) must fit |
+| `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one output row (`out_w·out_ch`) must fit. Buffer is bound to **URAM** — each 4096 entries spends one URAM block, so this trades URAM, not BRAM |
 | `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab |
 
 If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`.
@@ -127,23 +127,43 @@ AccData_t acc[kTileM];
 
 // Per-(ni, chunk) persistent state — chunk-scoped, lives in the consumer:
 AccData_t partial_outputs[kMaxAccPersistEntries];
+#pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM
 // Holds chunk_oh_count·out_w·out_ch accumulators that survive across
 // ic-tiles (standard) or mt-tiles (depthwise) within a chunk.  Indexed
 // by (oh_local·out_w + ow)·out_ch + m_off + m1 where oh_local = oh - oh_start.
+// Bound to URAM — the largest on-chip buffer, moved off scarce BRAM
+// into the otherwise-idle URAM pool (16 of 64 URAM blocks at the
+// 65536-entry default).  RAM_2P: Phase 1/3 use one port, Phase 2's
+// read and write are separate II=1 sub-loops, so no port conflict.
 
 // Per-(ni, chunk, ict, ow_tile) line buffer — lives in the standard
 // patch producer.  Both row and column dims are circular:
 //     row_slot = ih & (kMaxLineBufRows - 1)
 //     col_slot = iw & (kMaxLineBufCols - 1)
 Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
-// Within (chunk, ict, ow_tile) each input pixel in the tile's iw range
-// is fetched from DDR exactly once.  Reloaded per ow_tile (different
-// iw range); the (kw-1)·dilation_w-col overlap is re-fetched.
+#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+// dim=1 (ic_l) partitioned complete → kTileIC independent banks so
+// Phase 2 can gather a full PatchVec (all kTileIC channel lanes) in
+// one cycle.  Within (chunk, ict, ow_tile) each input pixel in the
+// tile's iw range is fetched from DDR exactly once; reloaded per
+// ow_tile, with the (kw-1)·dilation_w-col overlap re-fetched.
 
 // Per-(ni, chunk, mt, ow_tile) line buffer — depthwise variant, same
-// shape but indexed by m1 instead of ic_l:
+// shape but indexed by m1; partitioned complete dim=1 → kTileM banks.
 Data_t    line_buf[kTileM][kMaxLineBufRows][kMaxLineBufCols];
+#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 ```
+
+**Channel-packed patch stream (§2.12).**  The patch path
+(`input_patch_producer → broadcast_patches → consumer`) carries a
+`PatchVec` — a `kTileIC`-lane struct (`Data_t lane[kTileIC]`, 256-bit
+at defaults) — instead of one `Data_t` per beat.  The producer gathers
+all `kTileIC` channel lanes for a `(khi, kwi)` position into one beat;
+the consumer drains one beat per `(khi, kwi)` and UNROLL-unpacks into
+the local `patch[][][]` array.  This collapses the consumer's patch
+drain from `kTileIC·kh·kw` cycles to `kh·kw`.  The depthwise path packs
+its `kTileM` m-lanes into the first `kTileM` PatchVec lanes and
+zero-pads the rest.
 
 ---
 
@@ -184,7 +204,8 @@ for ni in [0, batch)
 
           for oh_local in [0, chunk_oh)
             for ow in [ow_start, ow_end)
-              // Drain kTileIC × kh × kw patch values from patch_stream — II=1
+              // Drain kh × kw channel-packed PatchVec beats from
+              //   patch_stream (1 beat = kTileIC lanes) — II=1
               for mt_in_group in [0, mt_per_group_actual)
                 // acc[0..kTileM-1] := partial_outputs[idx_base + …]    (II=1)
                 // accumulate_standard(patch, w_cache[mt_in_group], …):
@@ -228,7 +249,8 @@ for ni in [0, batch)
         ow_end   = min(out_w, ow_start + ow_per_tile)
         for oh_local in [0, chunk_oh)
           for ow in [ow_start, ow_end)
-            // Drain kTileM × kh × kw patch values from patch_stream — II=1
+            // Drain kh × kw channel-packed PatchVec beats from
+            //   patch_stream (kTileM lanes used, rest zero-pad) — II=1
             // acc[0..kTileM-1] := partial_outputs[idx_base + …]   (II=1)
             // accumulate_depthwise():
             //   for ri in [0, kh · kw):                            PIPELINE II=1
@@ -457,6 +479,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
 | **Dataflow stages** | 6 (input_patch_producer, broadcast_patches, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
+| **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
@@ -464,6 +487,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |
 | **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time) |
 | **Persistent acc constraint** | `out_w·out_ch ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
+| **Persistent acc storage** | `partial_outputs[]` bound to URAM (`bind_storage impl=URAM`) — off BRAM, into the idle URAM pool |
 | **Line-buffer column constraint** | `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(in_w no longer capped — wider inputs auto-tiled along ow)* |
 | **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag |
 | **Weight layout (standard)** | `[out_ch][in_ch][kh][kw]` |
