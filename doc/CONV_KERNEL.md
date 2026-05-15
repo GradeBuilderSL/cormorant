@@ -93,6 +93,68 @@ All three split axes accept duplicate DDR reads at tile/chunk boundaries — the
 
 ## 4. On-Chip Memory
 
+The kernel stages data through **four memory layers** — DDR, URAM, BRAM,
+and registers — each a smaller/faster cache of the layer below it.  The
+diagram shows every on-chip cache, the layer it is bound to, its
+capacity, and what it holds.  Post-§2.13 the design uses **25 % of the
+URAM pool** and **35 % of BRAM**, so both layers still have headroom
+for wider tiling.
+
+```mermaid
+flowchart TB
+    subgraph DDR["DDR — external memory · AXI gmem0-3"]
+        Xd[("x · input tensor")]
+        Wd[("weight")]
+        Bd[("bias")]
+        Yd[("y · output tensor")]
+    end
+
+    subgraph URAML["URAM layer — 64 blocks · 2.25 MB · 25% used"]
+        PO["partial_outputs<br/>65536 entries · 256 KB · 16 URAM blocks<br/><i>persistent accumulator — survives every<br/>ic-tile / mt-tile of one oh-chunk</i>"]
+    end
+
+    subgraph BRAML["BRAM layer — 288 BRAM18K · 35% used"]
+        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache;<br/>each x pixel fetched once per ow_tile</i>"]
+        WC["w_cache<br/>4·8·16·7·7 · ~50 KB · kTileIC banks<br/><i>one ict/ow_tile/M-group weight slab,<br/>reused across the spatial sweep</i>"]
+        WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
+        BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
+    end
+
+    subgraph REGL["Register layer — FF/LUT · fully ARRAY_PARTITIONed"]
+        PA["patch<br/>kTileIC·7·7 · every cell a register<br/><i>current oh,ow kernel window</i>"]
+        AC["acc<br/>kTileM lanes · registers<br/><i>MAC lane accumulators</i>"]
+    end
+
+    Xd -->|burst read| LB
+    Wd -->|burst read| WC
+    Wd -->|burst read| WB
+    Bd -->|loaded once| BB
+    LB -->|PatchVec gather| PA
+    WC -->|PN-wide weights| AC
+    WB -->|PM-wide weights| AC
+    PA -->|PN/PM MACs| AC
+    BB -->|Phase 1 init| PO
+    AC <-->|Phase 2 read-modify-write| PO
+    PO -->|Phase 3 drain + saturate| Yd
+
+    classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
+    classDef uram fill:#f9f0ff,stroke:#722ed1,color:#391085
+    classDef bram fill:#e6f7ff,stroke:#1890ff,color:#003a8c
+    classDef reg fill:#f6ffed,stroke:#52c41a,color:#135200
+    class Xd,Wd,Bd,Yd ddr
+    class PO uram
+    class LB,WC,WB,BB bram
+    class PA,AC reg
+```
+
+The two largest caches are the structural cost of the tiling strategy:
+`w_cache` (BRAM) holds one weight slab so DDR weight reads are amortised
+across the spatial sweep (§5.5), and `partial_outputs` (URAM) holds one
+oh-chunk's accumulators so the input is read once across all ic-tiles
+(§5.3).  Sizes scale with the `Config.h` knobs in §3 — `kMaxMperGroup`
+sizes `w_cache`, `kMaxAccPersistEntries` sizes `partial_outputs`,
+`kMaxLineBufRows/Cols` size `line_buf`.
+
 Buffers are declared inside `process_conv_kernel_tile` (re-allocated per inner
 iteration; HLS hoists them to BRAM/registers).
 
