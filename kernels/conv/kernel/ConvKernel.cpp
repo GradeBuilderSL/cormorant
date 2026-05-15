@@ -956,7 +956,16 @@ static void process_conv_kernel_tile(
                      oh_local++) {
                     for (unsigned ow = ow_start; ow < ow_end; ow++) {
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
+                        // Banked register file: partition only the bank
+                        // dim → kTileIC banks for the ic_l UNROLL's
+                        // parallel reads, with (khi,kwi) as a RAM address.
+                        // This keeps khi/kwi driving kTileIC RAM address
+                        // ports rather than the high-fanout combinational
+                        // read mux the fully-partitioned-FF form created
+                        // (DAC'20 control-broadcast — the mis-scheduled
+                        // MUXF8 on the routed critical path).
+                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+                        #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
                         // Drain kh*kw channel-packed PatchVec beats and
                         // unpack each into the kTileIC ic-lanes.
@@ -1042,7 +1051,9 @@ static void process_conv_kernel_tile(
                      oh_local++) {
                     for (unsigned ow = ow_start; ow < ow_end; ow++) {
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=0
+                        // Banked register file — see the Phase 2a note.
+                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+                        #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
                         AccData_t acc[kTileM];
                         #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
