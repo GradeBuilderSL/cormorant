@@ -159,11 +159,15 @@ Buffers are declared inside `process_conv_kernel_tile` (re-allocated per inner
 iteration; HLS hoists them to BRAM/registers).
 
 ```cpp
-// Per-(oh, ow, mt) scratch — partitioned for the parallel MAC inner loop.
+// Per-(oh, ow, mt) scratch — a banked register file (§2.18).
 
 Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-#pragma HLS ARRAY_PARTITION variable=patch complete dim=0
-// All three dimensions fully partitioned → every cell is a register.
+#pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+#pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
+// Only the bank dim is partitioned → kTileIC independent LUTRAMs, one
+// per ic-lane, so the ic_l UNROLL reads every bank in parallel while
+// (khi,kwi) addresses the RAM. Fully partitioning all three dims (the
+// pre-§2.18 form) made (khi,kwi) drive a wide combinational read mux.
 // Standard: patch[ic_l][khi][kwi] for current (oh, ow, ic_tile).
 // Depthwise: patch[m1][khi][kwi]  for current (oh, ow, m_tile);
 // the [kTileIC] depth covers kTileM lanes (kTileM ≤ kTileIC).
@@ -279,7 +283,7 @@ for ni in [0, batch)
 
     // PHASE 3: drain partial_outputs to acc_stream — PIPELINE II=1
     for oh_local, ow, mt, m1:
-      acc_stream.write(partial_outputs[…])
+      acc_stream.write(saturate_cast<Data_t>(partial_outputs[…]))  // §2.16
 ```
 
 **Inner-MAC throughput is `kTileIC` MACs/cycle** (PN-wide adder tree fed by
@@ -411,7 +415,7 @@ reduction would be stream-rate-bound on `weight_stream`.
 | `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable={x,weight,bias}` | top-level | Tells HLS the base pointers don't change across DATAFLOW processes |
-| `ARRAY_PARTITION variable=patch complete dim=0` | `patch[kTileIC][kMaxKH][kMaxKW]` | All cells become registers |
+| `ARRAY_PARTITION variable=patch complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` | `patch[kTileIC][kMaxKH][kMaxKW]` | Banked register file: kTileIC LUTRAMs, `(khi,kwi)` is a RAM address (§2.18) |
 | `ARRAY_PARTITION variable=w_cache complete dim=3` | standard `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks on the ic_l axis for the PN unroll |
 | `ARRAY_PARTITION variable=w_buf complete dim=1` | depthwise `w_buf[kTileM][kMaxKH][kMaxKW]` | kTileM banks for the PM unroll |
 | `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileM]` | All accumulators in registers |
@@ -448,7 +452,7 @@ weight input; no DSP impact.
 
 ## 6. Data Types and Saturation
 
-`saturate_cast<Data_t>(v)` converts `AccData_t` accumulator back to `Data_t` at the write stage. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward zero) and `AP_SAT` (saturation clamping), matching ONNX fixed-point semantics. A fallback template handles `float` builds (identity cast).
+`saturate_cast<Data_t>(v)` converts an `AccData_t` accumulator back to `Data_t`. It is applied in `process_conv_kernel_tile`'s Phase-3 drain (§2.16), so `acc_stream` is a `Data_t`-wide FIFO and `write_output_tile` copies finished elements straight to `y[]`. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward zero) and `AP_SAT` (saturation clamping), matching ONNX fixed-point semantics. A fallback template handles `float` builds (identity cast).
 
 ---
 
@@ -532,6 +536,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Modes** | Standard (group=1), Depthwise (group=in_ch) |
 | **Data type** | `ap_fixed<16,8>` (default) or `float` |
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `float` |
+| **MAC operand width** | `Data_t × Data_t` 16×16 multiply → single DSP48 per lane; operands are *not* pre-widened to `AccData_t` (§2.17) |
 | **Tiling** | kTileM=8 output channels × kTileIC=16 input channels |
 | **Inner-MAC parallelism (standard)** | PN-wide adder tree: kTileIC=16 MACs/cycle, lane-rotated on m1 |
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=8 MACs/cycle |
@@ -539,6 +544,8 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Dataflow stages** | 5 (input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
+| **Patch buffer storage** | `patch[kTileIC][kMaxKH][kMaxKW]` is a banked register file — kTileIC LUTRAMs partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18) |
+| **Accumulator stream** | `acc_stream` is `Data_t`-wide; `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
