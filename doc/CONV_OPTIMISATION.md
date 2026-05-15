@@ -12,8 +12,9 @@ final architecture.
 > **Status (2026-05-15).**  §2.7 (weight streaming), §2.8 (PN/PM
 > parallel MACs + X-prop guard), §2.9 (oh-chunking), §2.10 (weight
 > caching + M-grouping), §2.11 (ow-tiling — lifted the in_w cap),
-> §2.12 (channel-packed patch stream), and §2.13 (URAM accumulator)
-> are written up against measured `conv-verify` snapshots.  §2.1–§2.6
+> §2.12 (channel-packed patch stream), §2.13 (URAM accumulator), and
+> §2.14 (unified patch producer) are written up against measured
+> `conv-verify` snapshots.  §2.1–§2.6
 > still have TODO cells — structural outlines reflect the optimisation
 > passes visible in the current source (dataflow stages in
 > `csynth.rpt`, the Option-A IC-tiling design in `Config.h.in`, the
@@ -52,8 +53,9 @@ after running the full TestConvRef case list.
 | + Weight caching + M-grouping (§2.10) | 30 | 2,636,945 | **-31.7 %** | -46.3 % |
 | + ow-tiling (§2.11) | 30 | 2,673,625 | +1.4 % | -45.6 % |
 | + Channel-packed patch stream (§2.12) | 30 | 1,866,425 | **-30.2 %** | -62.0 % |
-| + URAM accumulator (§2.13, this snapshot) | 30 | 1,869,385 | +0.2 % | **-62.0 %** |
-| **Current state (post-§2.13, captured 2026-05-15)** | **30** | **1,869,385** | — | **-62.0 %** |
+| + URAM accumulator (§2.13) | 30 | 1,869,385 | +0.2 % | -62.0 % |
+| + Unified patch producer (§2.14, this snapshot) | 30 | 1,869,385 | +0.0 % | **-62.0 %** |
+| **Current state (post-§2.14, captured 2026-05-15)** | **30** | **1,869,385** | — | **-62.0 %** |
 
 **Net result vs §2.7 snapshot: 2.63× faster across 30 RTL tests; 62.0 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
@@ -610,9 +612,62 @@ stands alone as the constraint.
 multi-chunk path.  Restoring that coverage needs larger test
 dimensions (`out_h·out_w·out_ch > 65536`) or a reduced-cap config.
 
+### 2.14. Unified patch producer
+
+**Problem.**  Standard and depthwise convolution had **two separate
+patch producers** — `input_patch_producer_standard` and
+`input_patch_producer_depthwise` — selected by a runtime
+`if (is_depthwise)` in a dispatch wrapper.  Because the selector is a
+runtime argument, **both functions synthesise into silicon**, even
+though only one runs per kernel invocation.  The two were near-
+identical: same `line_buf` management, same Phase-1 DDR loads, same
+Phase-2 `PatchVec` gather — differing only in (a) the channel-
+parallelism axis (`kTileIC` input-channel banks vs `kTileM` channel
+banks) and (b) the M-group patch re-emission (standard replays per
+`num_m_groups`; depthwise does not).  The duplication cost a second
+`line_buf` and a second copy of all the producer control logic.
+
+This is the deduplication half of the "depthwise and standard are
+special cases of one convolution" observation — the *compute*
+datapaths (`accumulate_standard` PN-tree vs `accumulate_depthwise`
+PM-lanes) genuinely differ by parallelism axis and are **kept
+separate**; only the patch-assembly glue is shared.
+
+**Change.**  Fold the two producers and the wrapper into one
+`input_patch_producer(... , is_depthwise)`:
+
+- **Channel-tile geometry is runtime-derived:** `ct_width =
+  is_depthwise ? kTileM : kTileIC`, `total_ch = is_depthwise ? out_ch
+  : in_ch`, `ct_tiles = ceil(total_ch / ct_width)`.
+- **Group replay is runtime-derived:** `num_groups = is_depthwise ? 1
+  : num_m_groups`.
+- **One `line_buf[kTileIC][…][…]`** serves both modes (was one
+  `[kTileIC]` + one `[kTileM]`).  Depthwise uses banks `[0, kTileM)`;
+  the Phase-2 gather masks lanes `≥ ch_valid` to 0 — the same
+  X-clean mask the standard partial-IC tail already relies on, so
+  reading the never-written `[kTileM, kTileIC)` banks is safe (the
+  mux selects 0, the X never reaches an output).
+- `stream_load_weights`, the two `accumulate_*` datapaths, and the
+  consumer's Phase 2a/2b are **unchanged** — only the producer merged.
+
+**Result.** **0 ns** — the merged producer emits the identical
+`PatchVec` stream in the identical order, so all 30 RTL tests are
+bit-identical to §2.13 (Gate 4 reported a flat `+0.0 %`).  This is a
+pure resource win:
+
+**Synthesis impact.** No II violations; top-level slack unchanged at
+**-0.90 ns**.  Resources:
+LUT **66,426 (56 %) → 56,856 (48 %)** — −9,570, the headline win;
+LUT was the single tightest resource.
+BRAM **101 → 93** — the depthwise `line_buf` is gone.
+FF **72,901 → 66,137** (−6,764);
+DSP 168 → 158;
+URAM 16 unchanged.
+The kernel source shrank 201 lines (79 added, 280 deleted).
+
 ---
 
-## 3. Current architecture (post-§2.13)
+## 3. Current architecture (post-§2.14)
 
 ```mermaid
 flowchart LR
@@ -620,7 +675,7 @@ flowchart LR
     DDR_W[("weight<br/>gmem1")]
     DDR_B[("bias<br/>gmem2")]
     DDR_Y[("y<br/>gmem3")]
-    IPP["input_patch_producer<br/><i>standard + depthwise</i><br/>owns line_buf<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
+    IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
     BC["broadcast_patches<br/><i>PatchVec passthrough (factor=1)</i>"]
     SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
@@ -651,20 +706,21 @@ flowchart LR
 
 **Six dataflow stages**, all running concurrently:
 
-1. **`input_patch_producer`** — owns
-   `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]` (standard) or
-   `line_buf[kTileM][…][…]` (depthwise), both partitioned
-   `complete dim=1` (§2.12) with circular indexing on row and column
-   dims; reads `x[]` from `gmem0`.  Standard variant iterates
-   `(ni, chunk, ict, ow_tile, mg, oh, ow_in_tile, khi, kwi)` and emits
-   one channel-packed `PatchVec` per `(khi, kwi)` — chunk wraps
-   (ict, oh) for §2.9, ow_tile wraps (mg, oh, ow) for §2.11, mg wraps
-   (oh, ow) for §2.10 patch re-emission; depthwise variant substitutes
-   `mt` for `ict` and skips `mg`.  Within a `(chunk, ict|mt, ow_tile)`
-   each x pixel in the tile's iw range is fetched from DDR exactly once
-   per `(ni, c)`; the `(kh-1)·stride_h`-row overlap is re-fetched at
-   chunk transitions and the `(kw-1)·dilation_w`-col overlap at ow_tile
-   transitions.  Emits `PatchVec`s to `patch_pipe`.
+1. **`input_patch_producer`** — one assembler for both modes (§2.14).
+   Owns a single `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]`
+   partitioned `complete dim=1` (§2.12) with circular indexing on row
+   and column dims; reads `x[]` from `gmem0`.  Iterates
+   `(ni, chunk, ct, ow_tile, grp, oh, ow_in_tile, khi, kwi)` and emits
+   one channel-packed `PatchVec` per `(khi, kwi)`.  The channel-tile
+   axis is runtime-selected — `ct` spans `ic_tiles` of `kTileIC`
+   channels for standard, `m_tiles` of `kTileM` for depthwise (which
+   uses only `line_buf` banks `[0, kTileM)`); `grp` spans
+   `num_m_groups` for standard (§2.10 patch re-emission) and 1 for
+   depthwise.  Within a `(chunk, ct, ow_tile)` each x pixel in the
+   tile's iw range is fetched from DDR exactly once per `(ni, c)`; the
+   `(kh-1)·stride_h`-row overlap is re-fetched at chunk transitions and
+   the `(kw-1)·dilation_w`-col overlap at ow_tile transitions.  Emits
+   `PatchVec`s to `patch_pipe`.
 2. **`broadcast_patches`** — `PatchVec` passthrough since §2.10 (the
    standard producer's `mg` loop already emits patches `num_m_groups`
    times per `(ict, ow_tile, oh, ow_in_tile)`).  Kept for ABI
@@ -798,12 +854,12 @@ post-§2.8 (2026-05-13), post-§2.9 (2026-05-14), post-§2.10
 Sorted by `§2.7` descending so the cumulative drop is easy to read
 off.  Source: `build/kernels/conv/kv260/conv_timing_last.json`.
 
-§2.13 (URAM accumulator) adds no per-test column: it is a resource
-change with a uniform +0.0 % – +0.7 % timing cost (TOTAL
-1,864,225 → 1,867,185 ns `duration_ns`; `sim_time_ns`
-1,866,425 → 1,869,385 ns), so the §2.12 column below is still the
-last meaningful timing movement.  The `Baseline (pre-§2.1)` column
-is TODO.
+§2.13 (URAM accumulator) and §2.14 (unified patch producer) add no
+per-test column — both are resource changes.  §2.13 cost a uniform
++0.0 % – +0.7 % (TOTAL `duration_ns` 1,864,225 → 1,867,185 ns); §2.14
+is bit-identical (0 ns, the merged producer emits the same stream).
+The §2.12 column below is therefore still the last meaningful timing
+movement.  The `Baseline (pre-§2.1)` column is TODO.
 
 | Test | §2.7 | §2.8 | §2.9 | §2.10 | §2.11 | §2.12 | Δ§2.12 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -871,16 +927,17 @@ TODO: backfill the `Baseline (pre-§2.1)` column from a
 After §2.12 the heaviest test (`batch_3 ResNet-style`) is at 0.18 ms
 out of 1.86 ms total — 7.0× faster than at §2.7.  Worst-slack
 sub-block in `csynth.rpt` is `process_conv_kernel_tile` at **-0.90 ns**
-— unchanged across §2.8 → §2.13, so the MAC pipeline is still the
-timing-critical path.  §2.13 then rebalanced resources: BRAM
-**131 → 101** (`partial_outputs` moved to URAM), URAM **0 → 16
-(25 %)**, DSP 172 → 168, LUT flat at 66,426 (56 %).  **LUT is now the
-single tightest resource** — BRAM at 35 % and URAM at 25 % both have
-headroom, so further buffer widening should target those pools, not
-BRAM.
+— unchanged across §2.8 → §2.14, so the MAC pipeline is still the
+timing-critical path.  §2.13 and §2.14 then rebalanced resources:
+§2.13 moved `partial_outputs` to URAM (BRAM 131 → 101, URAM 0 → 16),
+and §2.14 merged the two patch producers (LUT 66,426 → **56,856**,
+BRAM 101 → **93**, FF 72,901 → **66,137**).  Current utilisation:
+**LUT 48 %, FF 28 %, BRAM 32 %, URAM 25 %, DSP 12 %**.  LUT is still
+the tightest resource but the §2.14 merge bought back ~8 points of
+headroom across the board.
 
 Distribution of the remaining work (§2.12 timing snapshot — unchanged
-by §2.13):
+by §2.13 / §2.14):
 
 - 10 depthwise tests: 0.73 ms / 1.86 ms (**39 %**) — depthwise didn't
   benefit from §2.10 weight caching; §2.12 packed its `kTileM`-wide
@@ -971,7 +1028,7 @@ until the next behavior-test sweep.
 
 | File | What changed |
 |---|---|
-| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop INNER to `ni` in both producers + `stream_load_weights` + consumer; `last_loaded_row` per-chunk init; `partial_outputs` indexed by `oh_local`.  **§2.10:** new `compute_m_grouping()` helper; mg loop in standard producer (patch re-emission), in `stream_load_weights` standard path (once per (ict, mg)), and in consumer Phase 2a; `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with `ARRAY_PARTITION complete dim=3`; `broadcast_factor` reduced to 1.  **§2.11:** new `compute_ow_tiling()` helper; ow_tile loop in both producers + `stream_load_weights` standard path + consumer Phase 2a/2b; `line_buf` reshaped to `[…][kMaxLineBufRows][kMaxLineBufCols]` with circular indexing on BOTH dims; Phase 1 iw clipping.  **§2.12:** new `struct PatchVec { Data_t lane[kTileIC]; }`; `line_buf` in both producers partitioned `ARRAY_PARTITION complete dim=1` so the Phase-2 gather of all `kTileIC` lanes into one `PatchVec` per `(khi,kwi)` is single-cycle; `broadcast_patches` and `process_conv_kernel_tile` retyped to `hls::stream<PatchVec>`; consumer drains one `PatchVec` per `(khi,kwi)` and UNROLL-unpacks the lanes; `input_per_iter = kh·kw` (was `kh·kw·kTileIC`); `patch_pipe`/`patch_stream` depth reduced to `kMaxKH·kMaxKW`.  **§2.13:** `#pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM` on the accumulator declaration in `process_conv_kernel_tile` — one pragma, no loop or index change. |
+| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop INNER to `ni` in both producers + `stream_load_weights` + consumer; `last_loaded_row` per-chunk init; `partial_outputs` indexed by `oh_local`.  **§2.10:** new `compute_m_grouping()` helper; mg loop in standard producer (patch re-emission), in `stream_load_weights` standard path (once per (ict, mg)), and in consumer Phase 2a; `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with `ARRAY_PARTITION complete dim=3`; `broadcast_factor` reduced to 1.  **§2.11:** new `compute_ow_tiling()` helper; ow_tile loop in both producers + `stream_load_weights` standard path + consumer Phase 2a/2b; `line_buf` reshaped to `[…][kMaxLineBufRows][kMaxLineBufCols]` with circular indexing on BOTH dims; Phase 1 iw clipping.  **§2.12:** new `struct PatchVec { Data_t lane[kTileIC]; }`; `line_buf` in both producers partitioned `ARRAY_PARTITION complete dim=1` so the Phase-2 gather of all `kTileIC` lanes into one `PatchVec` per `(khi,kwi)` is single-cycle; `broadcast_patches` and `process_conv_kernel_tile` retyped to `hls::stream<PatchVec>`; consumer drains one `PatchVec` per `(khi,kwi)` and UNROLL-unpacks the lanes; `input_per_iter = kh·kw` (was `kh·kw·kTileIC`); `patch_pipe`/`patch_stream` depth reduced to `kMaxKH·kMaxKW`.  **§2.13:** `#pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM` on the accumulator declaration in `process_conv_kernel_tile` — one pragma, no loop or index change.  **§2.14:** `input_patch_producer_standard` + `input_patch_producer_depthwise` + the dispatch wrapper collapsed into one `input_patch_producer(…, is_depthwise)`; channel-tile width (`ct_width`), tile count (`ct_tiles`), and group count (`num_groups`) runtime-derived from `is_depthwise`; one shared `line_buf[kTileIC][…][…]` (depthwise uses banks `[0,kTileM)`); −201 lines net. |
 | `kernels/conv/include/Config.h.in` | Templates `kTileM`, `kTileIC`, `kMaxKH`, `kMaxKW`, `kMaxInCh`, `kMaxOutCh`, `kMaxLineBufCols`, `kMaxLineBufRows`, `kMaxAccPersistEntries`, `kMaxMperGroup` from CMake-side variables.  **§2.9:** documented `out_w·out_ch ≤ kMaxAccPersistEntries` relaxed constraint.  **§2.10:** added `kMaxMperGroup` constant + doc block.  **§2.11:** renamed `kMaxInW` → `kMaxLineBufCols`; doc block fully rewritten — `in_h`/`in_w`/`out_h` no longer capped, only kernel-window-fits and `out_w·out_ch ≤ kMaxAccPersistEntries` remain.  Added `static_assert((kMaxLineBufCols & …) == 0)`.  **§2.12:** unchanged — `PatchVec` is sized from the existing `kTileIC` constant.  **§2.13:** `partial_outputs` doc bullet notes the URAM binding. |
 | `kernels/conv/CMakeLists.txt` | TODO — currently CMake `CACHE STRING`s; migrate to `kernels.conv` block in `platforms/<name>.json` to match pool (§4.1).  **§2.10:** added `CONV_MAX_M_PER_GROUP` cache var.  **§2.11:** renamed `CONV_MAX_IN_W` → `CONV_MAX_LINE_BUF_COLS`.  **§2.12:** unchanged.  **§2.13:** `CONV_MAX_ACC_PERSIST_ENTRIES` default raised 16384 → 65536; comment notes the value now spends URAM, not BRAM. |
 | `platforms/<name>.json` | TODO — add `kernels.conv` section once the migration lands. |
@@ -979,4 +1036,4 @@ until the next behavior-test sweep.
 | `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds.  **§2.9:** persistent-accumulator constraint relaxed to `out_w·out_ch ≤ kMaxAccPersistEntries`.  **§2.11:** `in_w ≤ kMaxInW` constraint REMOVED — replaced by `(kw-1)·dil_w + 1 ≤ kMaxLineBufCols`.  Scheduler validator should be updated to match. |
 | `kernels/conv/test/TestConvSim.cpp` | 34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
 | `hw/test_data/conv_test_data/` | 30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
-| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row). |
+| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row), §2.14 (unified patch producer — §4 single shared `line_buf`, memory-hierarchy diagram). |

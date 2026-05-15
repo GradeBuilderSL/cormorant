@@ -96,9 +96,9 @@ All three split axes accept duplicate DDR reads at tile/chunk boundaries — the
 The kernel stages data through **four memory layers** — DDR, URAM, BRAM,
 and registers — each a smaller/faster cache of the layer below it.  The
 diagram shows every on-chip cache, the layer it is bound to, its
-capacity, and what it holds.  Post-§2.13 the design uses **25 % of the
-URAM pool** and **35 % of BRAM**, so both layers still have headroom
-for wider tiling.
+capacity, and what it holds.  Post-§2.14 the design uses **48 % LUT,
+32 % BRAM, 25 % URAM** — LUT is the tightest layer; BRAM and URAM both
+keep headroom for wider tiling.
 
 ```mermaid
 flowchart TB
@@ -113,8 +113,8 @@ flowchart TB
         PO["partial_outputs<br/>65536 entries · 256 KB · 16 URAM blocks<br/><i>persistent accumulator — survives every<br/>ic-tile / mt-tile of one oh-chunk</i>"]
     end
 
-    subgraph BRAML["BRAM layer — 288 BRAM18K · 35% used"]
-        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache;<br/>each x pixel fetched once per ow_tile</i>"]
+    subgraph BRAML["BRAM layer — 288 BRAM18K · 32% used"]
+        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile</i>"]
         WC["w_cache<br/>4·8·16·7·7 · ~50 KB · kTileIC banks<br/><i>one ict/ow_tile/M-group weight slab,<br/>reused across the spatial sweep</i>"]
         WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
         BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
@@ -198,22 +198,19 @@ AccData_t partial_outputs[kMaxAccPersistEntries];
 // 65536-entry default).  RAM_2P: Phase 1/3 use one port, Phase 2's
 // read and write are separate II=1 sub-loops, so no port conflict.
 
-// Per-(ni, chunk, ict, ow_tile) line buffer — lives in the standard
-// patch producer.  Both row and column dims are circular:
+// Per-(ni, chunk, ct, ow_tile) line buffer — lives in the unified
+// input_patch_producer (§2.14).  Both row and column dims are circular:
 //     row_slot = ih & (kMaxLineBufRows - 1)
 //     col_slot = iw & (kMaxLineBufCols - 1)
 Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
 #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
-// dim=1 (ic_l) partitioned complete → kTileIC independent banks so
-// Phase 2 can gather a full PatchVec (all kTileIC channel lanes) in
-// one cycle.  Within (chunk, ict, ow_tile) each input pixel in the
+// dim=1 partitioned complete → kTileIC independent banks so Phase 2
+// can gather a full PatchVec (all kTileIC channel lanes) in one cycle.
+// One buffer serves both modes: standard fills all kTileIC banks,
+// depthwise fills only banks [0, kTileM) and the gather masks the
+// rest to 0.  Within (chunk, ct, ow_tile) each input pixel in the
 // tile's iw range is fetched from DDR exactly once; reloaded per
 // ow_tile, with the (kw-1)·dilation_w-col overlap re-fetched.
-
-// Per-(ni, chunk, mt, ow_tile) line buffer — depthwise variant, same
-// shape but indexed by m1; partitioned complete dim=1 → kTileM banks.
-Data_t    line_buf[kTileM][kMaxLineBufRows][kMaxLineBufCols];
-#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 ```
 
 **Channel-packed patch stream (§2.12).**  The patch path
