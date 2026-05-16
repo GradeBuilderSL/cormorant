@@ -239,6 +239,47 @@ static inline void compute_ow_tiling(
 }
 
 // ---------------------------------------------------------------------------
+// Per-invocation tile geometry (§2.19).
+//
+// oh-chunking, M-grouping and ow-tiling each need an integer division by a
+// RUNTIME divisor (out_w·out_ch, mt_per_group, stride_w, …), which HLS
+// synthesises as a multi-cycle sequential divider.  The geometry is
+// invariant for a whole kernel invocation, yet each dataflow stage used to
+// call compute_*() itself — so the same ~5 dividers were instantiated once
+// per stage (16 dividers across the kernel, ≈6.3k FF / 3.8k LUT).
+//
+// ConvKernel now computes the geometry ONCE and passes this struct to every
+// stage, collapsing the divider count to a single shared set.  The struct
+// crosses the DATAFLOW process boundaries as one stable scalar channel.
+// ---------------------------------------------------------------------------
+struct ConvGeometry {
+    unsigned oh_per_chunk;
+    unsigned num_chunks;
+    unsigned mt_per_group;
+    unsigned num_m_groups;
+    unsigned ow_per_tile;
+    unsigned num_ow_tiles;
+};
+
+static inline ConvGeometry compute_conv_geometry(
+    unsigned out_h, unsigned out_w, unsigned out_ch,
+    unsigned kw, unsigned stride_w, unsigned dilation_w
+) {
+    // Runs once per invocation (~129 cycles).  A #pragma HLS DATAFLOW here
+    // to overlap the three independent divider chains was tried and dropped:
+    // the canonical form (struct returned, fields written by 3 processes)
+    // segfaults Vitis HLS 2025.2's scalar-propagation pass, and the
+    // non-canonical form draws "region may not be handled correctly"
+    // warnings — not worth it to shave ~64 one-time cycles (0.02 % of runtime).
+    ConvGeometry g;
+    compute_oh_chunking(out_h, out_w, out_ch, g.oh_per_chunk, g.num_chunks);
+    compute_m_grouping (out_ch, g.mt_per_group, g.num_m_groups);
+    compute_ow_tiling  (out_w, kw, stride_w, dilation_w,
+                        g.ow_per_tile, g.num_ow_tiles);
+    return g;
+}
+
+// ---------------------------------------------------------------------------
 // Standard: II=1 pipelined K-reduction with PN-wide input-channel parallelism.
 //
 // Each PIPELINE iteration fires kTileIC parallel MACs that share (khi_cnt,
@@ -500,7 +541,8 @@ static void input_patch_producer(
     unsigned             dilation_w,
     unsigned             pad_top,
     unsigned             pad_left,
-    unsigned             is_depthwise
+    unsigned             is_depthwise,
+    ConvGeometry         geom
 ) {
     const unsigned in_hw    = in_h * in_w;
 
@@ -510,19 +552,16 @@ static void input_patch_producer(
     const unsigned total_ch = is_depthwise ? out_ch : in_ch;
     const unsigned ct_tiles = (total_ch + ct_width - 1) / ct_width;
 
-    unsigned oh_per_chunk, num_chunks;
-    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+    // Tile geometry computed once by ConvKernel (§2.19).
+    const unsigned oh_per_chunk = geom.oh_per_chunk;
+    const unsigned num_chunks   = geom.num_chunks;
 
-    unsigned mt_per_group, num_m_groups;
-    compute_m_grouping(out_ch, mt_per_group, num_m_groups);
-    (void)mt_per_group;  // Producer only needs the group count (re-emission factor).
     // Depthwise caches its weight slice once per (chunk, mt) — no M-group
     // replay — so it runs a single group.
-    const unsigned num_groups = is_depthwise ? 1u : num_m_groups;
+    const unsigned num_groups   = is_depthwise ? 1u : geom.num_m_groups;
 
-    unsigned ow_per_tile, num_ow_tiles;
-    compute_ow_tiling(out_w, kw, stride_w, dilation_w,
-                      ow_per_tile, num_ow_tiles);
+    const unsigned ow_per_tile  = geom.ow_per_tile;
+    const unsigned num_ow_tiles = geom.num_ow_tiles;
 
     // One kTileIC-wide line buffer for both modes; depthwise uses banks
     // [0, kTileM).  dim=1 partitioned complete → kTileIC independent
@@ -722,20 +761,16 @@ static void stream_load_weights(
     unsigned stride_w,
     unsigned dilation_w,
     unsigned batch,
-    unsigned is_depthwise
+    unsigned is_depthwise,
+    ConvGeometry geom
 )
 {
-    unsigned oh_per_chunk, num_chunks;
-    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
-    (void)oh_per_chunk;  // Weight emission no longer depends on (oh, ow); only chunk count.
-
-    unsigned mt_per_group, num_m_groups;
-    compute_m_grouping(out_ch, mt_per_group, num_m_groups);
-
-    unsigned ow_per_tile, num_ow_tiles;
-    compute_ow_tiling(out_w, kw, stride_w, dilation_w,
-                      ow_per_tile, num_ow_tiles);
-    (void)ow_per_tile;
+    // Tile geometry computed once by ConvKernel (§2.19).  Weight emission
+    // depends only on the chunk / group / tile COUNTS, not the per-* extents.
+    const unsigned num_chunks   = geom.num_chunks;
+    const unsigned mt_per_group = geom.mt_per_group;
+    const unsigned num_m_groups = geom.num_m_groups;
+    const unsigned num_ow_tiles = geom.num_ow_tiles;
 
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
@@ -849,13 +884,15 @@ static void process_conv_kernel_tile(
     unsigned                dilation_w,
     unsigned                pad_top,
     unsigned                pad_left,
-    unsigned                is_depthwise
+    unsigned                is_depthwise,
+    ConvGeometry            geom
 ) {
     const unsigned m_tiles  = (out_ch + kTileM  - 1) / kTileM;
     const unsigned ic_tiles = (in_ch  + kTileIC - 1) / kTileIC;
 
-    unsigned oh_per_chunk, num_chunks;
-    compute_oh_chunking(out_h, out_w, out_ch, oh_per_chunk, num_chunks);
+    // Tile geometry computed once by ConvKernel (§2.19).
+    const unsigned oh_per_chunk = geom.oh_per_chunk;
+    const unsigned num_chunks   = geom.num_chunks;
 
     AccData_t partial_outputs[kMaxAccPersistEntries];
     // Bound to URAM: this is by far the largest on-chip buffer and the
@@ -899,12 +936,10 @@ static void process_conv_kernel_tile(
         // ow_in_tile); within the m_group's mt_in_group loop the same patch
         // is reused with cached weights for each output-channel tile.
         if (!is_depthwise) {
-            unsigned mt_per_group, num_m_groups;
-            compute_m_grouping(out_ch, mt_per_group, num_m_groups);
-
-            unsigned ow_per_tile, num_ow_tiles;
-            compute_ow_tiling(out_w, kw, stride_w, dilation_w,
-                              ow_per_tile, num_ow_tiles);
+            const unsigned mt_per_group = geom.mt_per_group;
+            const unsigned num_m_groups = geom.num_m_groups;
+            const unsigned ow_per_tile  = geom.ow_per_tile;
+            const unsigned num_ow_tiles = geom.num_ow_tiles;
 
             for (unsigned ict = 0; ict < ic_tiles; ict++) {
                 const unsigned ic_off   = ict * kTileIC;
@@ -1017,9 +1052,8 @@ static void process_conv_kernel_tile(
             } // ict
         } else {
             // -------- Phase 2b: depthwise accumulate (mt OUTER, ow_tile) --------
-            unsigned ow_per_tile_dw, num_ow_tiles_dw;
-            compute_ow_tiling(out_w, kw, stride_w, dilation_w,
-                              ow_per_tile_dw, num_ow_tiles_dw);
+            const unsigned ow_per_tile_dw  = geom.ow_per_tile;
+            const unsigned num_ow_tiles_dw = geom.num_ow_tiles;
 
             for (unsigned mt = 0; mt < m_tiles; mt++) {
                 const unsigned m_off   = mt * kTileM;
@@ -1216,6 +1250,12 @@ void ConvKernel(
     const unsigned ic_tiles         = (in_ch  + kTileIC - 1) / kTileIC;
     const unsigned m_tiles          = (out_ch + kTileM  - 1) / kTileM;
 
+    // Tile geometry — computed ONCE here so the runtime-divisor divisions
+    // (oh-chunking / M-grouping / ow-tiling) synthesise a single shared
+    // divider set instead of one per dataflow stage (§2.19).
+    const ConvGeometry geom = compute_conv_geometry(
+        out_h, out_w, out_ch, kw, stride_w, dilation_w);
+
     hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
@@ -1247,18 +1287,19 @@ void ConvKernel(
 
     input_patch_producer(x, patch_stream, batch, in_ch, in_h, in_w,
         out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
-        dilation_w, pad_top, pad_left, is_depthwise
+        dilation_w, pad_top, pad_left, is_depthwise, geom
     );
 
     stream_load_weights(weight, weight_stream,
                         ic_tiles, m_tiles, in_ch, out_ch, out_w, out_h,
-                        kw, kh, stride_w, dilation_w, batch, is_depthwise);
+                        kw, kh, stride_w, dilation_w, batch, is_depthwise,
+                        geom);
 
     process_conv_kernel_tile(
         patch_stream, weight_stream, bias_stream, acc_stream,
         batch, in_ch, in_h, in_w, out_ch, out_h, out_w,
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
-        pad_top, pad_left, is_depthwise);
+        pad_top, pad_left, is_depthwise, geom);
 
     write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch);
 }
