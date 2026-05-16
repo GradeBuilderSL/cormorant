@@ -357,6 +357,14 @@ For the common case (`out_h · out_w · out_ch ≤ kMaxAccPersistEntries`)
 `num_chunks = 1` and the chunk loop adds only a few cycles of wrapper
 overhead.  See `compute_oh_chunking()` in `ConvKernel.cpp`.
 
+> **Tile geometry is computed once (§2.19).**  `compute_oh_chunking`,
+> `compute_m_grouping` and `compute_ow_tiling` each divide by a runtime
+> value, so HLS emits a sequential divider per call.  `ConvKernel`
+> evaluates all three exactly once via `compute_conv_geometry()` and
+> passes the result as a `ConvGeometry` struct to every dataflow stage —
+> the stages no longer call the helpers themselves, so the kernel
+> synthesises one shared divider set instead of one per stage.
+
 ### 5.4 ow-tiling
 
 The line buffer's column capacity `kMaxLineBufCols` (a compile-time
@@ -548,6 +556,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Accumulator stream** | `acc_stream` is `Data_t`-wide; `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
+| **Tile geometry** | oh-chunking / M-grouping / ow-tiling resolved once by `compute_conv_geometry()` and passed to every stage as a `ConvGeometry` struct — one shared divider set, not one per stage (§2.19) |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
 | **AXI-Lite registers** | 21 scalars |
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |

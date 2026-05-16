@@ -15,7 +15,8 @@ final architecture.
 > §2.12 (channel-packed patch stream), §2.13 (URAM accumulator),
 > §2.14 (unified patch producer), §2.15 (broadcast_patches
 > removal), §2.16 (`saturate_cast` moved to the writer), §2.17
-> (16×16 MAC operands), and §2.18 (patch register file) are written
+> (16×16 MAC operands), §2.18 (patch register file), and §2.19
+> (tile-geometry hoist) are written
 > up against measured `conv-verify` snapshots.
 > §2.1–§2.6
 > still have TODO cells — structural outlines reflect the optimisation
@@ -61,10 +62,11 @@ after running the full TestConvRef case list.
 | + `broadcast_patches` removal (§2.15) | 30 | 1,869,385 | +0.0 % | -62.0 % |
 | + `saturate_cast` to writer, narrow `acc_stream` (§2.16) | 30 | 1,869,385 | +0.0 % | -62.0 % |
 | + 16×16 MAC operands (§2.17) | 30 | 1,787,105 | **-4.4 %** | -63.6 % |
-| + patch register file (§2.18, this snapshot) | 30 | 1,783,075 | -0.2 % | **-63.7 %** |
-| **Current state (post-§2.18, captured 2026-05-16)** | **30** | **1,783,075** | — | **-63.7 %** |
+| + patch register file (§2.18) | 30 | 1,783,075 | -0.2 % | -63.7 % |
+| + tile-geometry hoist (§2.19, this snapshot) | 30 | 1,775,995 | -0.4 % | **-63.9 %** |
+| **Current state (post-§2.19, captured 2026-05-16)** | **30** | **1,775,995** | — | **-63.9 %** |
 
-**Net result vs §2.7 snapshot: 2.76× faster across 30 RTL tests; 63.7 %
+**Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
 (needs `conv_optimisation_1` re-run for the pre-§2.1 column).**
 
@@ -805,9 +807,55 @@ FF **51,176 → 32,089** (-37 %) and LUT **50,376 → 44,081** (-12.5 %)
 replaced by LUTRAM;
 DSP 146, BRAM 78, URAM 16 unchanged.
 
+### 2.19. Tile-geometry hoist
+
+**Problem.**  oh-chunking, M-grouping and ow-tiling each need an
+integer division by a **runtime divisor** (`kMaxAccPersistEntries /
+(out_w·out_ch)`, `m_tiles / mt_per_group`, `… / stride_w`, …), and HLS
+synthesises each as a multi-cycle **sequential divider** (`udiv_*_seq`,
+≈394 FF + 238 LUT apiece).  The three `compute_oh_chunking` /
+`compute_m_grouping` / `compute_ow_tiling` helpers were called
+*independently inside* `input_patch_producer`, `stream_load_weights`
+and `process_conv_kernel_tile` — and since each stage is a separate
+DATAFLOW process, the same ~5 dividers were instantiated **once per
+stage**.  Synthesis showed **16 dividers** across the kernel
+(5 + 5 + 6), ≈6.3 k FF and ≈3.8 k LUT spent on division — for a result
+that is *invariant* for the whole invocation.
+
+**Change.**  Compute the geometry **once**.  A new `ConvGeometry`
+struct (`oh_per_chunk`, `num_chunks`, `mt_per_group`, `num_m_groups`,
+`ow_per_tile`, `num_ow_tiles`) is filled by a single
+`compute_conv_geometry()` call in `ConvKernel`, and passed by value to
+each of the three stages — they read `geom.*` instead of calling the
+`compute_*` helpers themselves.  HLS keeps `compute_conv_geometry` as
+one one-shot dataflow process (`compute_conv_geometry_U0`, ~129-cycle
+latency, runs once before the stages spin up).
+
+> A `#pragma HLS DATAFLOW` *inside* `compute_conv_geometry` (to overlap
+> the three independent divider chains) was tried and dropped — the
+> canonical form segfaults Vitis HLS 2025.2's scalar-propagation pass,
+> the non-canonical form draws "region may not be handled correctly"
+> warnings, and the prize is only ~64 one-time cycles.  A code comment
+> records this so it isn't re-attempted.
+
+**Result.** **-7,080 ns (-0.4 %)** — the geometry resolves before the
+stages start rather than inside each; output bit-identical, 30/30 RTL
+PASS.
+
+**Synthesis impact.**  The three stages now synthesise **0 dividers
+each**; the 16 dividers collapse into the single
+`compute_conv_geometry` block (FF 2,812 / LUT 2,972 / DSP 3).  No II
+violations; slack stays **0.00 ns**.  Resources:
+FF **32,089 → 29,810** (-7.1 %);
+LUT **44,081 → 39,105** (-11.3 %) — LUT, the tightest resource, drops
+from 37 % to **33 %**;
+DSP 146 → 155 (+9 — `compute_conv_geometry`'s 3 DSP plus minor
+rebalancing; DSP utilisation 12 %);
+BRAM 78, URAM 16 unchanged.
+
 ---
 
-## 3. Current architecture (post-§2.18)
+## 3. Current architecture (post-§2.19)
 
 ```mermaid
 flowchart LR
@@ -1058,7 +1106,7 @@ TODO: backfill the `Baseline (pre-§2.1)` column from a
 
 ## 6. Where the floor is now
 
-After §2.17 the total across 30 RTL tests is **1.78 ms** — 2.76×
+After §2.19 the total across 30 RTL tests is **1.78 ms** — 2.77×
 faster than at §2.7.  §2.13–§2.15 rebalanced resources at zero
 throughput cost: §2.13 moved `partial_outputs` to URAM (BRAM
 131 → 101, URAM 0 → 16), §2.14 merged the two patch producers (LUT
@@ -1068,11 +1116,13 @@ FF → **62,987**).  Then §2.17/§2.18 closed the long-standing timing
 gap: the worst-slack sub-block had sat at **-0.90 ns** unchanged
 across §2.8 → §2.16 — the MAC pipeline — and §2.17's 16×16 multiply
 fix took it to **0.00 ns**, while §2.18's patch register file removed
-the broadcast read-mux trees (FF 62,987 → **32,089**, LUT
-54,867 → **44,081**).  Current utilisation: **LUT 37 %, BRAM 27 %, FF
-13 %, URAM 25 %, DSP 11 %**.  LUT is still the tightest resource, but
-the §2.13–§2.18 arc roughly halved both the FF and LUT footprint and
-cleared the timing deficit.
+the broadcast read-mux trees (FF 62,987 → 32,089, LUT
+54,867 → 44,081).  Finally §2.19 hoisted the tile-geometry dividers
+out of the per-stage bodies (FF → **29,810**, LUT → **39,105**).
+Current utilisation: **LUT 33 %, BRAM 27 %, FF 12 %, URAM 25 %,
+DSP 12 %**.  LUT is still the tightest resource, but the §2.13–§2.19
+arc more than halved both the FF and LUT footprint and cleared the
+timing deficit.
 
 Distribution of the remaining work (§2.12 timing snapshot; §2.13–§2.16
 left it unchanged, §2.17 cut every test ≈ -4.4 % so the proportions
@@ -1167,7 +1217,7 @@ until the next behavior-test sweep.
 
 | File | What changed |
 |---|---|
-| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop INNER to `ni` in both producers + `stream_load_weights` + consumer; `last_loaded_row` per-chunk init; `partial_outputs` indexed by `oh_local`.  **§2.10:** new `compute_m_grouping()` helper; mg loop in standard producer (patch re-emission), in `stream_load_weights` standard path (once per (ict, mg)), and in consumer Phase 2a; `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with `ARRAY_PARTITION complete dim=3`; `broadcast_factor` reduced to 1.  **§2.11:** new `compute_ow_tiling()` helper; ow_tile loop in both producers + `stream_load_weights` standard path + consumer Phase 2a/2b; `line_buf` reshaped to `[…][kMaxLineBufRows][kMaxLineBufCols]` with circular indexing on BOTH dims; Phase 1 iw clipping.  **§2.12:** new `struct PatchVec { Data_t lane[kTileIC]; }`; `line_buf` in both producers partitioned `ARRAY_PARTITION complete dim=1` so the Phase-2 gather of all `kTileIC` lanes into one `PatchVec` per `(khi,kwi)` is single-cycle; `broadcast_patches` and `process_conv_kernel_tile` retyped to `hls::stream<PatchVec>`; consumer drains one `PatchVec` per `(khi,kwi)` and UNROLL-unpacks the lanes; `input_per_iter = kh·kw` (was `kh·kw·kTileIC`); `patch_pipe`/`patch_stream` depth reduced to `kMaxKH·kMaxKW`.  **§2.13:** `#pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM` on the accumulator declaration in `process_conv_kernel_tile` — one pragma, no loop or index change.  **§2.14:** `input_patch_producer_standard` + `input_patch_producer_depthwise` + the dispatch wrapper collapsed into one `input_patch_producer(…, is_depthwise)`; channel-tile width (`ct_width`), tile count (`ct_tiles`), and group count (`num_groups`) runtime-derived from `is_depthwise`; one shared `line_buf[kTileIC][…][…]` (depthwise uses banks `[0,kTileM)`); −201 lines net.  **§2.15:** deleted the `broadcast_patches` function, the `patch_pipe` stream, and the `broadcast_iters`/`input_per_iter`/`broadcast_factor` plumbing; `input_patch_producer` writes `patch_stream` directly; DATAFLOW region 6 → 5 stages; −63 lines net.  **§2.16:** `acc_stream` retyped `hls::stream<AccData_t>` → `hls::stream<Data_t>`; `saturate_cast<Data_t>` moved from `write_output_tile`'s `y[]` write into `process_conv_kernel_tile`'s Phase-3 drain.  **§2.17:** `accumulate_standard` / `accumulate_depthwise` multiply `Data_t × Data_t` directly instead of widening both operands to `AccData_t` — 16×16 single-DSP MAC instead of a 32×32 DSP cascade.  **§2.18:** both `patch[kTileIC][kMaxKH][kMaxKW]` declarations in `process_conv_kernel_tile` changed from `ARRAY_PARTITION complete dim=0` to `complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` — banked LUTRAM register file. |
+| `kernels/conv/kernel/ConvKernel.cpp` | TODO — list the dataflow split, line_buf, IC-tiling Option-A persistent accumulator, depthwise/standard producer split, broadcast_patches, bias_producer (one bullet per §2.1–§2.6).  **§2.7:** new `stream_load_weights` dataflow producer owning `gmem1`; `process_conv_kernel_tile` reads from `weight_stream` instead of `const Data_t* weight`; deleted `load_standard_weights` / `load_depthwise_weights` helpers.  **§2.8:** `accumulate_standard` PN-wide adder tree over `ic_l` (UNROLL kTileIC); `accumulate_depthwise` PM-wide UNROLL over `m1`; X-prop guard on the weight read for `ic_l ≥ ic_valid`.  **§2.9:** new `compute_oh_chunking()` helper; chunk loop INNER to `ni` in both producers + `stream_load_weights` + consumer; `last_loaded_row` per-chunk init; `partial_outputs` indexed by `oh_local`.  **§2.10:** new `compute_m_grouping()` helper; mg loop in standard producer (patch re-emission), in `stream_load_weights` standard path (once per (ict, mg)), and in consumer Phase 2a; `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` with `ARRAY_PARTITION complete dim=3`; `broadcast_factor` reduced to 1.  **§2.11:** new `compute_ow_tiling()` helper; ow_tile loop in both producers + `stream_load_weights` standard path + consumer Phase 2a/2b; `line_buf` reshaped to `[…][kMaxLineBufRows][kMaxLineBufCols]` with circular indexing on BOTH dims; Phase 1 iw clipping.  **§2.12:** new `struct PatchVec { Data_t lane[kTileIC]; }`; `line_buf` in both producers partitioned `ARRAY_PARTITION complete dim=1` so the Phase-2 gather of all `kTileIC` lanes into one `PatchVec` per `(khi,kwi)` is single-cycle; `broadcast_patches` and `process_conv_kernel_tile` retyped to `hls::stream<PatchVec>`; consumer drains one `PatchVec` per `(khi,kwi)` and UNROLL-unpacks the lanes; `input_per_iter = kh·kw` (was `kh·kw·kTileIC`); `patch_pipe`/`patch_stream` depth reduced to `kMaxKH·kMaxKW`.  **§2.13:** `#pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM` on the accumulator declaration in `process_conv_kernel_tile` — one pragma, no loop or index change.  **§2.14:** `input_patch_producer_standard` + `input_patch_producer_depthwise` + the dispatch wrapper collapsed into one `input_patch_producer(…, is_depthwise)`; channel-tile width (`ct_width`), tile count (`ct_tiles`), and group count (`num_groups`) runtime-derived from `is_depthwise`; one shared `line_buf[kTileIC][…][…]` (depthwise uses banks `[0,kTileM)`); −201 lines net.  **§2.15:** deleted the `broadcast_patches` function, the `patch_pipe` stream, and the `broadcast_iters`/`input_per_iter`/`broadcast_factor` plumbing; `input_patch_producer` writes `patch_stream` directly; DATAFLOW region 6 → 5 stages; −63 lines net.  **§2.16:** `acc_stream` retyped `hls::stream<AccData_t>` → `hls::stream<Data_t>`; `saturate_cast<Data_t>` moved from `write_output_tile`'s `y[]` write into `process_conv_kernel_tile`'s Phase-3 drain.  **§2.17:** `accumulate_standard` / `accumulate_depthwise` multiply `Data_t × Data_t` directly instead of widening both operands to `AccData_t` — 16×16 single-DSP MAC instead of a 32×32 DSP cascade.  **§2.18:** both `patch[kTileIC][kMaxKH][kMaxKW]` declarations in `process_conv_kernel_tile` changed from `ARRAY_PARTITION complete dim=0` to `complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` — banked LUTRAM register file.  **§2.19:** new `struct ConvGeometry` + `compute_conv_geometry()` helper; the per-stage `compute_oh_chunking` / `compute_m_grouping` / `compute_ow_tiling` calls inside `input_patch_producer` / `stream_load_weights` / `process_conv_kernel_tile` deleted — each stage takes a `ConvGeometry geom` arg instead; `ConvKernel` computes the geometry once and passes it to all three stages. |
 | `kernels/conv/include/Config.h.in` | Templates `kTileM`, `kTileIC`, `kMaxKH`, `kMaxKW`, `kMaxInCh`, `kMaxOutCh`, `kMaxLineBufCols`, `kMaxLineBufRows`, `kMaxAccPersistEntries`, `kMaxMperGroup` from CMake-side variables.  **§2.9:** documented `out_w·out_ch ≤ kMaxAccPersistEntries` relaxed constraint.  **§2.10:** added `kMaxMperGroup` constant + doc block.  **§2.11:** renamed `kMaxInW` → `kMaxLineBufCols`; doc block fully rewritten — `in_h`/`in_w`/`out_h` no longer capped, only kernel-window-fits and `out_w·out_ch ≤ kMaxAccPersistEntries` remain.  Added `static_assert((kMaxLineBufCols & …) == 0)`.  **§2.12:** unchanged — `PatchVec` is sized from the existing `kTileIC` constant.  **§2.13:** `partial_outputs` doc bullet notes the URAM binding. |
 | `kernels/conv/CMakeLists.txt` | TODO — currently CMake `CACHE STRING`s; migrate to `kernels.conv` block in `platforms/<name>.json` to match pool (§4.1).  **§2.10:** added `CONV_MAX_M_PER_GROUP` cache var.  **§2.11:** renamed `CONV_MAX_IN_W` → `CONV_MAX_LINE_BUF_COLS`.  **§2.12:** unchanged.  **§2.13:** `CONV_MAX_ACC_PERSIST_ENTRIES` default raised 16384 → 65536; comment notes the value now spends URAM, not BRAM. |
 | `platforms/<name>.json` | TODO — add `kernels.conv` section once the migration lands. |
@@ -1175,4 +1225,4 @@ until the next behavior-test sweep.
 | `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds.  **§2.9:** persistent-accumulator constraint relaxed to `out_w·out_ch ≤ kMaxAccPersistEntries`.  **§2.11:** `in_w ≤ kMaxInW` constraint REMOVED — replaced by `(kw-1)·dil_w + 1 ≤ kMaxLineBufCols`.  Scheduler validator should be updated to match. |
 | `kernels/conv/test/TestConvSim.cpp` | 34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
 | `hw/test_data/conv_test_data/` | 30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
-| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row), §2.14 (unified patch producer — §4 single shared `line_buf`, memory-hierarchy diagram), §2.15 (`broadcast_patches` removal — §4 patch-path text, §5 stage count 6→5, §11 dataflow-stages row), §2.16 (`saturate_cast` at the Phase-3 drain — §5.1 drain pseudo-code, §6 saturation text, §11 accumulator-stream row), §2.17 (16×16 MAC operands — §11 MAC-operand-width row), §2.18 (patch register file — §4 `patch` declaration, §5.6 pragma table, §11 patch-buffer-storage row). |
+| `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row), §2.14 (unified patch producer — §4 single shared `line_buf`, memory-hierarchy diagram), §2.15 (`broadcast_patches` removal — §4 patch-path text, §5 stage count 6→5, §11 dataflow-stages row), §2.16 (`saturate_cast` at the Phase-3 drain — §5.1 drain pseudo-code, §6 saturation text, §11 accumulator-stream row), §2.17 (16×16 MAC operands — §11 MAC-operand-width row), §2.18 (patch register file — §4 `patch` declaration, §5.6 pragma table, §11 patch-buffer-storage row), §2.19 (tile-geometry hoist — §5 dataflow-stage notes on the `ConvGeometry` arg, §11 tile-geometry row). |
