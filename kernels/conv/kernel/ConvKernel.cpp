@@ -1224,9 +1224,33 @@ void ConvKernel(
     #pragma HLS INTERFACE s_axilite port=is_depthwise bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return       bundle=ctrl
 
+    // §2.20: every scalar argument (and the read-only input pointers) is
+    // invariant for the whole kernel invocation, so mark them STABLE.  HLS
+    // then forwards each as a stable signal shared across the DATAFLOW
+    // processes instead of synchronising it through a per-consumer depth-2
+    // FIFO — the pre-§2.20 build spent ~60 scalar channel FIFOs (~5.9k FF /
+    // ~4.1k LUT) purely on argument plumbing (`out_ch` alone was replicated
+    // into 5 FIFOs).  `y` is the WRITE port and is deliberately excluded.
     #pragma HLS STABLE variable=x
     #pragma HLS STABLE variable=weight
     #pragma HLS STABLE variable=bias
+    #pragma HLS STABLE variable=batch
+    #pragma HLS STABLE variable=in_ch
+    #pragma HLS STABLE variable=in_h
+    #pragma HLS STABLE variable=in_w
+    #pragma HLS STABLE variable=out_ch
+    #pragma HLS STABLE variable=out_h
+    #pragma HLS STABLE variable=out_w
+    #pragma HLS STABLE variable=kh
+    #pragma HLS STABLE variable=kw
+    #pragma HLS STABLE variable=stride_h
+    #pragma HLS STABLE variable=stride_w
+    #pragma HLS STABLE variable=dilation_h
+    #pragma HLS STABLE variable=dilation_w
+    #pragma HLS STABLE variable=pad_top
+    #pragma HLS STABLE variable=pad_left
+    #pragma HLS STABLE variable=has_bias
+    #pragma HLS STABLE variable=is_depthwise
 
     static_assert(kTileM <= kTileIC,
                   "depthwise mode reuses patch[kTileIC] for TILE_M lanes: "
