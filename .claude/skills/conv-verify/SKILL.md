@@ -47,8 +47,11 @@ make synthesize_conv_kv260
 - After it succeeds, glance at the synthesis summary for new violations (path is relative to the build directory):
 
   ```bash
-  sed -n '15,80p' kernels/conv/kv260/conv_kv260/solution1/syn/report/csynth.rpt
+  sed -n '15,80p' kernels/conv/kv260/conv_kv260/hls/syn/report/csynth.rpt
   ```
+
+  (The conv build uses the Vitis unified component flow, so reports live
+  under `<component>/hls/syn/report/`, not the legacy `solution1/syn/report/`.)
 
   Report any of these against the prior run:
   - **Top-level slack** drift beyond the baseline `-0.93 ns` on `ConvKernel`. Per-loop sub-blocks have their own slacks (e.g. `VITIS_LOOP_207_11_VITIS_LOOP_213_12` at `-0.93`, `VITIS_LOOP_232_13` at `-0.74`) — call out anything that worsened.
