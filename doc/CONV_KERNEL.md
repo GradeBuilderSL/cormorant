@@ -422,7 +422,7 @@ reduction would be stream-rate-bound on `weight_stream`.
 | `DATAFLOW` | top-level | Five concurrent producers/consumers |
 | `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
-| `STABLE variable={x,weight,bias}` | top-level | Tells HLS the base pointers don't change across DATAFLOW processes |
+| `STABLE variable=…` | top-level — `x`/`weight`/`bias` pointers + every scalar argument (§2.20) | Invariant for the whole invocation, so HLS forwards each as a stable signal instead of a per-consumer channel FIFO (`y`, the write port, is left unmarked) |
 | `ARRAY_PARTITION variable=patch complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` | `patch[kTileIC][kMaxKH][kMaxKW]` | Banked register file: kTileIC LUTRAMs, `(khi,kwi)` is a RAM address (§2.18) |
 | `ARRAY_PARTITION variable=w_cache complete dim=3` | standard `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks on the ic_l axis for the PN unroll |
 | `ARRAY_PARTITION variable=w_buf complete dim=1` | depthwise `w_buf[kTileM][kMaxKH][kMaxKW]` | kTileM banks for the PM unroll |
