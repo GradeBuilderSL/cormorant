@@ -115,23 +115,30 @@ $EDITOR remote_config.json   # set ssh.host and local.driver_dirs
 .venv/bin/python run_remote_tests.py --config remote_config.json
 ```
 
-### 7. Run the end-to-end MNIST demo
+### 7. Run an end-to-end demo
 
-Downloads the MNIST test split + two ONNX models (MNIST convnet and LeNet),
-generates a benchmark project per model, deploys to the KV260, and reports
-top-1 accuracy and per-image latency.
+Three demos under `demo/` take an ONNX model all the way to a running KV260
+inference project. Each follows the same **download → generate → deploy**
+flow behind a one-shot `run_demo.py`:
+
+| Demo | Model | Input | Output |
+|------|-------|-------|--------|
+| [`demo/mnist/`](demo/mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | top-1 accuracy + per-image latency |
+| [`demo/image_classification/`](demo/image_classification/) | MobileNetV1 1.0/224 | static JPG/PNG files | top-5 ImageNet predictions |
+| [`demo/camera/`](demo/camera/) | MobileNetV1 1.0/224 | live RealSense camera | real-time annotated frames streamed back over SSH |
 
 ```bash
-cd demo/mnist
+cd demo/<name>
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-cp mnist_config.json.example mnist_config.json
-$EDITOR mnist_config.json    # set ssh.host, key_file, uio_devices
+cp <name>_config.json.example <name>_config.json
+$EDITOR <name>_config.json    # set ssh.host, key_file, uio_devices
 
 .venv/bin/python run_demo.py
 ```
 
-See **[demo/mnist/README.md](demo/mnist/README.md)** for full details.
+See **[demo/README.md](demo/README.md)** for the demo overview and each
+demo's own `README.md` for full details.
 
 ---
 
@@ -655,7 +662,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 | `inference-scheduler/doc/INFERENCE_SCHEDULER.md` | Full inference scheduler technical reference |
 | `inference-scheduler/doc/REMOTE_TESTING.md` | SSH remote testing and performance benchmarking |
 | `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
-| `demo/mnist/README.md` | End-to-end MNIST inference demo (download → generate → deploy → benchmark) |
+| `demo/README.md` | End-to-end KV260 demos overview (mnist, image_classification, camera) |
 | `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
 | `doc/PROFILER.md` | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
 | `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
