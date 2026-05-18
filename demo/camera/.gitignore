@@ -1,0 +1,10 @@
+# User-local config — copy from camera_config.json.example and edit.
+camera_config.json
+
+# Downloaded assets (ONNX models, ImageNet labels).
+assets/
+
+# Generated inference projects + host-pulled stream frames.
+build/
+
+__pycache__/

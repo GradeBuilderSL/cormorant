@@ -1,0 +1,71 @@
+"""Shared error formatting for the camera demo scripts.
+
+download_assets.py / generate_project.py / deploy_and_run.py and the
+top-level run_demo.py all need the same "missing config" message.  Keeping
+it here avoids four drifting copies.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+DEMO_DIR = Path(__file__).resolve().parents[1]
+EXAMPLE  = DEMO_DIR / "camera_config.json.example"
+
+
+def format_missing_config(path: Path) -> str:
+    """Return a multi-line, copy-pasteable bootstrap message."""
+    lines = [
+        "",
+        "ERROR: camera demo config not found.",
+        "",
+        f"  Expected at: {path}",
+    ]
+    if EXAMPLE.exists():
+        lines += [
+            f"  Example   : {EXAMPLE}",
+            "",
+            "To bootstrap the demo:",
+            "",
+            f"  cp '{EXAMPLE}' '{path}'",
+            f"  $EDITOR '{path}'",
+            "",
+            "Required edits before the first run:",
+            "  • ssh.host         — KV260 hostname or IP (e.g. kv260.local)",
+            "  • ssh.user         — SSH user on the board (typically 'root')",
+            "  • ssh.key_file     — path to your SSH private key, or null + ssh.password",
+            "  • local.driver_dirs.* — HLS-generated driver paths for each kernel.",
+            "                          Build them first from the repo root with:",
+            "                            make synthesize_conv_kv260",
+            "                            make synthesize_pool_kv260",
+            "                            make synthesize_vectorop_kv260",
+            "",
+            "Board-side requirements (installed ON the KV260):",
+            "  • pyrealsense2 + librealsense   — RealSense capture",
+            "  • python3-opencv, numpy         — preprocessing + annotation",
+            "  See the demo README for install guidance.",
+            "",
+            "Optional but commonly tuned:",
+            "  • remote.uio_devices  — DT node labels of your loaded overlay",
+            "  • run.board_python    — Python interpreter on the board",
+            "  • camera.*            — RealSense stream geometry",
+            "",
+            f"See {DEMO_DIR / 'README.md'} for the full description of each field.",
+            "",
+        ]
+    else:
+        lines += [
+            "",
+            "  The example config (camera_config.json.example) is also",
+            "  missing — your checkout looks incomplete.  Restore it from",
+            "  git or re-clone the repository.",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def missing_config_die(path: Path, *, exit_code: int = 2) -> None:
+    """Print the bootstrap message to stderr and exit ``exit_code``."""
+    print(format_missing_config(path), file=sys.stderr)
+    sys.exit(exit_code)
