@@ -34,6 +34,25 @@ inline T saturate_cast(From v) {
 }
 
 // ---------------------------------------------------------------------------
+// C/RTL co-simulation transfer depths — single source of truth.
+//
+// cosim of an m_axi kernel needs a fixed transfer depth per pointer port.
+// These macros feed BOTH sides of the cosim contract:
+//   * the depth=<N> hints on ConvKernel.cpp's m_axi pragmas (size of the
+//     cosim memory model — must be >= the kernel's largest access), and
+//   * the fixed global buffers in test/TestConvSim.cpp's CONV_COSIM path
+//     (must be >= depth, or wrapc reads past the array end and SIGSEGVs).
+// They are cosim-only: depth does NOT constrain the synthesised AXI master
+// (runtime addresses) or the exported IP.  TestConvSim.cpp skips any case
+// whose tensors exceed these bounds under cosim (large convs are left to
+// plain C-sim); bump a port's value here to pull a larger case into cosim.
+// ---------------------------------------------------------------------------
+#define CONV_COSIM_DEPTH_X       8192
+#define CONV_COSIM_DEPTH_WEIGHT  16384
+#define CONV_COSIM_DEPTH_BIAS    256
+#define CONV_COSIM_DEPTH_Y       8192
+
+// ---------------------------------------------------------------------------
 // ConvKernel — 2-D convolution following ONNX Conv semantics.
 //
 // Supports standard convolution (group=1) and depthwise convolution

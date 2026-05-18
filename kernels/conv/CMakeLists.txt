@@ -54,6 +54,18 @@ set(CONV_MAX_KH  7  CACHE STRING
     "Compile-time kernel height limit; Conv nodes with kH > MAX_KH are rejected at scheduling")
 set(CONV_MAX_KW  7  CACHE STRING
     "Compile-time kernel width limit; Conv nodes with kW > MAX_KW are rejected at scheduling")
+set(CONV_MAX_IN_CH  1024 CACHE STRING
+    "Compile-time input-channel limit; bias_buf only — line_buf is tiled to kTileIC channels")
+set(CONV_MAX_OUT_CH 1024 CACHE STRING
+    "Compile-time output-channel limit; sizes bias_buf in bias_producer")
+set(CONV_MAX_LINE_BUF_COLS 64 CACHE STRING
+    "Column capacity of line_buf in the input patch producers (power of 2; used as a bitmask for slot wrapping). This caps ow_per_tile, NOT in_w: larger in_w is handled by ow-tiling, with the (kw-1)*dilation_w-col overlap re-fetched at tile boundaries.")
+set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
+    "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
+set(CONV_MAX_ACC_PERSIST_ENTRIES 65536 CACHE STRING
+    "Compile-time bound on out_w*out_ch (one output row) for the partial-output accumulator that survives across ic-tiles (Option-A tiling). The buffer is bound to URAM in ConvKernel.cpp, so raising this spends URAM blocks (4096 AccData_t entries each) rather than BRAM: 65536 = 16 of the XCK26's 64 URAM blocks. oh-chunking still splits outputs whose out_h*out_w*out_ch exceeds the buffer.")
+set(CONV_MAX_M_PER_GROUP 4 CACHE STRING
+    "Max number of mt-tiles cached together in the (ict, M-group) weight slab. Larger values fit more channels in one group (eliminating weight DDR replay), at the cost of BRAM/LUT for w_cache. When m_tiles exceeds this bound, the kernel processes M in groups of this size.")
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -163,7 +175,10 @@ message(STATUS "ConvKernel: targets — conv_kernel, conv_kernel_float, TestConv
 message(STATUS "ConvKernel: Data_t=${CONV_DATA_TYPE}  "
                "AccData_t=${CONV_ACC_DATA_TYPE}  "
                "TILE_M=${CONV_TILE_M}  TILE_IC=${CONV_TILE_IC}  "
-               "MAX_KH=${CONV_MAX_KH}  MAX_KW=${CONV_MAX_KW}")
+               "MAX_KH=${CONV_MAX_KH}  MAX_KW=${CONV_MAX_KW}  "
+               "MAX_IN_CH=${CONV_MAX_IN_CH}  MAX_OUT_CH=${CONV_MAX_OUT_CH}  "
+               "MAX_ACC_PERSIST_ENTRIES=${CONV_MAX_ACC_PERSIST_ENTRIES}  "
+               "MAX_M_PER_GROUP=${CONV_MAX_M_PER_GROUP}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
@@ -266,6 +281,45 @@ if(CONV_VITIS_HLS)
                 "${_p_build_dir}/Config.h")
 
         message(STATUS "ConvKernel: synthesis target 'synthesize_${_pname}' "
+                       "(${_p_part} @ ${_p_clock} MHz)")
+
+        # -------------------------------------------------------------------
+        # cosim_conv_<name> — C synthesis + RTL co-simulation in ONE run.
+        #
+        # csynth_design and cosim_design are sequenced in a single TCL (see
+        # Cosim.tcl.in), so one vitis-run invocation produces a component
+        # whose run summary covers both — `vitis -a <component>` then shows
+        # the cosim report (measured latency/II + actual hls::stream FIFO
+        # depths from -enable_dataflow_profiling) alongside synthesis.
+        #
+        # Separate component (conv_<name>_cosim) so it never clobbers the
+        # synthesize target's conv_<name> component / exported IP.  cosim
+        # RTL-simulates the whole TestConvSim.cpp test bench, so this target
+        # is slow (minutes) and is intentionally NOT a dependency of anything.
+        # -------------------------------------------------------------------
+        set(CONV_COSIM_COMPONENT "conv_${_pname}_cosim")
+        set(CONV_TB_SYNTHESIS    "${CMAKE_CURRENT_SOURCE_DIR}/test/TestConvSim.cpp")
+
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Cosim.tcl.in"
+            "${_p_build_dir}/cosim_${_pname}.tcl"
+            @ONLY)
+
+        add_custom_target(
+            "cosim_conv_${_pname}"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                    "${_p_build_dir}/${CONV_COSIM_COMPONENT}"
+            COMMAND ${CONV_VITIS_HLS} ${CONV_HLS_TCL_FLAG}
+                    "${_p_build_dir}/cosim_${_pname}.tcl"
+            WORKING_DIRECTORY "${_p_build_dir}"
+            COMMENT "HLS synth + cosim: ConvKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
+            DEPENDS
+                "${CONV_KERNEL_SRC}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include/ConvKernel.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/TestConvSim.cpp"
+                "${_p_build_dir}/Config.h")
+
+        message(STATUS "ConvKernel: cosim target 'cosim_conv_${_pname}' "
                        "(${_p_part} @ ${_p_clock} MHz)")
     endforeach()
 endif()

@@ -115,23 +115,30 @@ $EDITOR remote_config.json   # set ssh.host and local.driver_dirs
 .venv/bin/python run_remote_tests.py --config remote_config.json
 ```
 
-### 7. Run the end-to-end MNIST demo
+### 7. Run an end-to-end demo
 
-Downloads the MNIST test split + two ONNX models (MNIST convnet and LeNet),
-generates a benchmark project per model, deploys to the KV260, and reports
-top-1 accuracy and per-image latency.
+Three demos under `demo/` take an ONNX model all the way to a running KV260
+inference project. Each follows the same **download → generate → deploy**
+flow behind a one-shot `run_demo.py`:
+
+| Demo | Model | Input | Output |
+|------|-------|-------|--------|
+| [`demo/mnist/`](demo/mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | top-1 accuracy + per-image latency |
+| [`demo/image_classification/`](demo/image_classification/) | MobileNetV1 1.0/224 | static JPG/PNG files | top-5 ImageNet predictions |
+| [`demo/camera/`](demo/camera/) | MobileNetV1 1.0/224 | live RealSense camera | real-time annotated frames streamed back over SSH |
 
 ```bash
-cd demo/mnist
+cd demo/<name>
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-cp mnist_config.json.example mnist_config.json
-$EDITOR mnist_config.json    # set ssh.host, key_file, uio_devices
+cp <name>_config.json.example <name>_config.json
+$EDITOR <name>_config.json    # set ssh.host, key_file, uio_devices
 
 .venv/bin/python run_demo.py
 ```
 
-See **[demo/mnist/README.md](demo/mnist/README.md)** for full details.
+See **[demo/README.md](demo/README.md)** for the demo overview and each
+demo's own `README.md` for full details.
 
 ---
 
@@ -523,8 +530,8 @@ correctness configs with an additional `benchmarks` section.
 }
 ```
 
-The default `perf_config.json` ships with **49 benchmark cases** across the
-four kernels (20 VectorOPKernel, 12 MatmulKernel, 9 ConvKernel, 8 PoolingKernel).
+The default `perf_config.json` ships with **53 benchmark cases** across the
+four kernels (20 VectorOPKernel, 12 MatmulKernel, 10 ConvKernel, 11 PoolingKernel).
 
 ```bash
 cd inference-scheduler
@@ -553,15 +560,15 @@ cd inference-scheduler
   ───────────────────────────────────────────────────────────────────────────────────
   Label                    Parameters                        Lat(ms)      GB/s
   ───────────────────────────────────────────────────────────────────────────────────
-  ADD-1K                   ADD    size=1024    outer=1        0.0207     0.297
-  ADD-4K                   ADD    size=4096    outer=1        0.0516     0.476
+  ADD-1K                   ADD    size=1024    outer=1        0.0208     0.296
+  ADD-4K                   ADD    size=4096    outer=1        0.0515     0.477
   ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
   ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
   ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
   ...
-  ADD-bcast-8x16K          ADD    size=16384   outer=8        1.3813     0.569
-  RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3484     0.389
-  MUL-bcast-dw-12544x16    MUL    size=16      outer=12544    5.8274     0.207
+  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
+  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
+  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
   ───────────────────────────────────────────────────────────────────────────────────
                                                  peak GB/s                0.593
                                                min latency     0.0181
@@ -572,37 +579,44 @@ cd inference-scheduler
   Label              Parameters                        Lat(ms)    GOps/s
   ─────────────────────────────────────────────────────────────────────────────
   8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
-  32x32x32           N=32   K=32   M=32   batch=1       0.3039     0.216
-  256x256x256        N=256  K=256  M=256  batch=1     126.2730     0.266
-  dw-12544x16x1      N=12544 K=16   M=1    batch=1     13.3935     0.030
+  16x16x16           N=16   K=16   M=16   batch=1       0.0515     0.159
+  32x32x32           N=32   K=32   M=32   batch=1       0.3021     0.217
+  ...
+  dw-12544x16x3      N=12544 K=16   M=1    batch=3     38.7727     0.031
   ─────────────────────────────────────────────────────────────────────────────
                                          peak GOps/s                0.266
                                          min latency     0.0176
   12/12 OK
 
   ConvKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  3x3-1ch-28x28-32out    1ch 28x28→32ch 3x3k               14.5811     0.031
-  ─────────────────────────────────────────────────────────────────────────────────
-                                             peak GOps/s                0.031
-                                             min latency    14.5811
-  1/1 OK
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Label                      Parameters                        Lat(ms)    GOps/s
+  ─────────────────────────────────────────────────────────────────────────────────────
+  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                5.9634     0.076
+  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k               95.2806     0.076
+  3x3-64ch-56x56             64ch 56x56→64ch 3x3k             127.1612     1.818
+  ...
+  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k              33.7165     0.107
+  ─────────────────────────────────────────────────────────────────────────────────────
+                                                 peak GOps/s                1.903
+                                                 min latency     4.2167
+  10/10 OK
 
   PoolingKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)      GB/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  MaxPool-2x2-56x56      MaxPool 2x2 64ch 56x56            21.6922     0.023
-  MaxPool-2x2-28x28      MaxPool 2x2 64ch 28x28             5.3711     0.023
-  GlobalAvgPool-7x7      AvgPool 7x7 64ch 7x7               0.1908     0.034
-  ─────────────────────────────────────────────────────────────────────────────────
-                                               peak GB/s                0.036
-                                             min latency     0.1908
-  8/8 OK
+  ────────────────────────────────────────────────────────────────────────────────────
+  Label                     Parameters                        Lat(ms)      GB/s
+  ────────────────────────────────────────────────────────────────────────────────────
+  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             3.7900     0.132
+  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             1.0524     0.119
+  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             3.8125     0.132
+  ...
+  ────────────────────────────────────────────────────────────────────────────────────
+                                                  peak GB/s                0.133
+                                                min latency     0.1039
+  11/11 OK
+  ── OVERALL: All 53 cases passed ──
 
-  ── OVERALL: All 41 cases passed ──
+  ── OVERALL: All 53 cases passed ──
 ```
 
 | Metric | Meaning |
@@ -645,15 +659,17 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 
 | Document | Description |
 |----------|-------------|
-| `inference-scheduler/doc/INFERENCE_SCHEDULER.md` | Full inference scheduler technical reference |
-| `inference-scheduler/doc/REMOTE_TESTING.md` | SSH remote testing and performance benchmarking |
-| `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
-| `demo/mnist/README.md` | End-to-end MNIST inference demo (download → generate → deploy → benchmark) |
-| `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
-| `doc/PROFILER.md` | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
-| `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
-| `doc/POOLING_KERNEL.md` | PoolingKernel architecture |
-| `doc/SIMULATION_ISSUES.md` | PS VIP simulation quirks and workarounds |
+| [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](inference-scheduler/doc/INFERENCE_SCHEDULER.md) | Full inference scheduler technical reference |
+| [`inference-scheduler/doc/REMOTE_TESTING.md`](inference-scheduler/doc/REMOTE_TESTING.md) | SSH remote testing and performance benchmarking |
+| [`inference-scheduler/doc/BUFFER_REUSE.md`](inference-scheduler/doc/BUFFER_REUSE.md) | Live-interval buffer reuse optimisation |
+| [`demo/README.md`](demo/README.md) | End-to-end KV260 demos overview (mnist, image_classification, camera) |
+| [`inference-scheduler/doc/ARCHITECTURE.md`](inference-scheduler/doc/ARCHITECTURE.md) | Codegen internals — node classes, layout engine, mixin assembly |
+| [`doc/PROFILER.md`](doc/PROFILER.md) | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
+| [`doc/CONV_KERNEL.md`](doc/CONV_KERNEL.md) | ConvKernel architecture and tiling details |
+| [`doc/POOLING_KERNEL.md`](doc/POOLING_KERNEL.md) | PoolingKernel architecture |
+| [`doc/MATMUL_KERNEL.md`](doc/MATMUL_KERNEL.md) | MatmulKernel architecture and tiling details |
+| [`doc/VECTOROP_KERNEL.md`](doc/VECTOROP_KERNEL.md) | VectorOPKernel architecture (element-wise ops) |
+| [`doc/SIMULATION_ISSUES.md`](doc/SIMULATION_ISSUES.md) | PS VIP simulation quirks and workarounds |
 
 ---
 

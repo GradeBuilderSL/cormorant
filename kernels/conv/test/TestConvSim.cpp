@@ -1,6 +1,11 @@
 // ---------------------------------------------------------------------------
 // TestConvSim.cpp — reference tests for ConvKernel.
 //
+// This single bench serves BOTH verification flows:
+//   * plain C simulation  — the CMake TestConvRef target (host compiler);
+//   * C/RTL co-simulation — the cosim_conv_<platform> target, which compiles
+//     this file with -DCONV_COSIM (set by scripts/Cosim.tcl.in).
+//
 // Each test computes the same convolution with two independent implementations:
 //
 //   ref_conv()          — naive 7-nested-loop ground-truth oracle.
@@ -11,13 +16,23 @@
 // types (both share the same accumulator type and saturation policy), and
 // relative 1e-5 tolerance for float.
 //
+// cosim note: cosim of an m_axi kernel needs every pointer argument backed by
+// a fixed allocation at least as large as the kernel's depth= hint, so under
+// -DCONV_COSIM run_test() copies each case into the CONV_COSIM_DEPTH_*-sized
+// globals below.  Cases whose tensors exceed those bounds are skipped — cosim
+// is full RTL simulation, so large convs are left to plain C-sim.
+//
 // Test matrix (standard conv):
 //   1×1 kernel, 3×3 various pads/strides, 5×5 kernel, large spatial,
 //   partial TILE_IC, partial TILE_M, dilation=2, batch>1, bias,
+//   exact tile multiples, asymmetric stride, asymmetric dilation,
+//   1×1 output, horizontal filter, ResNet-style strided block,
 //   saturation (ap_fixed only).
 //
 // Test matrix (depthwise conv, is_depthwise=1):
-//   3×3 depthwise, 3×3 depthwise+bias, partial TILE_M, dilation=2.
+//   3×3 depthwise, 3×3 depthwise+bias, partial TILE_M, dilation=2,
+//   stride=2, batch>1, exact tile multiple, 5×5 kernel,
+//   asymmetric stride, saturation (ap_fixed only).
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -196,6 +211,23 @@ struct ConvParams {
 };
 
 // ---------------------------------------------------------------------------
+// cosim m_axi buffers (only the cosim build, -DCONV_COSIM).
+//
+// Every pointer handed to ConvKernel must be a fixed allocation >= the
+// kernel's m_axi depth= hint, or cosim's wrapc adapter reads past the buffer
+// and SIGSEGVs.  std::vector sized to the exact tensor is fine for plain
+// C-sim but not for cosim, so run_test() copies each case into these globals.
+// Sizes come from the CONV_COSIM_DEPTH_* macros in ConvKernel.h — the same
+// single source of truth that feeds the depth= hints on ConvKernel.cpp.
+// ---------------------------------------------------------------------------
+#ifdef CONV_COSIM
+static Data_t g_x[CONV_COSIM_DEPTH_X];
+static Data_t g_w[CONV_COSIM_DEPTH_WEIGHT];
+static Data_t g_b[CONV_COSIM_DEPTH_BIAS];
+static Data_t g_y[CONV_COSIM_DEPTH_Y];
+#endif
+
+// ---------------------------------------------------------------------------
 // Dump-mode helpers (only meaningful for fixed-point builds — the HDL
 // testbench reads 16-bit hex values one per line).
 // ---------------------------------------------------------------------------
@@ -326,7 +358,6 @@ static int run_test(const char* name, const ConvParams& p,
 
     const unsigned y_size = p.batch * p.out_ch * out_h * out_w;
     std::vector<Data_t> y_ref(y_size, Data_t(0));
-    std::vector<Data_t> y_got(y_size, Data_t(0));
 
     if (p.is_depthwise) {
         ref_depthwise_conv(x_data.data(), w_data.data(),
@@ -352,9 +383,36 @@ static int run_test(const char* name, const ConvParams& p,
                  p.has_bias ? 1u : 0u);
     }
 
-    ConvKernel(x_data.data(), w_data.data(),
-               b_data.data(),  // always a valid pointer (kernel guards by has_bias)
-               y_got.data(),
+    // -----------------------------------------------------------------------
+    // Pick the buffers handed to ConvKernel.  cosim needs fixed allocations
+    // >= the kernel's m_axi depth (the g_* globals); plain C-sim passes the
+    // per-test std::vector storage directly.  b_ptr is always a valid pointer
+    // (the kernel guards bias reads by has_bias).
+    // -----------------------------------------------------------------------
+#ifdef CONV_COSIM
+    if (x_data.size() > CONV_COSIM_DEPTH_X ||
+        w_data.size() > CONV_COSIM_DEPTH_WEIGHT ||
+        b_data.size() > CONV_COSIM_DEPTH_BIAS ||
+        y_size        > CONV_COSIM_DEPTH_Y) {
+        printf("%-55s SKIP (exceeds cosim buffers)\n", name);
+        return 0;
+    }
+    std::copy(x_data.begin(), x_data.end(), g_x);
+    std::copy(w_data.begin(), w_data.end(), g_w);
+    std::copy(b_data.begin(), b_data.end(), g_b);
+    const Data_t* x_ptr = g_x;
+    const Data_t* w_ptr = g_w;
+    const Data_t* b_ptr = g_b;
+    Data_t*       y_ptr = g_y;
+#else
+    std::vector<Data_t> y_got(y_size, Data_t(0));
+    const Data_t* x_ptr = x_data.data();
+    const Data_t* w_ptr = w_data.data();
+    const Data_t* b_ptr = b_data.data();
+    Data_t*       y_ptr = y_got.data();
+#endif
+
+    ConvKernel(x_ptr, w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
                p.kh, p.kw,
@@ -367,7 +425,7 @@ static int run_test(const char* name, const ConvParams& p,
     int mismatches = 0;
     for (unsigned i = 0; i < y_size; i++) {
         const double r = static_cast<double>(y_ref[i]);
-        const double g = static_cast<double>(y_got[i]);
+        const double g = static_cast<double>(y_ptr[i]);
         if (!vals_close(r, g)) {
             if (mismatches < 5) {
                 printf("  [%u] ref=%.6f got=%.6f\n", i, r, g);
@@ -672,6 +730,167 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 21: 1×1 kernel, exact IC and M tile multiples (no partial tile)
+    // Pure channel projection; exercises the IC reduction with two full tiles.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileIC*2; p.in_h=5; p.in_w=5; p.out_ch=kTileM*2;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.1f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("1x1, IC=TILE_IC*2 M=TILE_M*2 bias (exact tiles)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 22: Asymmetric strides (stride_h=2, stride_w=1) → 2×4 output
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=1; p.in_h=6; p.in_w=6; p.out_ch=2;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
+        total_failures += run_test("3x3, asymmetric stride h=2 w=1 → 2x4 out", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 23: Asymmetric dilation (dilation_h=1, dilation_w=2) → 5×5 output
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=1; p.in_h=7; p.in_w=9; p.out_ch=1;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=2;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
+        total_failures += run_test("3x3, asymmetric dilation h=1 w=2 → 5x5 out", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 24: Single-pixel output (3×3 input, 3×3 kernel, no padding)
+    // Exercises the oh/ow loops iterating exactly once.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileIC; p.in_h=3; p.in_w=3; p.out_ch=kTileM;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("3x3 input 3x3 kernel → 1x1 out, C=TILE_IC M=TILE_M", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 25: 1×5 horizontal filter, same-width padding (pad_left=pad_right=2)
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=1; p.in_h=5; p.in_w=8; p.out_ch=2;
+        p.kh=1; p.kw=5; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=2; p.pad_bottom=0; p.pad_right=2;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
+        total_failures += run_test("1x5 horizontal filter, pad_left=pad_right=2", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 26: batch=3, C=TILE_IC, M=TILE_M, stride=2, pad=1, bias
+    // Models a ResNet-style strided block; verifies batch iteration across tiles.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=3; p.in_ch=kTileIC; p.in_h=7; p.in_w=7; p.out_ch=kTileM;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("batch=3, C=TILE_IC M=TILE_M stride=2 (ResNet-style)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 27: oh-chunking standard.  out_h*out_w*out_ch = 32*32*32 = 32768
+    // exceeds kMaxAccPersistEntries (16384); out_w*out_ch = 1024 fits, so
+    // the kernel splits oh into 2 chunks (16 rows each).  This exercises the
+    // line-buffer reload at chunk boundaries and oh_local indexing in the
+    // consumer.  Small values keep ap_fixed<32,16> well clear of saturation.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=32; p.in_w=32; p.out_ch=32;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("oh-chunking standard (out=32x32x32, 2 chunks)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28: M-grouping standard.  out_ch=64 → m_tiles=8.  With default
+    // kMaxMperGroup=4 this triggers num_m_groups=2: weights for tiles
+    // 0..3 are cached together, processed across the entire (oh, ow)
+    // sweep, then the cache is refilled for tiles 4..7.  out_h*out_w*out_ch
+    // = 16*16*64 = 16384 = kMaxAccPersistEntries, so num_chunks=1 (this
+    // test isolates the M-grouping behaviour from chunking).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=16; p.in_w=16; p.out_ch=64;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("M-grouping standard (out_ch=64, 2 M-groups)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29: wide-input ow-tiling.  in_w=128 > kMaxLineBufCols (64), so
+    // the producers split the output column axis into multiple ow_tiles
+    // (3 at default kw=3, stride=1: ow_per_tile = 64 - 3 + 1 = 62; 128/62
+    // = 3 tiles).  out_h*out_w*out_ch = 8*128*8 = 8192 fits one chunk.
+    // This validates the line_buf circular column indexing and per-tile
+    // (kw-1)*dilation_w-col DDR overlap re-fetch.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=8; p.in_w=128; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("wide input ow-tiling (in_w=128, 3 ow-tiles)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Depthwise tests (is_depthwise=1).
     // Weight layout: [ch][1][kh][kw]  (no in_ch dimension in weight)
     // -----------------------------------------------------------------------
@@ -756,6 +975,89 @@ int main(int argc, char** argv)
         total_failures += run_test("DW stride=2, 8ch, pad=1", p, x, w, b);
     }
 
+    // -----------------------------------------------------------------------
+    // Test 27 (DW): batch=2, 3×3 depthwise, same padding, no bias
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=2; p.in_ch=4; p.in_h=6; p.in_w=6; p.out_ch=4;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW batch=2, 4ch, pad=1", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28 (DW): ch=TILE_M*2 — exact tile multiple, no partial last tile
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileM*2; p.in_h=6; p.in_w=6; p.out_ch=kTileM*2;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW ch=TILE_M*2 (exact tile), bias", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29 (DW): 5×5 depthwise kernel, 4 channels, no padding
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=4; p.in_h=9; p.in_w=9; p.out_ch=4;
+        p.kh=5; p.kw=5; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.25f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.25f, rng);
+        total_failures += run_test("DW 5x5 kernel, 4ch → 5x5 out", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 30 (DW): Asymmetric stride (stride_h=2, stride_w=1), 8 channels
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=8; p.in_w=8; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW asymmetric stride h=2 w=1, 8ch → 4x8 out", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31 (DW): oh-chunking depthwise.  32 channels, 32x32 output.
+    // out_h*out_w*out_ch = 32768 > kMaxAccPersistEntries; out_w*out_ch = 1024
+    // fits → 2 chunks of 16 rows each.  Exercises chunk-aware weight reload
+    // in the depthwise consumer (w_buf re-streamed per (chunk, mt)).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=32; p.in_h=32; p.in_w=32; p.out_ch=32;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.3f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.3f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("DW oh-chunking (32ch, 32x32 out, 2 chunks)", p, x, w, b);
+    }
+
 #ifdef CONV_HAVE_APFIXED
     // -----------------------------------------------------------------------
     // Test 19: Saturation — positive overflow
@@ -793,6 +1095,24 @@ int main(int argc, char** argv)
         std::vector<Data_t> w(n_w, Data_t(-1));
         std::vector<Data_t> b(p.out_ch, Data_t(kSatMin));
         total_failures += run_test("saturation: negative overflow → AP_MIN", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 31: Depthwise saturation — positive overflow
+    // weight=+1, input=kSatMax, bias=kSatMax → output must clamp at kSatMax.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=1; p.in_h=3; p.in_w=3; p.out_ch=1;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=true;
+        const unsigned n_x = p.batch*p.in_ch*p.in_h*p.in_w;
+        std::vector<Data_t> x(n_x, Data_t(kSatMax));
+        std::vector<Data_t> w(p.out_ch*1*p.kh*p.kw, Data_t(1));
+        std::vector<Data_t> b(p.out_ch, Data_t(kSatMax));
+        total_failures += run_test("DW saturation: positive overflow → AP_MAX", p, x, w, b);
     }
 #endif
 

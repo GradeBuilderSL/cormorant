@@ -64,10 +64,12 @@ static: the I/O names and active-kernel set differ per model.
   ```bash
   # from the repo root
   mkdir -p build && cd build
-  cmake -DAXI_BUS_WIDTH=128 ..
+  cmake -DAXI_BUS_WIDTH=32 ..
   make synthesize_kv260
   ```
 
+  `AXI_BUS_WIDTH` must match the AXI master width of the cormorant overlay
+  loaded on the board; the sample numbers below were measured at 32-bit.
   The default `mnist_config.json.example` assumes the standard build paths;
   override `local.driver_dirs` if you keep the build elsewhere.
 
@@ -118,9 +120,9 @@ Sample output:
 ```
   ── MNIST KV260 BENCHMARK ──
 
-  Model           Status         Acc  mean(ms)   p50(ms)   p99(ms)        IPS
-  ─────────────────────────────────────────────────────────────────────────────
-  mnist_convnet   OK          98.92%    21.287    21.286    21.309       47.0
+  Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
+  ───────────────────────────────────────────────────────────────────────────
+  mnist_convnet  OK       98.92%      4.546      4.546      4.553      219.9
 ```
 
 The full per-image numbers are also written to `build/results.json`.

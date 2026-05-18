@@ -215,20 +215,25 @@ endif()
 #   matmul      | matmul_op  | matmul_kv260   | matmul_test_data
 #   vectorop    | vector_op  | vadd_kv260     | vecop_test_data       (note: vadd legacy)
 #
-# IP repo path resolution: Vitis HLS exports the IP catalogue under
-# <build>/kernels/<k>/kv260/<hls_project>/solution1/impl/ip/ (the directory
-# containing component.xml).  Vivado's set_property ip_repo_paths needs that
-# exact directory; passing the parent <hls_project>/ or kv260/ does NOT work.
+# IP repo path resolution: Vitis HLS exports the IP catalogue into a
+# directory containing component.xml.  Vivado's set_property ip_repo_paths
+# needs that exact directory; passing a parent does NOT work.  The path
+# depends on the HLS flow: the legacy open_project/open_solution flow puts
+# it under <hls_project>/solution1/impl/ip/, while the Vitis unified
+# component flow (used by conv since the open_component switch) puts it
+# under <hls_project>/hls/impl/ip/.  The per-kernel IP subpath is therefore
+# the 5th column of _BEHAVIOR_TESTS below.
 # ---------------------------------------------------------------------------
 set(_TS_REPO "${CMAKE_SOURCE_DIR}/hw/cormorant_test_stand")
 if(EXISTS "${_TS_REPO}/Makefile")
 
-    # Map columns: axi_kernels-side | test-stand registry | hls_project | fixture-dir name
+    # Columns: axi_kernels name | test-stand registry | hls_project |
+    #          fixture-dir name | IP-repo subpath (flow-dependent, see above)
     set(_BEHAVIOR_TESTS
-        "conv|conv|conv_kv260|conv_test_data"
-        "pool|pooling|pool_kv260|pool_test_data"
-        "matmul|matmul_op|matmul_kv260|matmul_test_data"
-        "vectorop|vector_op|vadd_kv260|vecop_test_data"
+        "conv|conv|conv_kv260|conv_test_data|hls/impl/ip"
+        "pool|pooling|pool_kv260|pool_test_data|solution1/impl/ip"
+        "matmul|matmul_op|matmul_kv260|matmul_test_data|solution1/impl/ip"
+        "vectorop|vector_op|vadd_kv260|vecop_test_data|solution1/impl/ip"
     )
 
     set(_BEHAVIOR_TEST_AGG_DEPS "")
@@ -239,9 +244,10 @@ if(EXISTS "${_TS_REPO}/Makefile")
         list(GET _BT_LIST 1 _bt_tsname)    # test-stand registry name (for tb-<name>)
         list(GET _BT_LIST 2 _bt_hlsproj)   # HLS project dir name produced by Vitis
         list(GET _BT_LIST 3 _bt_dataname)  # subdirectory under hw/test_data/
+        list(GET _BT_LIST 4 _bt_ipsub)     # IP-repo subpath under <hls_project> (flow-dependent)
 
         set(_bt_datadir "${CMAKE_SOURCE_DIR}/hw/test_data/${_bt_dataname}")
-        set(_bt_iprepo  "${CMAKE_BINARY_DIR}/kernels/${_bt_kernel}/kv260/${_bt_hlsproj}/solution1/impl/ip")
+        set(_bt_iprepo  "${CMAKE_BINARY_DIR}/kernels/${_bt_kernel}/kv260/${_bt_hlsproj}/${_bt_ipsub}")
 
         # Pin the scoreboard JSON report to a known path in the build tree.
         # check_test_report.py turns summary.all_passed into the target's
