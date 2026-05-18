@@ -30,10 +30,11 @@ after running the full TestPoolingSim case list.
 | + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
 | + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
 | + kOwParallel=2 reduce (process 2 adjacent ow's per cycle) | 31 | 1,679,945 | -24.1% | -76.1% |
-| **+ kOwParallel=4 reduce + cyclic line_buf banking** | **31** | **1,513,475** | **-9.9%** | **-78.4%** |
+| + kOwParallel=4 reduce + cyclic line_buf banking | 31 | 1,513,475 | -9.9% | -78.4% |
+| **+ Shared tile geometry (one divider set, was per-stage)** | **31** | **1,485,975** | **-1.8%** | **-78.8%** |
 
-**Net result on the 31-test suite: ~4.64× faster than the post-baseline
-(line-buffer-only) implementation; ~78% reduction in total HW sim time.**
+**Net result on the 31-test suite: ~4.73× faster than the post-baseline
+(line-buffer-only) implementation; ~79% reduction in total HW sim time.**
 
 For the 25 tests common to every stage the same kernel runs **~7.8× faster**
 than the pre-optimization baseline (line-buffer-only equivalent on the same
@@ -591,9 +592,66 @@ discarded by the writer.  The pipeline runs through the padded cells
 anyway, so global pool's per-test cost grows by ~3 × kTileC cycles for
 the wider drain.  Negligible vs the wide-W wins.
 
+### 2.11. Shared tile geometry — collapse the per-stage dividers
+
+**Problem.** Every dataflow stage independently recomputed the W-tile count
+
+```cpp
+ow_tiles_w = (out_w + ow_tile - 1) / ow_tile;
+```
+
+`ow_tile` is a runtime value (it depends on `stride_w` / `pool_w` / `dil_w`
+via `compute_ow_tile`), so `÷ ow_tile` is a division by a **runtime
+divisor** — HLS synthesises it as a multi-cycle sequential divider.  All
+four stages — `row_loader`, `window_emitter`, `process_pool_kernel_tile`,
+`write_output_tile` — carried their own copy, so the same divider was
+instantiated **four times**.  (`c_tiles = (channels + kTileC - 1) / kTileC`
+was also recomputed per stage, but `÷ kTileC` is a compile-time
+power-of-two shift, not a divider.)  The geometry is invariant for a whole
+kernel invocation — there is no reason to compute it more than once.
+
+`compute_ow_tile` itself (`÷ stride_w`) was already called once in the top
+function and passed down as the `ow_tile` scalar, so that divider was
+already singular; only `ow_tiles_w` was replicated.
+
+**Change.** Lift the geometry into a struct computed once.  A new
+`PoolGeometry { c_tiles, ow_tile, ow_tiles_w }` is filled by
+`compute_pool_geometry()` at the top of `PoolingKernel` and passed by value
+to all four stages, replacing the previous `ow_tile` scalar parameter.
+Each stage reads `geom.c_tiles` / `geom.ow_tile` / `geom.ow_tiles_w`
+instead of recomputing them.  The struct crosses the DATAFLOW process
+boundaries as one stable scalar channel.
+
+This mirrors `ConvKernel`'s `ConvGeometry` / `compute_conv_geometry` (the
+conv optimisation log's §2.19) — the same "compute the geometry once, pass
+the struct to every stage" pattern.
+
+**Synthesis.** The csynth report gains one new module —
+`compute_pool_geometry`, a 72-cycle one-time block (3 DSP / 1,178 FF /
+1,479 LUT) — that holds the single shared divider set in place of the four
+stage-local copies.  No new timing-violation rows, no II regressions on any
+previously-II=1 loop, and the `m_axi_gmem0/1` data widths are unchanged
+(`16 → 16`).
+
+**Numerical correctness.** Purely structural — the geometry values are
+bit-identical, just computed once instead of four times.  C-sim 33/33 PASS,
+behavior test 31/31 PASS, zero y.hex fixture changes.
+
+**Result.** **-1.8% sim_time_ns** (1,513,475 → 1,485,975 ns total).  This is
+a modest move, and deliberately so: the dividers were **one-time,
+per-invocation** costs (~72 cycles), not per-output, so collapsing four
+into one removes setup latency and divider hardware but never touches the
+steady-state reduce loop that dominates every test's wall-clock.  The small
+uniform improvement is consistent with HLS retiming the dataflow region
+slightly more freely once the redundant divider logic is gone — the same
+mechanism §2.7 / §2.8 documented for FP units, at a far smaller magnitude
+because dividers are not in the hot loop.  The change is best understood as
+a **resource consolidation** (one divider set instead of four) that happens
+to also shave a little wall-clock, rather than a throughput optimisation.
+
 ---
 
-## 3. Current architecture (post-2.10)
+## 3. Current architecture (post-2.11)
 
 ```mermaid
 flowchart LR
@@ -642,6 +700,13 @@ flowchart LR
 Each ow_group covers kOwParallel adjacent ow positions; the W-tile
 dimension `owt` is collapsed to a single iteration when
 `in_w ≤ kMaxLineBufCols`.
+
+**Per-invocation tile geometry.** `compute_pool_geometry()` runs once at the
+top of `PoolingKernel` and fills a `PoolGeometry { c_tiles, ow_tile,
+ow_tiles_w }` struct passed by value to all four stages (§2.11).  The two
+runtime-divisor divisions — `÷ stride_w` inside `compute_ow_tile` and
+`÷ ow_tile` for `ow_tiles_w` — are therefore each synthesised once, in a
+shared `compute_pool_geometry` block, instead of being replicated per stage.
 
 **Cycle counts per output position** at the consumer's reduce loop
 (post-§2.10 — kOwParallel = 4 reduce, §2.8 FP-unit removal):
@@ -1010,7 +1075,7 @@ kOwParallel (Global pool variants and `MaxPool 1x1 pool_full 5x5`,
 
 | File | What changed |
 |---|---|
-| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9); `cyclic factor=kOwParallel dim=3` partition on line_buf to support kOwParallel ≥ 4 reads/cycle (§2.10) |
+| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9); `cyclic factor=kOwParallel dim=3` partition on line_buf to support kOwParallel ≥ 4 reads/cycle (§2.10); `PoolGeometry` struct + `compute_pool_geometry()` — per-invocation tile geometry (`c_tiles` / `ow_tile` / `ow_tiles_w`) computed once and passed to all four stages, collapsing the per-stage `ow_tiles_w` divider (§2.11) |
 | `kernels/pool/include/Config.h.in` | Templates `kTileC`, `kMaxPoolH`, `kMaxPoolW`, `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` from CMake-side variables (sourced from the platform JSON, §4) |
 | `kernels/pool/CMakeLists.txt` | `pool_load_constants(platform_json prefix)` reads `kernels.pool.*` from `platforms/<AXI_PLATFORM>.json` via `string(JSON …)`; default-platform values drive C-sim Config.h, per-platform values drive per-platform synthesis Config.h's; `CMAKE_CONFIGURE_DEPENDS` on every platform JSON so edits auto-trigger reconfigure on next `make` |
 | `platforms/<name>.json` | Single source of truth for kernel-side bounds — `kernels.pool` object holds all six values (§4.1).  The C++ build and the Python validator both read from here. |
