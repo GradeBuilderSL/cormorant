@@ -59,10 +59,12 @@ demo/image_classification/
   ```bash
   # from the repo root
   mkdir -p build && cd build
-  cmake -DAXI_BUS_WIDTH=128 ..
+  cmake -DAXI_BUS_WIDTH=32 ..
   make synthesize_kv260
   ```
 
+  `AXI_BUS_WIDTH` must match the AXI master width of the cormorant overlay
+  loaded on the board; the sample numbers below were measured at 32-bit.
   Override `local.driver_dirs` if you keep the build tree elsewhere.
 
 ### KV260 board
