@@ -659,15 +659,17 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 
 | Document | Description |
 |----------|-------------|
-| `inference-scheduler/doc/INFERENCE_SCHEDULER.md` | Full inference scheduler technical reference |
-| `inference-scheduler/doc/REMOTE_TESTING.md` | SSH remote testing and performance benchmarking |
-| `inference-scheduler/doc/BUFFER_REUSE.md` | Live-interval buffer reuse optimisation |
-| `demo/README.md` | End-to-end KV260 demos overview (mnist, image_classification, camera) |
-| `doc/ARCHITECTURE.md` | Codegen internals — node classes, layout engine, mixin assembly |
-| `doc/PROFILER.md` | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
-| `doc/CONV_KERNEL.md` | ConvKernel architecture and tiling details |
-| `doc/POOLING_KERNEL.md` | PoolingKernel architecture |
-| `doc/SIMULATION_ISSUES.md` | PS VIP simulation quirks and workarounds |
+| [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](inference-scheduler/doc/INFERENCE_SCHEDULER.md) | Full inference scheduler technical reference |
+| [`inference-scheduler/doc/REMOTE_TESTING.md`](inference-scheduler/doc/REMOTE_TESTING.md) | SSH remote testing and performance benchmarking |
+| [`inference-scheduler/doc/BUFFER_REUSE.md`](inference-scheduler/doc/BUFFER_REUSE.md) | Live-interval buffer reuse optimisation |
+| [`demo/README.md`](demo/README.md) | End-to-end KV260 demos overview (mnist, image_classification, camera) |
+| [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) | Codegen internals — node classes, layout engine, mixin assembly |
+| [`doc/PROFILER.md`](doc/PROFILER.md) | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
+| [`doc/CONV_KERNEL.md`](doc/CONV_KERNEL.md) | ConvKernel architecture and tiling details |
+| [`doc/POOLING_KERNEL.md`](doc/POOLING_KERNEL.md) | PoolingKernel architecture |
+| [`doc/MATMUL_KERNEL.md`](doc/MATMUL_KERNEL.md) | MatmulKernel architecture and tiling details |
+| [`doc/VECTOROP_KERNEL.md`](doc/VECTOROP_KERNEL.md) | VectorOPKernel architecture (element-wise ops) |
+| [`doc/SIMULATION_ISSUES.md`](doc/SIMULATION_ISSUES.md) | PS VIP simulation quirks and workarounds |
 
 ---
 
