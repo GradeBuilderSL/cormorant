@@ -118,9 +118,9 @@ Sample output:
 ```
   ── MNIST KV260 BENCHMARK ──
 
-  Model           Status         Acc  mean(ms)   p50(ms)   p99(ms)        IPS
-  ─────────────────────────────────────────────────────────────────────────────
-  mnist_convnet   OK          98.92%    21.287    21.286    21.309       47.0
+  Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
+  ───────────────────────────────────────────────────────────────────────────
+  mnist_convnet  OK       98.92%      4.546      4.546      4.553      219.9
 ```
 
 The full per-image numbers are also written to `build/results.json`.
