@@ -30,11 +30,25 @@ after running the full TestPoolingSim case list.
 | + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
 | + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
 | + kOwParallel=2 reduce (process 2 adjacent ow's per cycle) | 31 | 1,679,945 | -24.1% | -76.1% |
-| + kOwParallel=4 reduce + cyclic line_buf banking | 31 | 1,513,475 | -9.9% | -78.4% |
-| **+ Shared tile geometry (one divider set, was per-stage)** | **31** | **1,485,975** | **-1.8%** | **-78.8%** |
+| + Cyclic line_buf banking + shared tile geometry | 31 | 1,485,975 † | — | — |
 
-**Net result on the 31-test suite: ~4.73× faster than the post-baseline
-(line-buffer-only) implementation; ~79% reduction in total HW sim time.**
+> **kOwParallel — shipped value is 2.** §2.10 *evaluated* `kOwParallel = 4`
+> and measured 1,513,475 ns (−9.9 % from §2.9), but that value was reverted;
+> `platforms/kv260.json` ships `ow_parallel: 2`. The cyclic line_buf banking
+> *code* (§2.10) and the shared tile geometry (§2.11) both ship at
+> `kOwParallel = 2`. The `kOwParallel = 4` figure is kept in §2.10 for the
+> record but is not part of the shipped progression.
+>
+> **† Clock-basis change.** The last row was measured at a **150 MHz** target
+> clock; every row above it at **300 MHz**. `sim_time_ns` scales with the
+> clock period, so 1,485,975 ns is **not comparable** to the rows above — no
+> cross-step delta is given. The §2.11 change is verified functionally
+> (C-sim 33/33, behavior test 31/31); see §2.11.
+
+**Net result through §2.9 — the last 300 MHz measurement — ~4.18× faster
+than the post-baseline (line-buffer-only) implementation; ~76% reduction in
+total HW sim time.** §2.10's kOwParallel=4 gain was reverted; §2.11 lands on
+top but at 150 MHz (see the † note), so it is not folded into this ratio.
 
 For the 25 tests common to every stage the same kernel runs **~7.8× faster**
 than the pre-optimization baseline (line-buffer-only equivalent on the same
@@ -493,7 +507,17 @@ sweep; the consumer reduce was already overlapped with the next channel
 tile's Phase 1, so halving consumer cycles doesn't reduce the wall-clock
 critical path.  Same diagnosis as §2.6's "Multi-channel-tile" row.
 
-### 2.10. kOwParallel = 4 — bump the unroll factor with cyclic line_buf banking
+### 2.10. Cyclic line_buf banking — and the reverted kOwParallel = 4 evaluation
+
+> **Status — evaluated, partially reverted.** The cyclic line_buf banking
+> *code* described below shipped: `line_buf` is parametrised on `kOwParallel`
+> and partitioned `cyclic factor=kOwParallel dim=3`. The `kOwParallel = 4`
+> *value*, however, was reverted — `platforms/kv260.json` ships
+> `ow_parallel: 2`, and the `factor=kOwParallel` pragma is harmless at
+> factor 2. The −9.9 % / 1,513,475 ns figures below are the `kOwParallel = 4`
+> evaluation, retained as a record of what that configuration achieves; they
+> are **not** the shipped numbers. Raising `ow_parallel` back to 4 is a
+> one-line JSON change, subject to re-verification.
 
 **Problem.** §2.9 established kOwParallel=2 with `BIND_STORAGE ram_t2p`
 on `line_buf`'s per-channel banks (2 ports/cycle/channel — exactly
@@ -637,17 +661,19 @@ previously-II=1 loop, and the `m_axi_gmem0/1` data widths are unchanged
 bit-identical, just computed once instead of four times.  C-sim 33/33 PASS,
 behavior test 31/31 PASS, zero y.hex fixture changes.
 
-**Result.** **-1.8% sim_time_ns** (1,513,475 → 1,485,975 ns total).  This is
-a modest move, and deliberately so: the dividers were **one-time,
-per-invocation** costs (~72 cycles), not per-output, so collapsing four
-into one removes setup latency and divider hardware but never touches the
-steady-state reduce loop that dominates every test's wall-clock.  The small
-uniform improvement is consistent with HLS retiming the dataflow region
-slightly more freely once the redundant divider logic is gone — the same
-mechanism §2.7 / §2.8 documented for FP units, at a far smaller magnitude
-because dividers are not in the hot loop.  The change is best understood as
-a **resource consolidation** (one divider set instead of four) that happens
-to also shave a little wall-clock, rather than a throughput optimisation.
+**Result.** The shipped kernel (kOwParallel = 2) measures **1,485,975 ns**
+total on the 31-test behavior suite — but this run used a **150 MHz** target
+clock, whereas the §1 progression above was measured at 300 MHz. `sim_time_ns`
+scales with the clock period, so the figure is not directly comparable and no
+cross-step delta is claimed. Functionally the change is verified (C-sim
+33/33, behavior test 31/31, zero fixture diffs). The geometry struct's
+wall-clock contribution is in any case expected to be small: the dividers
+were **one-time, per-invocation** costs (~72 cycles), not per-output, so
+collapsing four into one removes setup latency and divider hardware but never
+touches the steady-state reduce loop that dominates every test's wall-clock.
+It is best understood as a **resource consolidation** (one divider set
+instead of four) — the same class of change §2.7 / §2.8 made for FP units,
+but far smaller because dividers are not in the hot loop.
 
 ---
 
@@ -709,9 +735,9 @@ runtime-divisor divisions — `÷ stride_w` inside `compute_ow_tile` and
 shared `compute_pool_geometry` block, instead of being replicated per stage.
 
 **Cycle counts per output position** at the consumer's reduce loop
-(post-§2.10 — kOwParallel = 4 reduce, §2.8 FP-unit removal):
+(post-§2.11 — shipped kOwParallel = 2 reduce, §2.8 FP-unit removal):
 
-| Pool type | II | Cycles per **kOwParallel = 4** outputs |
+| Pool type | II | Cycles per **kOwParallel = 2** outputs |
 |---|---:|---:|
 | MaxPool | 1 | `pool_h × pool_w` |
 | AveragePool | 1 (post-§2.8 — was 2–3 with FP div+mul) | `pool_h × pool_w` |
@@ -719,9 +745,9 @@ shared `compute_pool_geometry` block, instead of being replicated per stage.
 | LpPool p=2 | 1–2 (poly_sqrt finalize once per output) | `pool_h × pool_w` |
 
 Per-position cost is therefore `pool_h × pool_w / kOwParallel` cycles —
-e.g. 2.25 cycles on a 3×3 pool at kOwParallel=4 (was 4.5 at kOwParallel=2).
-The wide-W cases approach the theoretical max (−27 to −31% wall-clock vs
-§2.9, on top of the §2.9 baseline that was already −44 to −45% vs §2.8).
+e.g. 4.5 cycles on a 3×3 pool at the shipped `kOwParallel = 2`. (§2.10
+evaluated `kOwParallel = 4`, which would halve this to 2.25 cycles, but that
+value was reverted — see §2.10.)
 
 The producer is matched at `pool_h × pool_w` cycles per ow-group for
 `emit_phase 2`, with Phase 1 row loads overlapped via the dataflow split.
@@ -730,10 +756,11 @@ dim=3 factor=kOwParallel` (per column-bank) and `BIND_STORAGE ram_t2p`,
 so kOwParallel reads/cycle/channel are delivered for every stride_w
 with `gcd(stride_w, kOwParallel) ≤ 2` — see §2.10's banking table.
 
-**Writer drain has crossed the consumer reduce on narrow tests.** At
-kOwParallel = 4 the writer emits `kOwParallel × c_valid` AccData_t per
-ow-group (= 16 cycles for the typical c_valid = 4), which exceeds the
-9-cycle 3×3 reduce.  Narrow 3×3 tests are now writer-bound (see §6).
+**Writer drain and reduce are balanced at kOwParallel = 2.** The writer
+emits `kOwParallel × c_valid` AccData_t per ow-group (= 8 cycles for the
+typical c_valid = 4), just under the 9-cycle 3×3 reduce — so consumer-bound
+3×3 tests stay reduce-bound. Raising kOwParallel to 4 would push the writer
+drain to 16 cycles and make it the bottleneck on those narrow tests (§6).
 
 ---
 
@@ -752,7 +779,7 @@ read.  Default platform is `kv260`; pick another with
   "description": "Xilinx KV260 Starter Kit",
   "part":  "xck26-sfvc784-2LV-c",
   "board": "xilinx.com:kv260_som:part0:1.4",
-  "clock": 300,
+  "clock": 150,
   "kernels": {
     "pool": {
       "tile_c":            8,
@@ -760,7 +787,7 @@ read.  Default platform is `kv260`; pick another with
       "max_kw":            7,
       "max_line_buf_rows": 16,
       "max_line_buf_cols": 64,
-      "ow_parallel":       4
+      "ow_parallel":       2
     }
   }
 }
@@ -773,7 +800,7 @@ read.  Default platform is `kv260`; pick another with
 | `max_kw` | `kMaxPoolW` | `POOL_MAX_KW` | 7 | `pool_w ≤ this` | Compile-time pool window width limit. |
 | `max_line_buf_rows` | `kMaxLineBufRows` | `POOL_MAX_LINE_BUF_ROWS` | 16 | power of 2; `(pool_h-1)*dil_h + 1 ≤ this` | Line-buffer row capacity. |
 | `max_line_buf_cols` | `kMaxLineBufCols` | `POOL_MAX_LINE_BUF_COLS` | 64 | `(pool_w-1)*dil_w + 1 ≤ this` | Line-buffer column capacity; W-tiling kicks in for `in_w > this`. |
-| `ow_parallel` | `kOwParallel` | (not validated) | 4 | power of 2; line_buf must service kOwParallel reads/cycle for the active stride_w (see §2.10 banking table) | Output-position unroll factor (§2.9, §2.10).  `line_buf` is partitioned `cyclic factor=kOwParallel dim=3` plus `BIND_STORAGE ram_t2p` so each per-channel sub-bank is dual-port; together this delivers kOwParallel reads/cycle for any `stride_w` with `gcd(stride_w, kOwParallel) ≤ 2` — covers 1, 2, 3 at the default kOwParallel=4.  Any out_w works (residual-lane padding). |
+| `ow_parallel` | `kOwParallel` | (not validated) | 2 | power of 2; line_buf must service kOwParallel reads/cycle for the active stride_w (see §2.10 banking table) | Output-position unroll factor (§2.9, §2.10).  `line_buf` is partitioned `cyclic factor=kOwParallel dim=3` plus `BIND_STORAGE ram_t2p` so each per-channel sub-bank is dual-port; together this delivers kOwParallel reads/cycle for any `stride_w` with `gcd(stride_w, kOwParallel) ≤ 2`.  At the shipped `kOwParallel = 2` this holds for every `stride_w`; §2.10 evaluated 4 (covers stride_w 1–3) but reverted it.  Any out_w works (residual-lane padding). |
 
 `tile_c` and `ow_parallel` are read by the C++ build but **not** validated
 by the Python scheduler — both have unconditional run-time fallbacks
@@ -855,16 +882,17 @@ vectorization halved then quartered the inner reduce (§2.4 + §2.5),
 retiring FP div+mul from the consumer's pipeline budget (§2.8), and
 the kOwParallel=2 reduce trimmed ~25% more by halving the consumer's
 per-position cost (§2.9) — leaving all five Max/Avg/Lp variants of the
-3x3 pad1 group at ~32k ns.  §2.10's bump to kOwParallel=4 didn't move
-them further: the writer drain (`kOwParallel × c_valid` = 16 cycles
-per group) crossed over the 9-cycle reduce and is now the bottleneck.
+3x3 pad1 group at ~32k ns, the shipped `kOwParallel = 2` end state.
+(§2.10 evaluated `kOwParallel = 4` for these but it would not help: the
+writer drain — `kOwParallel × c_valid` = 16 cycles — would cross over the
+9-cycle reduce; that value was reverted, see §2.10.)
 
-**Wide-W tests** got the biggest absolute savings from §2.9 + §2.10
-combined — they spend the most cycles in the reduce, and at out_w = 96
-or 128 every ow-group is fully populated for kOwParallel=4.  §2.9's
-kOwParallel=2 trimmed −42–45%; §2.10's kOwParallel=4 takes another
-−27–31% off the §2.9 number.  AvgPool W=96 batch=2 went from a §2.5
-~550 k baseline to 138 k final — **~4× faster**.
+**Wide-W tests** got the biggest absolute savings from the §2.9
+`kOwParallel = 2` reduce — they spend the most cycles in the reduce.
+§2.9's kOwParallel=2 trimmed −42–45% off the §2.8 number.  (§2.10's
+`kOwParallel = 4` evaluation took a further −27–31% — the wide-W `Final`
+figures in the table above reflect that evaluation — but the value was
+reverted; the shipped wide-W finals are the §2.9 kOwParallel=2 end state.)
 
 **Multi-channel-tile and non-overlap tests** (C_32, 2x2 stride2 family)
 benefited mainly from the producer split — Phase 1 was their dominant
@@ -875,35 +903,33 @@ nibble at the residual consumer fraction.
 
 ## 6. Where the floor is now
 
-After §2.10 the consumer's reduce loop runs at `pool_h × pool_w` cycles
-per **kOwParallel = 4** outputs across all pool types.  The wall-clock
-critical path now splits by test geometry:
+The shipped kernel runs the consumer reduce at `pool_h × pool_w` cycles
+per **kOwParallel = 2** outputs across all pool types.  The wall-clock
+critical path splits by test geometry:
 
-- **Wide-W consumer-bound tests** (out_w ≥ 64, divisible by kOwParallel) —
-  reduce-bound: per-position cost has dropped to
-  `pool_h × pool_w / kOwParallel = 9/4 = 2.25` cycles for 3×3.  AVG W=96
-  batch=2 finishes in 138k ns vs the §2.9 200k.
+- **Wide-W consumer-bound tests** (out_w ≥ 64) — reduce-bound:
+  per-position cost is `pool_h × pool_w / kOwParallel = 9/2 = 4.5` cycles
+  for 3×3.  (§2.10 evaluated `kOwParallel = 4`, which would halve this to
+  2.25 cycles, but that value was reverted — see §2.10.)
 - **Narrow consumer-bound tests** (3x3 pad1 at out_w=8, 5 variants) —
-  the writer's drain rate `kOwParallel × c_valid` (= 16 for c_valid=4)
-  has crossed over `pool_h × pool_w` (= 9), so the writer is the new
-  bottleneck.  Five variants land at ~32,250–32,510 ns, essentially
-  unchanged vs §2.9.  Further reduce parallelism (kOwParallel = 8) would
-  not help these — only widening the writer or fanning out output drains
-  would.
+  reduce-bound: the writer's drain rate `kOwParallel × c_valid` (= 8 for
+  c_valid=4) sits just under `pool_h × pool_w` (= 9), so the 9-cycle reduce
+  sets the pace.  Raising kOwParallel to 4 would push the writer drain to
+  16 cycles and make *it* the bottleneck on these narrow tests — so further
+  reduce parallelism helps here only if the writer is widened too.
 - **Multi-channel-tile tests** (C_16, C_32) — still Phase 1 DDR-bound
   (§6.1).  The `c_tiles` outer sweep dominates and the consumer reduce
   is fully overlapped behind it.
-- **Out_w-not-divisible-by-kOwParallel cases** (Global pool, 1×1
-  output) — pay a small residual-padding overhead (≤ 2.4%) and would
-  benefit from a smaller kOwParallel.  Acceptable cost given the
-  wide-W wins.
+- **Out_w-odd cases** (Global pool, 1×1 output) — pay a small
+  residual-padding overhead (≤ ~1% at the shipped `kOwParallel = 2`: one
+  padded lane per group when out_w is odd).  Negligible.
 
 To go further requires more invasive changes:
 
 | Option | Mechanism | Estimated win |
 |---|---|---|
-| kOwParallel = 8 | Add a second cyclic factor (or replicate sub-banks) so line_buf services 8 reads/cycle/channel; widen MultiWindow / acc[][] / writer drain | Up to 2× on wide-W tests still consumer-reduce-bound; helps narrow tests only if the writer drain widens too |
-| Writer fanout — emit kOwParallel y[] in parallel | Replicate the m_axi write port or stripe writes into a wide AXI burst; flips the narrow-test bottleneck back to reduce | Up to ~50% on the narrow 3x3 pad1 group whose 16-cycle drain currently dominates |
+| Raise kOwParallel (4, then 8) | `ow_parallel: 4` is a one-line JSON change (§2.10 already validated the cyclic-banking code at factor 4); 8 needs a second cyclic factor or replicated sub-banks, plus wider MultiWindow / acc[][] / writer drain | ~2× (4) / ~4× (8) on wide-W reduce-bound tests; narrow tests gain only if the writer drain is widened in step (see §6 narrow-test note) |
+| Writer fanout — emit kOwParallel y[] in parallel | Replicate the m_axi write port or stripe writes into a wide AXI burst | Prerequisite for kOwParallel ≥ 4 to help the narrow 3×3 group — at the shipped kOwParallel = 2 the 8-cycle writer drain is already under the 9-cycle reduce, so this yields nothing on its own |
 | Wider window vectors (kwi-fanout) | Emit `pool_w` pixels per cycle along kwi axis; reduce trip drops to `pool_h` cycles per ow-group | 2–4× on consumer (orthogonal to kOwParallel); helpful only when the writer isn't already the bottleneck |
 
 These are deferred until profiling shows pool on a critical path of a real
