@@ -2,15 +2,20 @@
 # Runs C synthesis and exports the result as a Vivado IP catalog archive.
 #
 # Variables substituted by CMake configure_file (@ONLY):
-#   POOL_HLS_PROJECT_NAME   — HLS project directory name
+#   POOL_HLS_PROJECT_NAME   — HLS component directory name
 #   POOL_BOARD_OPTION       — set_part command (includes -board if present)
 #   POOL_SRC_SYNTHESIS      — kernel source file path
 #   POOL_SYNTHESIS_FLAGS    — -O3 plus -I paths for include directories
 #   POOL_TARGET_CLOCK_TCL   — target clock frequency in MHz
 #   POOL_IP_OUTPUT_DIR      — output directory for the exported IP catalog
+#
+# Uses the Vitis unified "component" flow (open_component) rather than the
+# legacy open_project/open_solution pair.  The component flow emits a
+# <component>/<component>.hlscompile_summary file that Vitis Analyzer
+# (`vitis -a <summary>`) opens; the legacy flow does not.  Reports land
+# under <component>/hls/syn/report/ instead of solution1/syn/report/.
 
-open_project @POOL_HLS_PROJECT_NAME@
-open_solution solution1 -flow_target vivado
+open_component -reset @POOL_HLS_PROJECT_NAME@ -flow_target vivado
 
 @POOL_BOARD_OPTION@
 

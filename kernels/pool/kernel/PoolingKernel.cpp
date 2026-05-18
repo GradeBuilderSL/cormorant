@@ -373,6 +373,43 @@ static inline unsigned compute_ow_tile(
 }
 
 // ---------------------------------------------------------------------------
+// Per-invocation tile geometry.
+//
+// Both the W-tile width (compute_ow_tile divides by the runtime stride_w) and
+// the W-tile count (ow_tiles_w divides by the runtime ow_tile) need an integer
+// division by a RUNTIME divisor, which HLS synthesises as a multi-cycle
+// sequential divider.  The geometry is invariant for a whole kernel
+// invocation, yet each dataflow stage used to recompute ow_tiles_w (and
+// c_tiles) itself — so the same divider was instantiated once per stage (four
+// copies across the kernel).
+//
+// PoolingKernel now computes the geometry ONCE and passes this struct to every
+// stage, collapsing the divider count to a single shared set.  The struct
+// crosses the DATAFLOW process boundaries as one stable scalar channel.
+// ---------------------------------------------------------------------------
+struct PoolGeometry {
+    unsigned c_tiles;     // (channels + kTileC - 1) / kTileC
+    unsigned ow_tile;     // W-tile chunk width (compute_ow_tile)
+    unsigned ow_tiles_w;  // number of W-tiles spanning out_w
+};
+
+static inline PoolGeometry compute_pool_geometry(
+    unsigned channels,
+    unsigned out_w,
+    unsigned pool_w,
+    unsigned stride_w,
+    unsigned dil_w
+) {
+    PoolGeometry g;
+    g.c_tiles    = (channels + kTileC - 1) / kTileC;
+    g.ow_tile    = compute_ow_tile(out_w, pool_w, stride_w, dil_w);
+    g.ow_tiles_w = (g.ow_tile > 0)
+        ? ((out_w + g.ow_tile - 1) / g.ow_tile)
+        : 1u;
+    return g;
+}
+
+// ---------------------------------------------------------------------------
 // row_loader — DATAFLOW source (Phase 1).
 //
 // Reads input rows from DDR and pushes them onto row_data_pipe in the order
@@ -403,12 +440,12 @@ static void row_loader(
     unsigned             pad_left,
     unsigned             dil_h,
     unsigned             dil_w,
-    unsigned             ow_tile
+    const PoolGeometry&  geom
 ) {
-    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
+    const unsigned c_tiles    = geom.c_tiles;
     const unsigned in_hw      = in_h * in_w;
-    const unsigned ow_tiles_w =
-        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+    const unsigned ow_tile    = geom.ow_tile;
+    const unsigned ow_tiles_w = geom.ow_tiles_w;
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     // Local to one kernel invocation — collects every DDR cell read.
@@ -538,11 +575,11 @@ static void window_emitter(
     unsigned                  dil_w,
     unsigned                  pool_type,
     unsigned                  count_include_pad,
-    unsigned                  ow_tile
+    const PoolGeometry&       geom
 ) {
-    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
-    const unsigned ow_tiles_w =
-        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+    const unsigned c_tiles    = geom.c_tiles;
+    const unsigned ow_tile    = geom.ow_tile;
+    const unsigned ow_tiles_w = geom.ow_tiles_w;
 
     // line_buf:  kTileC * kMaxLineBufRows * kMaxLineBufCols * sizeof(Data_t)
     //         =      8  *       16        *       64        *      2     =  16 KB
@@ -772,7 +809,7 @@ static void process_pool_kernel_tile(
     unsigned                pool_w,
     unsigned                pool_type,
     unsigned                lp_order,
-    unsigned                ow_tile
+    const PoolGeometry&     geom
 ) {
     // acc[kOwParallel][kTileC] — both dimensions fully partitioned so the
     // unrolled reduce can update all kOwParallel * kTileC lanes in one
@@ -780,9 +817,9 @@ static void process_pool_kernel_tile(
     AccData_t acc[kOwParallel][kTileC];
     #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
-    const unsigned ow_tiles_w =
-        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+    const unsigned c_tiles    = geom.c_tiles;
+    const unsigned ow_tile    = geom.ow_tile;
+    const unsigned ow_tiles_w = geom.ow_tiles_w;
 
     for (unsigned ni = 0; ni < batch; ni++) {
         for (unsigned ct = 0; ct < c_tiles; ct++) {
@@ -931,12 +968,12 @@ static void write_output_tile(
     unsigned                channels,
     unsigned                out_h,
     unsigned                out_w,
-    unsigned                ow_tile
+    const PoolGeometry&     geom
 ) {
-    const unsigned c_tiles    = (channels + kTileC - 1) / kTileC;
+    const unsigned c_tiles    = geom.c_tiles;
     const unsigned hw_stride  = out_h * out_w;
-    const unsigned ow_tiles_w =
-        (ow_tile > 0) ? ((out_w + ow_tile - 1) / ow_tile) : 1u;
+    const unsigned ow_tile    = geom.ow_tile;
+    const unsigned ow_tiles_w = geom.ow_tiles_w;
 
     for (unsigned ni = 0; ni < batch; ni++) {
         for (unsigned ct = 0; ct < c_tiles; ct++) {
@@ -1000,9 +1037,17 @@ void PoolingKernel(
     // Two m_axi ports: gmem0 for the read-only input, gmem1 for the write-
     // only output.  All scalar arguments go into the s_axilite ctrl register
     // file accessed by the PS driver.
+    //
+    // depth=<N> is a C/RTL co-simulation hint only — it sizes the verification
+    // adapter FIFO cosim builds for each m_axi port.  It does NOT constrain the
+    // synthesised AXI master (runtime addresses) or the exported IP.  The
+    // POOL_COSIM_DEPTH_* macros (PoolingKernel.h) are the single source of
+    // truth shared with the test/TestPoolingSim.cpp cosim buffers.  cosim of an
+    // m_axi kernel aborts without depth ("a depth specification is required for
+    // interface port 'x'").
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=x  offset=slave bundle=gmem0
-    #pragma HLS INTERFACE m_axi port=y  offset=slave bundle=gmem1
+    #pragma HLS INTERFACE m_axi port=x  offset=slave bundle=gmem0 depth=POOL_COSIM_DEPTH_X
+    #pragma HLS INTERFACE m_axi port=y  offset=slave bundle=gmem1 depth=POOL_COSIM_DEPTH_Y
     #pragma HLS INTERFACE s_axilite port=x                 bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=y                 bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=batch             bundle=ctrl
@@ -1063,14 +1108,18 @@ void PoolingKernel(
     //   acc_stream   c_valid AccData_t entries per (ni, ct, owt, oh, ow);
     //                depth kTileC matches the writer's per-tile drain burst.
     //
-    // ow_tile is the W-tile chunk size (single source of truth — passed to
-    // all three stages so they iterate (ni, ct, owt, oh, ow) in lockstep).
-    // When in_w <= kMaxLineBufCols the formula yields ow_tile = out_w and the
-    // owt loop runs once: the kernel matches the zero-duplication path.
-    // When in_w > kMaxLineBufCols, ow_tile < out_w and boundary input columns are
-    // re-read once per W-tile transition — the documented relaxation.
+    // geom bundles the per-invocation tile geometry (c_tiles, ow_tile,
+    // ow_tiles_w) — computed ONCE here so the runtime-divisor divisions land
+    // in a single shared divider set instead of one per dataflow stage.  It is
+    // the single source of truth, passed to all four stages so they iterate
+    // (ni, ct, owt, oh, ow) in lockstep.  When in_w <= kMaxLineBufCols the
+    // formula yields ow_tile = out_w and the owt loop runs once: the kernel
+    // matches the zero-duplication path.  When in_w > kMaxLineBufCols,
+    // ow_tile < out_w and boundary input columns are re-read once per W-tile
+    // transition — the documented relaxation.
     // -----------------------------------------------------------------------
-    const unsigned ow_tile = compute_ow_tile(out_w, pool_w, stride_w, dil_w);
+    const PoolGeometry geom = compute_pool_geometry(
+        channels, out_w, pool_w, stride_w, dil_w);
 
     #pragma HLS DATAFLOW
 
@@ -1109,21 +1158,21 @@ void PoolingKernel(
         batch, channels, in_h, in_w, out_h, out_w,
         pool_h, pool_w, stride_h, stride_w,
         pad_top, pad_left, dil_h, dil_w,
-        ow_tile);
+        geom);
 
     window_emitter(
         row_data_pipe, window_pipe, denom_pipe,
         batch, channels, in_h, in_w, out_h, out_w,
         pool_h, pool_w, stride_h, stride_w,
         pad_top, pad_left, dil_h, dil_w,
-        pool_type, count_include_pad, ow_tile);
+        pool_type, count_include_pad, geom);
 
     process_pool_kernel_tile(
         window_pipe, denom_pipe, acc_stream,
         batch, channels, out_h, out_w,
-        pool_h, pool_w, pool_type, lp_order, ow_tile);
+        pool_h, pool_w, pool_type, lp_order, geom);
 
     write_output_tile(
         y, acc_stream,
-        batch, channels, out_h, out_w, ow_tile);
+        batch, channels, out_h, out_w, geom);
 }
