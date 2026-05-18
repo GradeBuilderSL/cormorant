@@ -523,8 +523,8 @@ correctness configs with an additional `benchmarks` section.
 }
 ```
 
-The default `perf_config.json` ships with **49 benchmark cases** across the
-four kernels (20 VectorOPKernel, 12 MatmulKernel, 9 ConvKernel, 8 PoolingKernel).
+The default `perf_config.json` ships with **53 benchmark cases** across the
+four kernels (20 VectorOPKernel, 12 MatmulKernel, 10 ConvKernel, 11 PoolingKernel).
 
 ```bash
 cd inference-scheduler
@@ -553,15 +553,15 @@ cd inference-scheduler
   ───────────────────────────────────────────────────────────────────────────────────
   Label                    Parameters                        Lat(ms)      GB/s
   ───────────────────────────────────────────────────────────────────────────────────
-  ADD-1K                   ADD    size=1024    outer=1        0.0207     0.297
-  ADD-4K                   ADD    size=4096    outer=1        0.0516     0.476
+  ADD-1K                   ADD    size=1024    outer=1        0.0208     0.296
+  ADD-4K                   ADD    size=4096    outer=1        0.0515     0.477
   ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
   ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
   ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
   ...
-  ADD-bcast-8x16K          ADD    size=16384   outer=8        1.3813     0.569
-  RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3484     0.389
-  MUL-bcast-dw-12544x16    MUL    size=16      outer=12544    5.8274     0.207
+  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
+  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
+  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
   ───────────────────────────────────────────────────────────────────────────────────
                                                  peak GB/s                0.593
                                                min latency     0.0181
@@ -572,37 +572,44 @@ cd inference-scheduler
   Label              Parameters                        Lat(ms)    GOps/s
   ─────────────────────────────────────────────────────────────────────────────
   8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
-  32x32x32           N=32   K=32   M=32   batch=1       0.3039     0.216
-  256x256x256        N=256  K=256  M=256  batch=1     126.2730     0.266
-  dw-12544x16x1      N=12544 K=16   M=1    batch=1     13.3935     0.030
+  16x16x16           N=16   K=16   M=16   batch=1       0.0515     0.159
+  32x32x32           N=32   K=32   M=32   batch=1       0.3021     0.217
+  ...
+  dw-12544x16x3      N=12544 K=16   M=1    batch=3     38.7727     0.031
   ─────────────────────────────────────────────────────────────────────────────
                                          peak GOps/s                0.266
                                          min latency     0.0176
   12/12 OK
 
   ConvKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  3x3-1ch-28x28-32out    1ch 28x28→32ch 3x3k               14.5811     0.031
-  ─────────────────────────────────────────────────────────────────────────────────
-                                             peak GOps/s                0.031
-                                             min latency    14.5811
-  1/1 OK
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Label                      Parameters                        Lat(ms)    GOps/s
+  ─────────────────────────────────────────────────────────────────────────────────────
+  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                5.9634     0.076
+  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k               95.2806     0.076
+  3x3-64ch-56x56             64ch 56x56→64ch 3x3k             127.1612     1.818
+  ...
+  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k              33.7165     0.107
+  ─────────────────────────────────────────────────────────────────────────────────────
+                                                 peak GOps/s                1.903
+                                                 min latency     4.2167
+  10/10 OK
 
   PoolingKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)      GB/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  MaxPool-2x2-56x56      MaxPool 2x2 64ch 56x56            21.6922     0.023
-  MaxPool-2x2-28x28      MaxPool 2x2 64ch 28x28             5.3711     0.023
-  GlobalAvgPool-7x7      AvgPool 7x7 64ch 7x7               0.1908     0.034
-  ─────────────────────────────────────────────────────────────────────────────────
-                                               peak GB/s                0.036
-                                             min latency     0.1908
-  8/8 OK
+  ────────────────────────────────────────────────────────────────────────────────────
+  Label                     Parameters                        Lat(ms)      GB/s
+  ────────────────────────────────────────────────────────────────────────────────────
+  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             3.7900     0.132
+  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             1.0524     0.119
+  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             3.8125     0.132
+  ...
+  ────────────────────────────────────────────────────────────────────────────────────
+                                                  peak GB/s                0.133
+                                                min latency     0.1039
+  11/11 OK
+  ── OVERALL: All 53 cases passed ──
 
-  ── OVERALL: All 41 cases passed ──
+  ── OVERALL: All 53 cases passed ──
 ```
 
 | Metric | Meaning |

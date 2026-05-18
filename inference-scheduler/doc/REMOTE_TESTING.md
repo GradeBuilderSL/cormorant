@@ -664,25 +664,25 @@ After all cases run, the script prints a per-kernel table:
   ───────────────────────────────────────────────────────────────────────────────────
   Label                    Parameters                        Lat(ms)      GB/s
   ───────────────────────────────────────────────────────────────────────────────────
-  ADD-1K                   ADD    size=1024    outer=1        0.0207     0.297
-  ADD-4K                   ADD    size=4096    outer=1        0.0516     0.476
+  ADD-1K                   ADD    size=1024    outer=1        0.0208     0.296
+  ADD-4K                   ADD    size=4096    outer=1        0.0515     0.477
   ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
   ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
   ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
-  MUL-16K                  MUL    size=16384   outer=1        0.1756     0.560
-  MUL-64K                  MUL    size=65536   outer=1        0.6712     0.586
-  DIV-4K                   DIV    size=4096    outer=1        0.0520     0.473
-  RELU-16K                 RELU   size=16384   outer=1        0.1728     0.379
+  MUL-16K                  MUL    size=16384   outer=1        0.1755     0.560
+  MUL-64K                  MUL    size=65536   outer=1        0.6708     0.586
+  DIV-4K                   DIV    size=4096    outer=1        0.0521     0.472
+  RELU-16K                 RELU   size=16384   outer=1        0.1732     0.378
   RELU-64K                 RELU   size=65536   outer=1        0.6683     0.392
-  RELU6-16K                RELU6  size=16384   outer=1        0.1729     0.379
+  RELU6-16K                RELU6  size=16384   outer=1        0.1731     0.379
   ADD-bcast-8x16K          ADD    size=16384   outer=8        1.3813     0.569
-  MUL-bcast-8x16K          MUL    size=16384   outer=8        1.3813     0.569
-  RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3484     0.389
-  MUL-bcast-dw-12544x16    MUL    size=16      outer=12544    5.8274     0.207
+  MUL-bcast-8x16K          MUL    size=16384   outer=8        1.3814     0.569
+  RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3483     0.389
+  MUL-bcast-dw-12544x16    MUL    size=16      outer=12544     6.0383     0.199
   SOFTMAX-1K-1row          6      size=1024    outer=1        0.0181     0.226
-  SOFTMAX-4K-1row          6      size=4096    outer=1        0.0491     0.334
+  SOFTMAX-4K-1row          6      size=4096    outer=1        0.0494     0.332
   SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
-  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1100     0.298
+  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
   SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
   ───────────────────────────────────────────────────────────────────────────────────
                                                  peak GB/s                0.593
@@ -694,50 +694,62 @@ After all cases run, the script prints a per-kernel table:
   Label              Parameters                        Lat(ms)    GOps/s
   ─────────────────────────────────────────────────────────────────────────────
   8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
-  16x16x16           N=16   K=16   M=16   batch=1       0.0520     0.157
-  32x32x32           N=32   K=32   M=32   batch=1       0.3039     0.216
-  64x64x64           N=64   K=64   M=64   batch=1       2.1416     0.245
-  128x128x128        N=128  K=128  M=128  batch=1      16.1860     0.259
-  256x256x256        N=256  K=256  M=256  batch=1     126.2730     0.266
-  FC-1x256x256       N=1    K=256  M=256  batch=1       1.9489     0.067
-  FC-4x256x256       N=4    K=256  M=256  batch=1       1.9778     0.265
-  batch4-64x64x64    N=64   K=64   M=64   batch=4       8.5376     0.246
-  batch4-A-bcast     N=64   K=64   M=64   batch=4       8.5382     0.246
-  dw-12544x16x1      N=12544 K=16   M=1    batch=1     13.3935     0.030
-  dw-12544x16x3      N=12544 K=16   M=1    batch=3     40.1768     0.030
+  16x16x16           N=16   K=16   M=16   batch=1       0.0515     0.159
+  32x32x32           N=32   K=32   M=32   batch=1       0.3021     0.217
+  64x64x64           N=64   K=64   M=64   batch=1       2.1335     0.246
+  128x128x128        N=128  K=128  M=128  batch=1      16.1825     0.259
+  256x256x256        N=256  K=256  M=256  batch=1     126.2571     0.266
+  FC-1x256x256       N=1    K=256  M=256  batch=1       1.9480     0.067
+  FC-4x256x256       N=4    K=256  M=256  batch=1       1.9776     0.265
+  batch4-64x64x64    N=64   K=64   M=64   batch=4       8.5207     0.246
+  batch4-A-bcast     N=64   K=64   M=64   batch=4       8.5120     0.246
+  dw-12544x16x1      N=12544 K=16   M=1    batch=1     12.9113     0.031
+  dw-12544x16x3      N=12544 K=16   M=1    batch=3     38.7727     0.031
   ─────────────────────────────────────────────────────────────────────────────
                                          peak GOps/s                0.266
                                          min latency     0.0176
   12/12 OK
 
   ConvKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  3x3-1ch-28x28-32out    1ch 28x28→32ch 3x3k               14.5811     0.031
-  ─────────────────────────────────────────────────────────────────────────────────
-                                             peak GOps/s                0.031
-                                             min latency    14.5811
-  1/1 OK
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Label                      Parameters                        Lat(ms)    GOps/s
+  ─────────────────────────────────────────────────────────────────────────────────────
+  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                5.9634     0.076
+  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k               95.2806     0.076
+  3x3-64ch-56x56             64ch 56x56→64ch 3x3k             127.1612     1.818
+  3x3-64ch-56x56-s2          64ch 56x56→64ch 3x3k              32.0390     1.804
+  3x3-64ch-28x28             64ch 28x28→64ch 3x3k              31.7999     1.818
+  1x1-64to128-56x56          64ch 56x56→128ch 1x1k            119.2604     0.431
+  1x1-128to256-28x28         128ch 28x28→256ch 1x1k            98.8143     0.520
+  5x5-16ch-28x28             16ch 28x28→16ch 5x5k               5.2719     1.903
+  dw-3x3-32ch-28x28          32ch 28x28→32ch 3x3k               4.2167     0.107
+  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k              33.7165     0.107
+  ─────────────────────────────────────────────────────────────────────────────────────
+                                                 peak GOps/s                1.903
+                                                 min latency     4.2167
+  10/10 OK
 
   PoolingKernel
-  ─────────────────────────────────────────────────────────────────────────────────
-  Label                  Parameters                        Lat(ms)      GB/s
-  ─────────────────────────────────────────────────────────────────────────────────
-  MaxPool-2x2-56x56      MaxPool 2x2 64ch 56x56            21.6922     0.023
-  MaxPool-2x2-28x28      MaxPool 2x2 64ch 28x28             5.3711     0.023
-  MaxPool-3x3-56x56      MaxPool 3x3 64ch 56x56            36.2833     0.014
-  MaxPool-3x3-14x14      MaxPool 3x3 64ch 14x14             2.1684     0.014
-  AvgPool-2x2-56x56      AvgPool 2x2 64ch 56x56            21.6922     0.023
-  AvgPool-3x3-28x28      AvgPool 3x3 64ch 28x28             8.8810     0.014
-  GlobalMaxPool-14x14    MaxPool 14x14 64ch 14x14           0.7044     0.036
-  GlobalAvgPool-7x7      AvgPool 7x7 64ch 7x7               0.1908     0.034
-  ─────────────────────────────────────────────────────────────────────────────────
-                                               peak GB/s                0.036
-                                             min latency     0.1908
-  8/8 OK
+  ────────────────────────────────────────────────────────────────────────────────────
+  Label                     Parameters                        Lat(ms)      GB/s
+  ────────────────────────────────────────────────────────────────────────────────────
+  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             3.7900     0.132
+  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             1.0524     0.119
+  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             3.8125     0.132
+  MaxPool-3x3-14x14         MaxPool 3x3 64ch 14x14             0.3956     0.079
+  AvgPool-2x2-56x56         AvgPool 2x2 64ch 56x56             3.7901     0.132
+  AvgPool-3x3-28x28         AvgPool 3x3 64ch 28x28             1.0548     0.119
+  GlobalMaxPool-14x14       MaxPool 14x14 64ch 14x14           0.3778     0.067
+  GlobalAvgPool-7x7-64      AvgPool 7x7 64ch 7x7               0.1039     0.062
+  GlobalAvgPool-7x7-1024    AvgPool 7x7 1024ch 7x7             1.5445     0.066
+  AvgPool-2x2-7x7-1024      AvgPool 7x7 1024ch 7x7             1.5445     0.066
+  AvgPool-2x2-3x3-32-112    AvgPool 3x3 32ch 112x112           7.5081     0.133
+  ────────────────────────────────────────────────────────────────────────────────────
+                                                  peak GB/s                0.133
+                                                min latency     0.1039
+  11/11 OK
 
-  ── OVERALL: All 41 cases passed ──
+  ── OVERALL: All 53 cases passed ──
 ```
 
 | Column | Meaning |

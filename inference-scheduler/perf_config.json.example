@@ -67,20 +67,26 @@
       "enabled": true,
       "warmup": 10,
       "cases": [
-        {"label": "ADD-1K",           "op": 0, "size": 1024,   "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "ADD-4K",           "op": 0, "size": 4096,   "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "ADD-16K",          "op": 0, "size": 16384,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "ADD-64K",          "op": 0, "size": 65536,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 100},
-        {"label": "ADD-256K",         "op": 0, "size": 262144, "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 50},
-        {"label": "MUL-16K",          "op": 2, "size": 16384,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "MUL-64K",          "op": 2, "size": 65536,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 100},
-        {"label": "DIV-4K",           "op": 3, "size": 4096,   "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 50},
-        {"label": "RELU-16K",         "op": 4, "size": 16384,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "RELU-64K",         "op": 4, "size": 65536,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 100},
-        {"label": "RELU6-16K",        "op": 5, "size": 16384,  "outer": 1, "a_inc": 0,     "b_inc": 0, "iters": 200},
-        {"label": "ADD-bcast-8x16K",  "op": 0, "size": 16384,  "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
-        {"label": "MUL-bcast-8x16K",  "op": 2, "size": 16384,  "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
-        {"label": "RELU-bcast-8x16K", "op": 4, "size": 16384,  "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100}
+        {"label": "ADD-1K", "op": 0, "size": 1024, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "ADD-4K", "op": 0, "size": 4096, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "ADD-16K", "op": 0, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "ADD-64K", "op": 0, "size": 65536, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 100},
+        {"label": "ADD-256K", "op": 0, "size": 262144, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 50},
+        {"label": "MUL-16K", "op": 2, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "MUL-64K", "op": 2, "size": 65536, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 100},
+        {"label": "DIV-4K", "op": 3, "size": 4096, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 50},
+        {"label": "RELU-16K", "op": 4, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "RELU-64K", "op": 4, "size": 65536, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 100},
+        {"label": "RELU6-16K", "op": 5, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "ADD-bcast-8x16K", "op": 0, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
+        {"label": "MUL-bcast-8x16K", "op": 2, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
+        {"label": "RELU-bcast-8x16K", "op": 4, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
+        {"label": "MUL-bcast-dw-12544x16", "op": 2, "size": 16, "outer": 12544, "a_inc": 16, "b_inc": 0, "iters": 100},
+        {"label": "SOFTMAX-1K-1row", "op": 6, "size": 1024, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
+        {"label": "SOFTMAX-4K-1row", "op": 6, "size": 4096, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 100},
+        {"label": "SOFTMAX-16K-1row", "op": 6, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 50},
+        {"label": "SOFTMAX-1K-8rows", "op": 6, "size": 1024, "outer": 8, "a_inc": 1024, "b_inc": 0, "iters": 100},
+        {"label": "SOFTMAX-4K-4rows", "op": 6, "size": 4096, "outer": 4, "a_inc": 4096, "b_inc": 0, "iters": 50}
       ]
     },
 
@@ -88,16 +94,18 @@
       "enabled": true,
       "warmup": 10,
       "cases": [
-        {"label": "8x8x8",           "n": 8,   "k": 8,   "m": 8,   "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 500},
-        {"label": "16x16x16",        "n": 16,  "k": 16,  "m": 16,  "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 500},
-        {"label": "32x32x32",        "n": 32,  "k": 32,  "m": 32,  "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 200},
-        {"label": "64x64x64",        "n": 64,  "k": 64,  "m": 64,  "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 100},
-        {"label": "128x128x128",     "n": 128, "k": 128, "m": 128, "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 50},
-        {"label": "256x256x256",     "n": 256, "k": 256, "m": 256, "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 20},
-        {"label": "FC-1x256x256",    "n": 1,   "k": 256, "m": 256, "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 500},
-        {"label": "FC-4x256x256",    "n": 4,   "k": 256, "m": 256, "batch": 1, "a_stride": 0,    "b_stride": 0,    "iters": 200},
-        {"label": "batch4-64x64x64", "n": 64,  "k": 64,  "m": 64,  "batch": 4, "a_stride": 4096, "b_stride": 4096, "iters": 50},
-        {"label": "batch4-A-bcast",  "n": 64,  "k": 64,  "m": 64,  "batch": 4, "a_stride": 0,    "b_stride": 4096, "iters": 50}
+        {"label": "8x8x8", "n": 8, "k": 8, "m": 8, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 500},
+        {"label": "16x16x16", "n": 16, "k": 16, "m": 16, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 500},
+        {"label": "32x32x32", "n": 32, "k": 32, "m": 32, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 200},
+        {"label": "64x64x64", "n": 64, "k": 64, "m": 64, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 100},
+        {"label": "128x128x128", "n": 128, "k": 128, "m": 128, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 50},
+        {"label": "256x256x256", "n": 256, "k": 256, "m": 256, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 20},
+        {"label": "FC-1x256x256", "n": 1, "k": 256, "m": 256, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 500},
+        {"label": "FC-4x256x256", "n": 4, "k": 256, "m": 256, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 200},
+        {"label": "batch4-64x64x64", "n": 64, "k": 64, "m": 64, "batch": 4, "a_stride": 4096, "b_stride": 4096, "iters": 50},
+        {"label": "batch4-A-bcast", "n": 64, "k": 64, "m": 64, "batch": 4, "a_stride": 0, "b_stride": 4096, "iters": 50},
+        {"label": "dw-12544x16x1", "n": 12544, "k": 16, "m": 1, "batch": 1, "a_stride": 0, "b_stride": 0, "iters": 200},
+        {"label": "dw-12544x16x3", "n": 12544, "k": 16, "m": 1, "batch": 3, "a_stride": 200704, "b_stride": 16, "iters": 100}
       ]
     },
 
@@ -105,15 +113,16 @@
       "enabled": true,
       "warmup": 10,
       "cases": [
-        {"label": "3x3-1ch-28x28-32out", "batch": 1, "in_ch": 1,   "in_h": 28, "in_w": 28, "out_ch": 32,  "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 200},
-        {"label": "3x3-64ch-56x56",      "batch": 1, "in_ch": 64,  "in_h": 56, "in_w": 56, "out_ch": 64,  "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 50},
-        {"label": "3x3-64ch-56x56-s2",   "batch": 1, "in_ch": 64,  "in_h": 56, "in_w": 56, "out_ch": 64,  "kh": 3, "kw": 3, "stride_h": 2, "stride_w": 2, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 50},
-        {"label": "3x3-64ch-28x28",      "batch": 1, "in_ch": 64,  "in_h": 28, "in_w": 28, "out_ch": 64,  "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 100},
-        {"label": "1x1-64to128-56x56",   "batch": 1, "in_ch": 64,  "in_h": 56, "in_w": 56, "out_ch": 128, "kh": 1, "kw": 1, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 0, "pad_left": 0, "has_bias": 0, "is_dw": 0, "iters": 50},
-        {"label": "1x1-128to256-28x28",  "batch": 1, "in_ch": 128, "in_h": 28, "in_w": 28, "out_ch": 256, "kh": 1, "kw": 1, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 0, "pad_left": 0, "has_bias": 0, "is_dw": 0, "iters": 50},
-        {"label": "5x5-16ch-28x28",      "batch": 1, "in_ch": 16,  "in_h": 28, "in_w": 28, "out_ch": 16,  "kh": 5, "kw": 5, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 2, "pad_left": 2, "has_bias": 0, "is_dw": 0, "iters": 100},
-        {"label": "dw-3x3-32ch-28x28",   "batch": 1, "in_ch": 32,  "in_h": 28, "in_w": 28, "out_ch": 32,  "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 1, "iters": 200},
-        {"label": "dw-3x3-64ch-56x56",   "batch": 1, "in_ch": 64,  "in_h": 56, "in_w": 56, "out_ch": 64,  "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 1, "iters": 50}
+        {"label": "3x3-1ch-28x28-32out", "batch": 1, "in_ch": 1, "in_h": 28, "in_w": 28, "out_ch": 32, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 200},
+        {"label": "3x3-1ch-28x28-32out-b16", "batch": 16, "in_ch": 1, "in_h": 28, "in_w": 28, "out_ch": 32, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 50},
+        {"label": "3x3-64ch-56x56", "batch": 1, "in_ch": 64, "in_h": 56, "in_w": 56, "out_ch": 64, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 50},
+        {"label": "3x3-64ch-56x56-s2", "batch": 1, "in_ch": 64, "in_h": 56, "in_w": 56, "out_ch": 64, "kh": 3, "kw": 3, "stride_h": 2, "stride_w": 2, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 50},
+        {"label": "3x3-64ch-28x28", "batch": 1, "in_ch": 64, "in_h": 28, "in_w": 28, "out_ch": 64, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 0, "iters": 100},
+        {"label": "1x1-64to128-56x56", "batch": 1, "in_ch": 64, "in_h": 56, "in_w": 56, "out_ch": 128, "kh": 1, "kw": 1, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 0, "pad_left": 0, "has_bias": 0, "is_dw": 0, "iters": 50},
+        {"label": "1x1-128to256-28x28", "batch": 1, "in_ch": 128, "in_h": 28, "in_w": 28, "out_ch": 256, "kh": 1, "kw": 1, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 0, "pad_left": 0, "has_bias": 0, "is_dw": 0, "iters": 50},
+        {"label": "5x5-16ch-28x28", "batch": 1, "in_ch": 16, "in_h": 28, "in_w": 28, "out_ch": 16, "kh": 5, "kw": 5, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 2, "pad_left": 2, "has_bias": 0, "is_dw": 0, "iters": 100},
+        {"label": "dw-3x3-32ch-28x28", "batch": 1, "in_ch": 32, "in_h": 28, "in_w": 28, "out_ch": 32, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 1, "iters": 200},
+        {"label": "dw-3x3-64ch-56x56", "batch": 1, "in_ch": 64, "in_h": 56, "in_w": 56, "out_ch": 64, "kh": 3, "kw": 3, "stride_h": 1, "stride_w": 1, "dilation_h": 1, "dilation_w": 1, "pad_top": 1, "pad_left": 1, "has_bias": 0, "is_dw": 1, "iters": 50}
       ]
     },
 
@@ -121,14 +130,17 @@
       "enabled": true,
       "warmup": 10,
       "cases": [
-        {"label": "MaxPool-2x2-56x56",   "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 2,  "pool_w": 2,  "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
-        {"label": "MaxPool-2x2-28x28",   "batch": 1, "channels": 64, "in_h": 28, "in_w": 28, "pool_h": 2,  "pool_w": 2,  "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
-        {"label": "MaxPool-3x3-56x56",   "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 3,  "pool_w": 3,  "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 100},
-        {"label": "MaxPool-3x3-14x14",   "batch": 1, "channels": 64, "in_h": 14, "in_w": 14, "pool_h": 3,  "pool_w": 3,  "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
-        {"label": "AvgPool-2x2-56x56",   "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 2,  "pool_w": 2,  "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
-        {"label": "AvgPool-3x3-28x28",   "batch": 1, "channels": 64, "in_h": 28, "in_w": 28, "pool_h": 3,  "pool_w": 3,  "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "MaxPool-2x2-56x56", "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 2, "pool_w": 2, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "MaxPool-2x2-28x28", "batch": 1, "channels": 64, "in_h": 28, "in_w": 28, "pool_h": 2, "pool_w": 2, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "MaxPool-3x3-56x56", "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 3, "pool_w": 3, "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 100},
+        {"label": "MaxPool-3x3-14x14", "batch": 1, "channels": 64, "in_h": 14, "in_w": 14, "pool_h": 3, "pool_w": 3, "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "AvgPool-2x2-56x56", "batch": 1, "channels": 64, "in_h": 56, "in_w": 56, "pool_h": 2, "pool_w": 2, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "AvgPool-3x3-28x28", "batch": 1, "channels": 64, "in_h": 28, "in_w": 28, "pool_h": 3, "pool_w": 3, "stride_h": 2, "stride_w": 2, "pad_top": 1, "pad_left": 1, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
         {"label": "GlobalMaxPool-14x14", "batch": 1, "channels": 64, "in_h": 14, "in_w": 14, "pool_h": 14, "pool_w": 14, "stride_h": 1, "stride_w": 1, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 0, "lp_order": 1, "count_include_pad": 0, "iters": 200},
-        {"label": "GlobalAvgPool-7x7",   "batch": 1, "channels": 64, "in_h": 7,  "in_w": 7,  "pool_h": 7,  "pool_w": 7,  "stride_h": 1, "stride_w": 1, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200}
+        {"label": "GlobalAvgPool-7x7-64", "batch": 1, "channels": 64, "in_h": 7, "in_w": 7, "pool_h": 7, "pool_w": 7, "stride_h": 1, "stride_w": 1, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "GlobalAvgPool-7x7-1024", "batch": 1, "channels": 1024, "in_h": 7, "in_w": 7, "pool_h": 7, "pool_w": 7, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "AvgPool-2x2-7x7-1024", "batch": 1, "channels": 1024, "in_h": 7, "in_w": 7, "pool_h": 7, "pool_w": 7, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200},
+        {"label": "AvgPool-2x2-3x3-32-112", "batch": 1, "channels": 32, "in_h": 112, "in_w": 112, "pool_h": 3, "pool_w": 3, "stride_h": 2, "stride_w": 2, "pad_top": 0, "pad_left": 0, "dil_h": 1, "dil_w": 1, "pool_type": 1, "lp_order": 1, "count_include_pad": 0, "iters": 200}
       ]
     }
   }
