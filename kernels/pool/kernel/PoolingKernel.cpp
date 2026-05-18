@@ -539,9 +539,12 @@ static void row_loader(
 // Mirrors the row_loader's (ni, ct, owt, oh) schedule so stream consumption
 // matches production.
 //
-// MultiDenom (kOwParallel valid_counts) is computed via fully-unrolled
-// kOwParallel × kMaxPoolH × kMaxPoolW passes — collapses to a parallel
-// adder tree (~1 cycle).
+// MultiDenom (kOwParallel valid_counts) is computed in closed form: a
+// window position is in-bounds iff its row AND its column are in-bounds,
+// and the two tests are independent, so the valid set is the rectangle
+// product {valid khi} × {valid kwi} and valid_count = num_valid_kh *
+// num_valid_kw.  num_valid_kh is counted once per group (it does not
+// depend on the ow position); num_valid_kw is counted per p.
 //
 // Residual handling — when (ow_hi - ow_lo) is not a multiple of kOwParallel,
 // the last group covers padded positions ow ≥ ow_hi.  Padded lanes get
@@ -691,35 +694,51 @@ static void window_emitter(
                         const unsigned ow_g = ow_lo + g * kOwParallel;
 
                         // -----------------------------------------------
-                        // Per-position valid_count via fully-unrolled
-                        // kOwParallel × kMaxPoolH × kMaxPoolW adder tree.
-                        // Padded positions (ow_g + p ≥ ow_hi) compute a
-                        // nominal count; their results are dropped by
-                        // the writer so the denom value is don't-care.
+                        // Per-position valid_count, closed form.
+                        //
+                        // A window position (khi, kwi) is in-bounds iff
+                        // its row is in-bounds AND its column is — the row
+                        // test depends only on khi, the column test only
+                        // on kwi.  So the in-bounds set is the rectangle
+                        // product {valid khi} × {valid kwi} and
+                        //   valid_count = num_valid_kh * num_valid_kw.
+                        // num_valid_kh does not depend on the ow position,
+                        // so it is counted once per group; num_valid_kw is
+                        // counted per p.  This replaces the former
+                        // kOwParallel × kMaxPoolH × kMaxPoolW (98-lane)
+                        // bounds-count with kMaxPoolH + kOwParallel ×
+                        // kMaxPoolW (21-lane) counting plus kOwParallel
+                        // multiplies.  Padded positions (ow_g + p ≥ ow_hi)
+                        // compute a nominal count; the writer drops them.
                         // -----------------------------------------------
+                        unsigned num_valid_kh = 0;
+                        for (unsigned khi = 0; khi < kMaxPoolH; khi++) {
+                            #pragma HLS UNROLL
+                            if (khi < pool_h) {
+                                const int ih_v = (int)(oh * stride_h + khi * dil_h)
+                                               - (int)pad_top;
+                                if (ih_v >= 0 && (unsigned)ih_v < in_h)
+                                    num_valid_kh++;
+                            }
+                        }
+
                         MultiDenom md;
                         for (unsigned p = 0; p < kOwParallel; p++) {
                             #pragma HLS UNROLL
                             const unsigned ow_p = ow_g + p;
-                            unsigned valid_count = 0;
-                            for (unsigned khi = 0; khi < kMaxPoolH; khi++) {
+                            unsigned num_valid_kw = 0;
+                            for (unsigned kwi = 0; kwi < kMaxPoolW; kwi++) {
                                 #pragma HLS UNROLL
-                                for (unsigned kwi = 0; kwi < kMaxPoolW; kwi++) {
-                                    #pragma HLS UNROLL
-                                    if (khi < pool_h && kwi < pool_w) {
-                                        const int ih_v = (int)(oh * stride_h + khi * dil_h)
-                                                       - (int)pad_top;
-                                        const int iw_v = (int)(ow_p * stride_w + kwi * dil_w)
-                                                       - (int)pad_left;
-                                        if (ih_v >= 0 && (unsigned)ih_v < in_h &&
-                                            iw_v >= 0 && (unsigned)iw_v < in_w)
-                                            valid_count++;
-                                    }
+                                if (kwi < pool_w) {
+                                    const int iw_v = (int)(ow_p * stride_w + kwi * dil_w)
+                                                   - (int)pad_left;
+                                    if (iw_v >= 0 && (unsigned)iw_v < in_w)
+                                        num_valid_kw++;
                                 }
                             }
                             md.d[p] = count_include_pad
                                 ? (pool_h * pool_w)
-                                : valid_count;
+                                : (num_valid_kh * num_valid_kw);
                         }
                         denom_pipe.write(md);
 
