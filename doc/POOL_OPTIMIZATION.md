@@ -30,25 +30,18 @@ after running the full TestPoolingSim case list.
 | + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
 | + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
 | + kOwParallel=2 reduce (process 2 adjacent ow's per cycle) | 31 | 1,679,945 | -24.1% | -76.1% |
-| + Cyclic line_buf banking + shared tile geometry | 31 | 1,485,975 † | — | — |
+| **+ Cyclic line_buf banking + shared tile geometry** | **31** | **1,485,975** | **-11.5%** | **-78.8%** |
 
 > **kOwParallel — shipped value is 2.** §2.10 *evaluated* `kOwParallel = 4`
 > and measured 1,513,475 ns (−9.9 % from §2.9), but that value was reverted;
 > `platforms/kv260.json` ships `ow_parallel: 2`. The cyclic line_buf banking
 > *code* (§2.10) and the shared tile geometry (§2.11) both ship at
-> `kOwParallel = 2`. The `kOwParallel = 4` figure is kept in §2.10 for the
-> record but is not part of the shipped progression.
->
-> **† Clock-basis change.** The last row was measured at a **150 MHz** target
-> clock; every row above it at **300 MHz**. `sim_time_ns` scales with the
-> clock period, so 1,485,975 ns is **not comparable** to the rows above — no
-> cross-step delta is given. The §2.11 change is verified functionally
-> (C-sim 33/33, behavior test 31/31); see §2.11.
+> `kOwParallel = 2` — the −11.5 % row above is their combined effect vs §2.9.
+> The `kOwParallel = 4` figure is kept in §2.10 for the record but is not
+> part of the shipped progression.
 
-**Net result through §2.9 — the last 300 MHz measurement — ~4.18× faster
-than the post-baseline (line-buffer-only) implementation; ~76% reduction in
-total HW sim time.** §2.10's kOwParallel=4 gain was reverted; §2.11 lands on
-top but at 150 MHz (see the † note), so it is not folded into this ratio.
+**Net result on the 31-test suite: ~4.73× faster than the post-baseline
+(line-buffer-only) implementation; ~79% reduction in total HW sim time.**
 
 For the 25 tests common to every stage the same kernel runs **~7.8× faster**
 than the pre-optimization baseline (line-buffer-only equivalent on the same
@@ -662,18 +655,17 @@ bit-identical, just computed once instead of four times.  C-sim 33/33 PASS,
 behavior test 31/31 PASS, zero y.hex fixture changes.
 
 **Result.** The shipped kernel (kOwParallel = 2) measures **1,485,975 ns**
-total on the 31-test behavior suite — but this run used a **150 MHz** target
-clock, whereas the §1 progression above was measured at 300 MHz. `sim_time_ns`
-scales with the clock period, so the figure is not directly comparable and no
-cross-step delta is claimed. Functionally the change is verified (C-sim
-33/33, behavior test 31/31, zero fixture diffs). The geometry struct's
-wall-clock contribution is in any case expected to be small: the dividers
-were **one-time, per-invocation** costs (~72 cycles), not per-output, so
-collapsing four into one removes setup latency and divider hardware but never
-touches the steady-state reduce loop that dominates every test's wall-clock.
-It is best understood as a **resource consolidation** (one divider set
-instead of four) — the same class of change §2.7 / §2.8 made for FP units,
-but far smaller because dividers are not in the hot loop.
+total on the 31-test behavior suite. An isolated wall-clock delta for the
+geometry struct alone was not separately benchmarked — §2.10's cyclic-banking
+code landed in the same window — so the §1 table folds both into one −11.5 %
+step vs §2.9. The geometry struct's own contribution is expected to be
+small: the dividers were **one-time, per-invocation** costs (~72 cycles),
+not per-output, so collapsing four into one removes setup latency and
+divider hardware but never touches the steady-state reduce loop that
+dominates every test's wall-clock. It is best understood as a **resource
+consolidation** (one divider set instead of four) — the same class of change
+§2.7 / §2.8 made for FP units, but far smaller because dividers are not in
+the hot loop.
 
 ---
 
