@@ -282,8 +282,8 @@ marker so host parsers can pick them out of mixed output.
 ```
 LAYERS_JSON: {"layers":[
   {"i":0,"name":"Convolution28","calls":10000,
-   "mean_us":6071.75,"min_us":6069.16,"max_us":6156.23,
-   "total_us":60717500.00},
+   "mean_us":2761.26,"min_us":2757.32,"max_us":2792.04,
+   "total_us":27612600.00},
   …
 ]}
 ```
@@ -395,15 +395,20 @@ overrides `cfg.run.profile_layers` to true for that run.
 Per-model summary printed to stderr:
 
 ```
-accuracy = 98.92%   mean = 21.290 ms   throughput = 47.0 img/s
+accuracy = 98.92%   mean = 4.548 ms   throughput = 219.9 img/s
 per-layer (top 5 by mean):
-  [  3] Convolution110            calls=10000  mean= 14037.12us  …
-  …
-ddr (zuplus_apm @0xfd490000): total read=0.07 GB/s (13.81 GiB)  …
+  [  0] Convolution28                    calls=10000  mean=  2761.26us  min=  2757.32us  max=  2792.04us
+  [  3] Convolution110                   calls=10000  mean=  1338.04us  min=  1335.66us  max=  1372.06us
+  [  2] Pooling66                        calls=10000  mean=   138.45us  min=   137.29us  max=   173.16us
+  [  7] _gemm_matmul_1                   calls=10000  mean=   110.99us  min=   110.70us  max=   159.80us
+  [  5] Pooling160                       calls=10000  mean=    84.63us  min=    84.00us  max=   119.72us
+ddr (zuplus_apm @0xfd490000): total read=0.07 GB/s (2.94 GiB)  write=0.00 GB/s (7.8 MiB)  over 45.5s
   per-slot:
-    slot 0: read=0.07 GB/s (13.81 GiB)  write=0.00 GB/s (15.9 MiB)
+    slot 0: read=0.07 GB/s (2.94 GiB)  write=0.00 GB/s (7.8 MiB)
     slot 1: idle
-    …
+    slot 2: idle
+    slot 3: idle
+    slot 4: idle
 ```
 
 Full per-layer and per-slot data is also written to
