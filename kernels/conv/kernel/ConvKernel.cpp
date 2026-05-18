@@ -59,6 +59,7 @@
 
 #include <algorithm>
 #include "hls_stream.h"
+#include "hls_task.h"
 
 #include "ConvKernel.h"
 
@@ -684,7 +685,10 @@ static void input_patch_producer(
                             const unsigned col_slot = iw_ok
                                 ? ((unsigned)iw & (kMaxLineBufCols - 1))
                                 : 0u;
+
                             PatchVec v;
+                            #pragma HLS aggregate variable=v compact=byte
+
                             for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                                 #pragma HLS UNROLL
                                 const bool ch_ok = (ic_l < ch_valid);
@@ -1008,6 +1012,7 @@ static void process_conv_kernel_tile(
                             for (unsigned kwi = 0; kwi < kw; kwi++) {
                                 #pragma HLS PIPELINE II=1
                                 const PatchVec v = patch_stream.read();
+
                                 for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                                     #pragma HLS UNROLL
                                     patch[ic_l][khi][kwi] = v.lane[ic_l];
@@ -1195,11 +1200,22 @@ void ConvKernel(
     //   m_axi_max_widen_bitwidth is set globally in scripts/Synthesis.tcl.in
     //   via AXI_BUS_WIDTH (lets users dial it back to match a 128-bit block
     //   design); not duplicated per-port so the global stays authoritative.
+    //
+    //   depth=<N> is a C/RTL co-simulation hint only — it sizes the
+    //   verification adapter FIFO cosim builds for each m_axi port.  It does
+    //   NOT constrain the synthesised AXI master (runtime addresses) or the
+    //   exported IP.  The CONV_COSIM_DEPTH_* macros (ConvKernel.h) are the
+    //   single source of truth shared with the test/TestConvSim.cpp cosim
+    //   buffers.  (UG1399 documents an argument-expression form,
+    //   depth=batch*in_ch*in_h*in_w, but it triggered an HLS 200-1715
+    //   source-synthesis error here, so constants are used.)  cosim of an
+    //   m_axi kernel aborts without depth ("a depth specification is
+    //   required for interface port 'x'").
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 
-    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 
-    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 
-    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 
+    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X
+    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT
+    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS
+    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y
 
     #pragma HLS INTERFACE s_axilite port=x            bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=weight       bundle=ctrl
@@ -1280,7 +1296,7 @@ void ConvKernel(
     const ConvGeometry geom = compute_conv_geometry(
         out_h, out_w, out_ch, kw, stride_w, dilation_w);
 
-    hls::stream<AccData_t> bias_stream;
+    hls_thread_local hls::stream<AccData_t> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
     // patch_stream carries the producer's channel-packed PatchVec
@@ -1288,14 +1304,14 @@ void ConvKernel(
     // §2.15).  Each beat is one kTileIC-lane column; depth is one
     // kernel window's worth of beats (kMaxKH*kMaxKW) so the consumer
     // drains it as the assembler fills it under DATAFLOW.
-    hls::stream<PatchVec> patch_stream;
+    hls_thread_local hls::stream<PatchVec> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
 
     // acc_stream carries already-saturated Data_t — process_conv_kernel_tile
     // applies saturate_cast in its Phase-3 drain, so this inter-stage FIFO
     // is Data_t-wide (not AccData_t-wide) and write_output_tile is a plain
     // stream→DDR copy.
-    hls::stream<Data_t> acc_stream;
+    hls_thread_local hls::stream<Data_t> acc_stream;
     #pragma HLS STREAM variable=acc_stream depth=kTileM
 
     // weight_stream carries one Data_t per cycle from stream_load_weights
@@ -1303,7 +1319,7 @@ void ConvKernel(
     // kTileIC * kMaxKH * kMaxKW = 6272 at defaults) so the producer can
     // pre-fetch the next iteration's weight slice while the consumer is
     // still in accumulate — full producer/consumer overlap.
-    hls::stream<Data_t> weight_stream;
+    hls_thread_local hls::stream<Data_t> weight_stream;
     #pragma HLS STREAM variable=weight_stream depth=kTileM*kTileIC*kMaxKH*kMaxKW
 
     bias_producer(bias, bias_stream,

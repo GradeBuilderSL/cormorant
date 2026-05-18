@@ -282,5 +282,44 @@ if(CONV_VITIS_HLS)
 
         message(STATUS "ConvKernel: synthesis target 'synthesize_${_pname}' "
                        "(${_p_part} @ ${_p_clock} MHz)")
+
+        # -------------------------------------------------------------------
+        # cosim_conv_<name> — C synthesis + RTL co-simulation in ONE run.
+        #
+        # csynth_design and cosim_design are sequenced in a single TCL (see
+        # Cosim.tcl.in), so one vitis-run invocation produces a component
+        # whose run summary covers both — `vitis -a <component>` then shows
+        # the cosim report (measured latency/II + actual hls::stream FIFO
+        # depths from -enable_dataflow_profiling) alongside synthesis.
+        #
+        # Separate component (conv_<name>_cosim) so it never clobbers the
+        # synthesize target's conv_<name> component / exported IP.  cosim
+        # RTL-simulates the whole TestConvSim.cpp test bench, so this target
+        # is slow (minutes) and is intentionally NOT a dependency of anything.
+        # -------------------------------------------------------------------
+        set(CONV_COSIM_COMPONENT "conv_${_pname}_cosim")
+        set(CONV_TB_SYNTHESIS    "${CMAKE_CURRENT_SOURCE_DIR}/test/TestConvSim.cpp")
+
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Cosim.tcl.in"
+            "${_p_build_dir}/cosim_${_pname}.tcl"
+            @ONLY)
+
+        add_custom_target(
+            "cosim_conv_${_pname}"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                    "${_p_build_dir}/${CONV_COSIM_COMPONENT}"
+            COMMAND ${CONV_VITIS_HLS} ${CONV_HLS_TCL_FLAG}
+                    "${_p_build_dir}/cosim_${_pname}.tcl"
+            WORKING_DIRECTORY "${_p_build_dir}"
+            COMMENT "HLS synth + cosim: ConvKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
+            DEPENDS
+                "${CONV_KERNEL_SRC}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include/ConvKernel.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/TestConvSim.cpp"
+                "${_p_build_dir}/Config.h")
+
+        message(STATUS "ConvKernel: cosim target 'cosim_conv_${_pname}' "
+                       "(${_p_part} @ ${_p_clock} MHz)")
     endforeach()
 endif()

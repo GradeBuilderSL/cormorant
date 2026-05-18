@@ -1,6 +1,11 @@
 // ---------------------------------------------------------------------------
 // TestConvSim.cpp — reference tests for ConvKernel.
 //
+// This single bench serves BOTH verification flows:
+//   * plain C simulation  — the CMake TestConvRef target (host compiler);
+//   * C/RTL co-simulation — the cosim_conv_<platform> target, which compiles
+//     this file with -DCONV_COSIM (set by scripts/Cosim.tcl.in).
+//
 // Each test computes the same convolution with two independent implementations:
 //
 //   ref_conv()          — naive 7-nested-loop ground-truth oracle.
@@ -10,6 +15,12 @@
 // Outputs are compared element-by-element with zero tolerance for fixed-point
 // types (both share the same accumulator type and saturation policy), and
 // relative 1e-5 tolerance for float.
+//
+// cosim note: cosim of an m_axi kernel needs every pointer argument backed by
+// a fixed allocation at least as large as the kernel's depth= hint, so under
+// -DCONV_COSIM run_test() copies each case into the CONV_COSIM_DEPTH_*-sized
+// globals below.  Cases whose tensors exceed those bounds are skipped — cosim
+// is full RTL simulation, so large convs are left to plain C-sim.
 //
 // Test matrix (standard conv):
 //   1×1 kernel, 3×3 various pads/strides, 5×5 kernel, large spatial,
@@ -200,6 +211,23 @@ struct ConvParams {
 };
 
 // ---------------------------------------------------------------------------
+// cosim m_axi buffers (only the cosim build, -DCONV_COSIM).
+//
+// Every pointer handed to ConvKernel must be a fixed allocation >= the
+// kernel's m_axi depth= hint, or cosim's wrapc adapter reads past the buffer
+// and SIGSEGVs.  std::vector sized to the exact tensor is fine for plain
+// C-sim but not for cosim, so run_test() copies each case into these globals.
+// Sizes come from the CONV_COSIM_DEPTH_* macros in ConvKernel.h — the same
+// single source of truth that feeds the depth= hints on ConvKernel.cpp.
+// ---------------------------------------------------------------------------
+#ifdef CONV_COSIM
+static Data_t g_x[CONV_COSIM_DEPTH_X];
+static Data_t g_w[CONV_COSIM_DEPTH_WEIGHT];
+static Data_t g_b[CONV_COSIM_DEPTH_BIAS];
+static Data_t g_y[CONV_COSIM_DEPTH_Y];
+#endif
+
+// ---------------------------------------------------------------------------
 // Dump-mode helpers (only meaningful for fixed-point builds — the HDL
 // testbench reads 16-bit hex values one per line).
 // ---------------------------------------------------------------------------
@@ -330,7 +358,6 @@ static int run_test(const char* name, const ConvParams& p,
 
     const unsigned y_size = p.batch * p.out_ch * out_h * out_w;
     std::vector<Data_t> y_ref(y_size, Data_t(0));
-    std::vector<Data_t> y_got(y_size, Data_t(0));
 
     if (p.is_depthwise) {
         ref_depthwise_conv(x_data.data(), w_data.data(),
@@ -356,9 +383,36 @@ static int run_test(const char* name, const ConvParams& p,
                  p.has_bias ? 1u : 0u);
     }
 
-    ConvKernel(x_data.data(), w_data.data(),
-               b_data.data(),  // always a valid pointer (kernel guards by has_bias)
-               y_got.data(),
+    // -----------------------------------------------------------------------
+    // Pick the buffers handed to ConvKernel.  cosim needs fixed allocations
+    // >= the kernel's m_axi depth (the g_* globals); plain C-sim passes the
+    // per-test std::vector storage directly.  b_ptr is always a valid pointer
+    // (the kernel guards bias reads by has_bias).
+    // -----------------------------------------------------------------------
+#ifdef CONV_COSIM
+    if (x_data.size() > CONV_COSIM_DEPTH_X ||
+        w_data.size() > CONV_COSIM_DEPTH_WEIGHT ||
+        b_data.size() > CONV_COSIM_DEPTH_BIAS ||
+        y_size        > CONV_COSIM_DEPTH_Y) {
+        printf("%-55s SKIP (exceeds cosim buffers)\n", name);
+        return 0;
+    }
+    std::copy(x_data.begin(), x_data.end(), g_x);
+    std::copy(w_data.begin(), w_data.end(), g_w);
+    std::copy(b_data.begin(), b_data.end(), g_b);
+    const Data_t* x_ptr = g_x;
+    const Data_t* w_ptr = g_w;
+    const Data_t* b_ptr = g_b;
+    Data_t*       y_ptr = g_y;
+#else
+    std::vector<Data_t> y_got(y_size, Data_t(0));
+    const Data_t* x_ptr = x_data.data();
+    const Data_t* w_ptr = w_data.data();
+    const Data_t* b_ptr = b_data.data();
+    Data_t*       y_ptr = y_got.data();
+#endif
+
+    ConvKernel(x_ptr, w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
                p.kh, p.kw,
@@ -371,7 +425,7 @@ static int run_test(const char* name, const ConvParams& p,
     int mismatches = 0;
     for (unsigned i = 0; i < y_size; i++) {
         const double r = static_cast<double>(y_ref[i]);
-        const double g = static_cast<double>(y_got[i]);
+        const double g = static_cast<double>(y_ptr[i]);
         if (!vals_close(r, g)) {
             if (mismatches < 5) {
                 printf("  [%u] ref=%.6f got=%.6f\n", i, r, g);
