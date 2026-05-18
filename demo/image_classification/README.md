@@ -107,19 +107,16 @@ Sample output:
 ```
   ── IMAGE CLASSIFICATION KV260 ──
 
-  cat.jpg                                   (212.4 ms)
-    1) [ 282] tabby                            prob= 78.41%  logit=  3120
-    2) [ 285] Egyptian_cat                     prob= 12.06%  logit=  2641
-    3) [ 283] tiger_cat                        prob=  4.97%  logit=  2413
-    4) [ 287] lynx                             prob=  1.21%  logit=  2052
-    5) [ 284] Persian_cat                      prob=  0.83%  logit=  1956
-  dog.jpg                                   (211.8 ms)
-    1) [ 208] golden_retriever                 prob= 64.30%  logit=  2987
-    ...
+  image: greyfox-672194.JPEG  latency=2463.174 ms
+    1) [ 281] grey_fox                          prob= 69.06%  logit=  3034
+    2) [ 278] red_fox                           prob=  4.96%  logit=  2360
+    3) [ 264] Pembroke                          prob=  2.83%  logit=  2216
+    4) [ 272] red_wolf                          prob=  2.32%  logit=  2165
+    5) [ 279] kit_fox                           prob=  2.15%  logit=  2146
 
-  Model        Status   Images   mean(ms)   p50(ms)   p99(ms)        IPS
+  Model         Status   Images   mean(ms)    p50(ms)    p99(ms)        IPS
   ─────────────────────────────────────────────────────────────────────────
-  mobilenet_v1  OK         12     211.6     211.5     213.0       4.7
+  mobilenet_v1  OK           1   2463.174   2463.174   2463.174        0.4
 ```
 
 The full per-image top-K table is also written to `build/results.json`.
