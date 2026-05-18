@@ -1,7 +1,5 @@
 """Tests for setup script generation (TestSetupScript)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist
@@ -26,7 +24,6 @@ class TestSetupScript(unittest.TestCase):
         self.assertIn("xrt", s)
 
     def test_pool_size_in_script(self):
-        import re
         from src.graph import OnnxGraph as G
         from src.codegen import CodeGenerator as CG
         g  = G(_model("single_add.onnx"))

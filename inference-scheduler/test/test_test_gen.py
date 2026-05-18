@@ -1,7 +1,5 @@
 """Tests for test/test_inference.c generation (TestTestGen)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

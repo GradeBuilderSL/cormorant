@@ -1,7 +1,5 @@
 """Tests for residual connection model handling (TestResidualModels)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

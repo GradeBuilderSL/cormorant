@@ -38,17 +38,15 @@ registers; inference_buf_ptr() returns the virtual pointer for CPU access.
 """
 
 from __future__ import annotations
-import os
 from typing import List, Optional
 
 from ..graph   import OnnxGraph
 from ..nodes    import ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SchedulerError
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
-from ..tensor  import TensorInfo, LARGE_WEIGHT_THRESHOLD
+from ..tensor  import TensorInfo
 from ..dtype   import DataType, AP_FIXED_16_8
 from ..layout  import TensorLayout
-from ._banners import _file_banner
 
 
 class _CoreMixin:
@@ -118,15 +116,16 @@ class _CoreMixin:
                 continue
 
             n      = sn.outer_count          # number of loop iterations
-            chunk  = sn.chunk_size           # data elements per iteration
-            stride = sn.aligned_chunk_size   # buffer elements per iteration (>= chunk)
+            stride = sn.aligned_chunk_size   # buffer elements per iteration (>= chunk_size)
             alloc  = n * stride
 
-            def _should_update_advancing(cur: TensorLayout) -> bool:
+            def _should_update_advancing(cur: TensorLayout, alloc=alloc) -> bool:
                 # Update if switching from flat to advancing (n_chunks==1 → >1),
                 # or if a later broadcast node needs a larger allocation.
-                # When stride == chunk (no gap), alloc == numel so the pure-alloc
-                # comparison would wrongly skip the flat→advancing transition.
+                # When stride == chunk_size (no gap), alloc == numel so the
+                # pure-alloc comparison would wrongly skip the flat→advancing
+                # transition.  `alloc` is captured as a default arg so the
+                # closure binds the loop iteration's value (B023-safe).
                 return cur.n_chunks == 1 or alloc > cur.alloc
 
             # Output: advancing-strided.
@@ -174,17 +173,17 @@ class _CoreMixin:
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
-            max_input_alloc = max(l.alloc for l in input_layouts)
+            max_input_alloc = max(lay.alloc for lay in input_layouts)
 
             out_name = sn.output.onnx_name
             out_lay  = layouts[out_name]
 
             # Find the dominant strided input (highest alloc with n_chunks > 1).
             dominant = None
-            for l in input_layouts:
-                if l.n_chunks > 1:
-                    if dominant is None or l.alloc > dominant.alloc:
-                        dominant = l
+            for lay in input_layouts:
+                if lay.n_chunks > 1:
+                    if dominant is None or lay.alloc > dominant.alloc:
+                        dominant = lay
 
             # Update output layout if any input has a larger alloc.
             if max_input_alloc > out_lay.alloc:
@@ -533,7 +532,7 @@ class _CoreMixin:
             if not placed:
                 slots.append([end, align_up(a), [name]])
 
-        for slot_end, slot_alloc, names in slots:
+        for _slot_end, slot_alloc, names in slots:
             for name in names:
                 layout.append((name, offset, alloc_sizes[name]))
             offset += slot_alloc
@@ -735,7 +734,7 @@ class _CoreMixin:
 
         return [
             (f"{n}_{sn.index}" if counts[n] > 1 else n)
-            for sn, n in zip(nodes, candidates)
+            for sn, n in zip(nodes, candidates, strict=True)
         ]
 
     @property

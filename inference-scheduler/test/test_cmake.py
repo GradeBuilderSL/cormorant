@@ -1,7 +1,5 @@
 """Tests for CMakeLists.txt generation (TestCMakeGen)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

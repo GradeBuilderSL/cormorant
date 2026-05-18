@@ -97,7 +97,6 @@ class TestLargeWeightDat(unittest.TestCase):
 
     # CLI: weights/ directory written for large-weight models
     def test_cli_writes_dat_file(self):
-        import subprocess, sys
         with tempfile.TemporaryDirectory() as td:
             subprocess.run(
                 [sys.executable,
@@ -110,7 +109,6 @@ class TestLargeWeightDat(unittest.TestCase):
             self.assertEqual(os.path.getsize(dat), 1048576 * 2)
 
     def test_cli_no_weights_dir_for_small_model(self):
-        import subprocess, sys
         with tempfile.TemporaryDirectory() as td:
             subprocess.run(
                 [sys.executable,
@@ -137,7 +135,6 @@ class TestLargeWeightDat(unittest.TestCase):
         self.assertNotIn("#include <stdio.h>", cg.generate_source())
 
     def test_cli_embed_flag_no_dat_file(self):
-        import subprocess, sys
         with tempfile.TemporaryDirectory() as td:
             subprocess.run(
                 [sys.executable,
@@ -149,7 +146,6 @@ class TestLargeWeightDat(unittest.TestCase):
             self.assertFalse(os.path.isdir(os.path.join(td, "weights")))
 
     def test_cli_embed_flag_rom_array_in_source(self):
-        import subprocess, sys
         with tempfile.TemporaryDirectory() as td:
             subprocess.run(
                 [sys.executable,

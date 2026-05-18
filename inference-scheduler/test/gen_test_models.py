@@ -43,7 +43,6 @@ Run from the inference-scheduler directory:
 
 import argparse
 import os
-import sys
 import numpy as np
 import onnx
 import onnx.helper as oh

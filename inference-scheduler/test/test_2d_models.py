@@ -1,7 +1,5 @@
 """Tests for 2D tensor model handling (TestTwoDimModels)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist
@@ -44,7 +42,7 @@ class TestTwoDimModels(unittest.TestCase):
     def test_batch_relu_size_macro(self):
         _, cg = self._gen("batch_relu.onnx")
         h = cg.generate_header()
-        self.assertIn(f"INFERENCE_X_SIZE", h)
+        self.assertIn("INFERENCE_X_SIZE", h)
         self.assertIn(str(4 * 64), h)
 
     def test_matrix_ops_size_macros(self):

@@ -1,7 +1,5 @@
 """Tests for ONNX graph parsing (TestGraphParsing)."""
 
-import os
-import sys
 import unittest
 
 from helpers import _model, _models_exist

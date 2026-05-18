@@ -938,7 +938,6 @@ class TestSkipConnection(unittest.TestCase):
 
     def test_x_is_both_matmul_input_and_add_input(self):
         """X participates in MatMul (operand A) and in Add (skip path)."""
-        from src.nodes import MatmulNode, ScheduledNode
         mm  = self.graph.nodes[0]
         add = self.graph.nodes[2]
         self.assertEqual(mm.inputs[0].onnx_name, "X")
@@ -948,7 +947,6 @@ class TestSkipConnection(unittest.TestCase):
     # ---- MatmulNode geometry ----
 
     def test_matmul_dims(self):
-        from src.nodes import MatmulNode
         mm = self.graph.nodes[0]
         self.assertEqual(mm.n, 4)
         self.assertEqual(mm.k, 8)
@@ -1041,7 +1039,8 @@ class TestSkipConnection(unittest.TestCase):
         """When W=0, Relu(X@0)=0 and Y=X+0=X: output equals input."""
         from src.graph   import OnnxGraph
         from src.codegen import CodeGenerator
-        import onnx, numpy as np
+        import onnx
+        import numpy as np
         from onnx import helper, TensorProto, numpy_helper
 
         w_zero = numpy_helper.from_array(
@@ -1058,7 +1057,8 @@ class TestSkipConnection(unittest.TestCase):
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
 
-        import tempfile, os
+        import tempfile
+        import os
         with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
             onnx.save(model, f.name)
             tmp = f.name

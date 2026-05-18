@@ -1,7 +1,6 @@
 """Generate ONNX test models that use PoolingKernel nodes."""
 
 import os
-import numpy as np
 import onnx
 from onnx import helper, TensorProto
 

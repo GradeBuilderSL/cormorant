@@ -28,11 +28,11 @@ from typing import Union
 from .tensor import TensorInfo
 from .nodes  import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
                      POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
+from .dtype  import DataType, AP_FIXED_16_8
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm"} | POOL_OP_TYPES | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES
 )
-from .dtype  import DataType, AP_FIXED_16_8
 
 
 # ------------------------------------------------------------------ #

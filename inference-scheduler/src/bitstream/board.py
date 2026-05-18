@@ -211,9 +211,9 @@ def check_board(session: RemoteSession) -> bool:
         (f"[ -f {_FPGA_FIRMWARE} ] && echo ok || echo missing",    "fpga_manager firmware"),
         (f"[ -d {_OVERLAYS_DIR} ] && echo ok || echo missing",     "configfs overlays dir"),
         (f"[ -d {_FIRMWARE_DIR} ] && echo ok || echo missing",     "/lib/firmware dir"),
-        (f"[ -c /dev/mem ] && echo ok || echo missing",            "/dev/mem (AFIFM RMW)"),
-        (f"[ \"$(id -u)\" = '0' ] && echo 'root' || "
-         f"sudo -n true 2>/dev/null && echo 'passwordless sudo' || echo '__MISSING__'",
+        ("[ -c /dev/mem ] && echo ok || echo missing",            "/dev/mem (AFIFM RMW)"),
+        ("[ \"$(id -u)\" = '0' ] && echo 'root' || "
+         "sudo -n true 2>/dev/null && echo 'passwordless sudo' || echo '__MISSING__'",
          "root / sudo access"),
     ]
     all_ok = True

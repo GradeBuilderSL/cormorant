@@ -1,7 +1,5 @@
 """Tests for ap_fixed<16,8> weight encoding via DataType abstraction."""
 
-import os
-import sys
 import unittest
 import numpy as np
 

@@ -201,7 +201,7 @@ class TestLiveIntervals(unittest.TestCase):
             cg = _cg(m)
             bpe = cg._dtype.bytes_per_elem
             align_to = 64 // bpe
-            def align_up(n):
+            def align_up(n, align_to=align_to):
                 return (n + align_to - 1) & ~(align_to - 1)
             layout, _ = cg._compute_pool_layout()
             # Group by offset

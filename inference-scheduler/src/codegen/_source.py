@@ -3,9 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes    import OP_NAMES, _ALIGN_BYTES, MatmulNode, ScheduledNode, ConvNode, PoolNode, ReshapeNode
-from ..schedule import Dag
-from ..tensor   import LARGE_WEIGHT_THRESHOLD
+from ..nodes    import OP_NAMES, MatmulNode, ScheduledNode
 from ._banners  import _banner, _file_banner
 
 
@@ -204,11 +202,16 @@ class _SourceMixin:
         out = []
         for ch in s:
             o = ord(ch)
-            if ch == '\\':   out.append('\\\\')
-            elif ch == '"':  out.append('\\"')
-            elif ch == '\n': out.append('\\n')
-            elif ch == '\r': out.append('\\r')
-            elif ch == '\t': out.append('\\t')
+            if ch == '\\':
+                out.append('\\\\')
+            elif ch == '"':
+                out.append('\\"')
+            elif ch == '\n':
+                out.append('\\n')
+            elif ch == '\r':
+                out.append('\\r')
+            elif ch == '\t':
+                out.append('\\t')
             elif o < 0x20 or o == 0x7f:
                 out.append(f"\\x{o:02x}")
             else:
@@ -254,7 +257,6 @@ class _SourceMixin:
         nodes          = self._graph.nodes
         # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
         need_run_op    = any(isinstance(sn, ScheduledNode) for sn in nodes)
-        need_run_op_at = False
         need_run_matmul = self._has_matmul_nodes
         need_run_matmul_at = any(
             isinstance(sn, MatmulNode) and sn.outer_count > 1
@@ -927,7 +929,7 @@ class _SourceMixin:
             out_c = out_t.c_name
             alias_redirect_lines += [
                 f"    /* '{out_t.onnx_name}' is a terminal reshape alias — redirect the",
-                f"     * kernel output chain to write directly into the caller's buffer. */",
+                "     * kernel output chain to write directly into the caller's buffer. */",
                 f"    inference_buf_retain({out_c});",
             ]
             for c in chain:
