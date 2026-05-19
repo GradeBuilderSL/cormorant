@@ -220,8 +220,8 @@ endif()
 # needs that exact directory; passing a parent does NOT work.  The path
 # depends on the HLS flow: the legacy open_project/open_solution flow puts
 # it under <hls_project>/solution1/impl/ip/, while the Vitis unified
-# component flow (used by conv and pool since the open_component switch)
-# puts it under <hls_project>/hls/impl/ip/.  The per-kernel IP subpath is
+# component flow (used by conv, pool and matmul since the open_component
+# switch) puts it under <hls_project>/hls/impl/ip/.  The per-kernel IP subpath is
 # therefore the 5th column of _BEHAVIOR_TESTS below.
 # ---------------------------------------------------------------------------
 set(_TS_REPO "${CMAKE_SOURCE_DIR}/hw/cormorant_test_stand")
@@ -232,7 +232,7 @@ if(EXISTS "${_TS_REPO}/Makefile")
     set(_BEHAVIOR_TESTS
         "conv|conv|conv_kv260|conv_test_data|hls/impl/ip"
         "pool|pooling|pool_kv260|pool_test_data|hls/impl/ip"
-        "matmul|matmul_op|matmul_kv260|matmul_test_data|solution1/impl/ip"
+        "matmul|matmul_op|matmul_kv260|matmul_test_data|hls/impl/ip"
         "vectorop|vector_op|vadd_kv260|vecop_test_data|solution1/impl/ip"
     )
 

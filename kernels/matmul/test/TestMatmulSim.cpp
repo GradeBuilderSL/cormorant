@@ -230,6 +230,53 @@ static bool compare_outputs(
 }
 
 // ---------------------------------------------------------------------------
+// invoke_matmul — call MatmulKernel, routing through the cosim fixed buffers.
+//
+// Plain C-sim passes the per-test std::vector storage straight to the kernel.
+// The cosim build (-DMATMUL_COSIM, set by scripts/Cosim.tcl.in) instead copies
+// each case into the fixed MATMUL_COSIM_DEPTH_*-sized globals: cosim's wrapc
+// adapter sizes its RTL memory model from the kernel's m_axi depth= hint and
+// transfers the whole buffer, so a smaller per-test allocation would be read
+// past its end.  Cases whose matrices exceed the cosim buffers are skipped and
+// left to plain C-sim.
+//
+// Returns true if the kernel ran (caller then compares C_got); false if the
+// case was skipped (the caller should report it as a pass).
+// ---------------------------------------------------------------------------
+#ifdef MATMUL_COSIM
+static Data_t g_a[MATMUL_COSIM_DEPTH_A];
+static Data_t g_b[MATMUL_COSIM_DEPTH_B];
+static Data_t g_c[MATMUL_COSIM_DEPTH_C];
+#endif
+
+static bool invoke_matmul(const char* label,
+                          const std::vector<Data_t>& A,
+                          const std::vector<Data_t>& B,
+                          std::vector<Data_t>&       C_got,
+                          unsigned n, unsigned k, unsigned m, unsigned batch,
+                          unsigned a_stride, unsigned b_stride,
+                          unsigned c_stride)
+{
+    (void)label;  // used only by the MATMUL_COSIM skip message below
+#ifdef MATMUL_COSIM
+    if (A.size() > MATMUL_COSIM_DEPTH_A ||
+        B.size() > MATMUL_COSIM_DEPTH_B ||
+        C_got.size() > MATMUL_COSIM_DEPTH_C) {
+        printf("  SKIP  %s  (exceeds cosim buffers)\n", label);
+        return false;
+    }
+    std::copy(A.begin(), A.end(), g_a);
+    std::copy(B.begin(), B.end(), g_b);
+    MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride);
+    std::copy(g_c, g_c + C_got.size(), C_got.begin());
+#else
+    MatmulKernel(A.data(), B.data(), C_got.data(),
+                 n, k, m, batch, a_stride, b_stride, c_stride);
+#endif
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // RunTest2D — fill A, B with deterministic random values, compare ref vs kernel.
 //
 // Inputs are drawn from [-1, 1] to keep accumulator sums well within
@@ -256,10 +303,11 @@ static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
         return true;
     }
 
-    MatmulKernel    (A.data(), B.data(), C_got.data(),
-                     n, k, m,
-                     /*batch=*/1,
-                     /*a_stride=*/n * k, /*b_stride=*/k * m, /*c_stride=*/n * m);
+    if (!invoke_matmul(label, A, B, C_got,
+                       n, k, m, /*batch=*/1,
+                       /*a_stride=*/n * k, /*b_stride=*/k * m,
+                       /*c_stride=*/n * m))
+        return true;  // skipped — case exceeds the cosim buffers
 
     return compare_outputs(C_ref.data(), C_got.data(), n * m, label);
 }
@@ -295,8 +343,9 @@ static bool RunTestBatch(const char* label,
         return true;
     }
 
-    MatmulKernel    (A.data(), B.data(), C_got.data(),
-                     n, k, m, batch, a_stride, b_stride, c_stride);
+    if (!invoke_matmul(label, A, B, C_got,
+                       n, k, m, batch, a_stride, b_stride, c_stride))
+        return true;  // skipped — case exceeds the cosim buffers
 
     return compare_outputs(C_ref.data(), C_got.data(), batch * c_stride, label);
 }
@@ -330,11 +379,11 @@ static bool RunTestSaturation(const char* label,
         return true;
     }
 
-    MatmulKernel (A.data(), B.data(), C_got.data(),
-                  N, k_sat, M,
-                  /*batch=*/1,
-                  /*a_stride=*/N * k_sat, /*b_stride=*/k_sat * M,
-                  /*c_stride=*/N * M);
+    if (!invoke_matmul(label, A, B, C_got,
+                       N, k_sat, M, /*batch=*/1,
+                       /*a_stride=*/N * k_sat, /*b_stride=*/k_sat * M,
+                       /*c_stride=*/N * M))
+        return true;  // skipped — case exceeds the cosim buffers
 
     bool ok = compare_outputs(C_ref.data(), C_got.data(), N * M, label);
 
