@@ -84,7 +84,7 @@
     "poll_interval_ms": 40,
     "_poll_interval_ms_note": "How often the host SFTP-pulls the latest annotated frame.",
     "jpeg_quality": 80,
-    "window_title": "KV260 Camera Classification",
+    "window_title": "Cormorant Camera Demo",
     "save_only": false,
     "_save_only_note": "true on a headless host: save streamed frames to build/stream/ instead of opening a window."
   },

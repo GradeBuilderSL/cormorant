@@ -262,7 +262,7 @@ def run_camera_demo(session: RemoteSession, cfg: dict, project: dict,
 
     disp        = cfg.get("display", {})
     poll_ms     = int(disp.get("poll_interval_ms", 40))
-    window      = disp.get("window_title", "KV260 Camera Classification")
+    window      = disp.get("window_title", "Cormorant Camera Demo")
     duration_s  = float(cfg["run"].get("duration_s", 0.0))
 
     cv2 = None

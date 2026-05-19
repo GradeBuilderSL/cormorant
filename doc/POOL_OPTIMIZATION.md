@@ -30,7 +30,8 @@ after running the full TestPoolingSim case list.
 | + poly_sqrt (drop FP sqrtf unit on LP-2 path) | 31 | 2,856,995 | -16.4% | -59.3% |
 | + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
 | + kOwParallel=2 reduce (process 2 adjacent ow's per cycle) | 31 | 1,679,945 | -24.1% | -76.1% |
-| **+ Cyclic line_buf banking + shared tile geometry** | **31** | **1,485,975** | **-11.5%** | **-78.8%** |
+| + Cyclic line_buf banking + shared tile geometry | 31 | 1,485,975 | -11.5% | -78.8% |
+| **+ Closed-form valid_count (window_emitter LUT −2.1k)** | **31** | **1,472,005** | **-0.9%** | **-79.0%** |
 
 > **kOwParallel — shipped value is 2.** §2.10 *evaluated* `kOwParallel = 4`
 > and measured 1,513,475 ns (−9.9 % from §2.9), but that value was reverted;
@@ -40,7 +41,7 @@ after running the full TestPoolingSim case list.
 > The `kOwParallel = 4` figure is kept in §2.10 for the record but is not
 > part of the shipped progression.
 
-**Net result on the 31-test suite: ~4.73× faster than the post-baseline
+**Net result on the 31-test suite: ~4.77× faster than the post-baseline
 (line-buffer-only) implementation; ~79% reduction in total HW sim time.**
 
 For the 25 tests common to every stage the same kernel runs **~7.8× faster**
@@ -237,7 +238,8 @@ fetches rows for oh = k+1.
 **Plus: unrolled valid_count.** The denominator counter (sequential
 `pool_h × pool_w` cycles per output) was replaced with a fully-unrolled
 `kMaxPoolH × kMaxPoolW` adder tree (~1 cycle on the 300 MHz clock).
-Lives in `window_emitter`.
+Lives in `window_emitter`.  (Later replaced by the separable closed form —
+see §2.12 — which keeps the ~1-cycle latency at a fraction of the LUT.)
 
 **Result.** **-3.1% sim_time_ns** (3,416,225 ns total). Pattern matches
 prediction exactly — savings concentrated on tests where Phase 1 was the
@@ -667,9 +669,56 @@ consolidation** (one divider set instead of four) — the same class of change
 §2.7 / §2.8 made for FP units, but far smaller because dividers are not in
 the hot loop.
 
+### 2.12. Closed-form valid_count — collapse the 98-lane bounds-count
+
+**Problem.** A synthesis-report audit (`csynth.rpt`) flagged `window_emitter`
+as the kernel's largest LUT consumer — 11,415 LUT, of which **7,873 LUT** was
+combinational "Expression" logic. The dominant term was the MultiDenom
+`valid_count`: §2.6 computed it as a fully-unrolled
+`kOwParallel × kMaxPoolH × kMaxPoolW` = 2 × 7 × 7 = **98-lane** bounds-check +
+popcount adder tree — 98 lanes, each doing two `int` range compares (on
+`ih_v` and `iw_v`) plus a conditional increment, all feeding one wide adder
+tree.
+
+**Change.** The count is **separable**. A window position `(khi, kwi)` is
+in-bounds iff its **row** is in-bounds *and* its **column** is — and the row
+test depends only on `khi`, the column test only on `kwi`. The in-bounds set
+is therefore the rectangle product `{valid khi} × {valid kwi}`, so
+
+```
+valid_count = num_valid_kh * num_valid_kw
+```
+
+`num_valid_kh` does not depend on the `ow` position, so it is counted once
+per ow-group; `num_valid_kw` is counted per `p`. The 98-lane count becomes
+`kMaxPoolH + kOwParallel × kMaxPoolW` = 7 + 2 × 7 = **21 lanes**, each lane a
+single 1-D range test (two compares), plus `kOwParallel` multiplies. No
+runtime divider is introduced — the per-axis counts are still tallied, not
+solved per-axis in closed form, so dilation needs no special handling.
+
+**Numerical correctness.** Exact — `|{valid khi}| × |{valid kwi}|` *is* the
+count of in-bounds `(khi, kwi)` pairs, with no approximation. C-sim 33/33
+PASS, behavior test 31/31 PASS, zero y.hex fixture diffs.
+
+**Result.** A **resource** optimisation:
+
+| Metric | before | after | Δ |
+|---|---:|---:|---:|
+| Kernel LUT | 31,854 | 29,713 | −2,141 (−6.7 %) |
+| Kernel FF | 16,765 | 16,568 | −197 |
+| `window_emitter` total LUT | 11,415 | 9,274 | −2,141 (−18.8 %) |
+| `window_emitter` Expression LUT | 7,873 | 5,780 | −2,093 (−26.6 %) |
+
+No new timing-violation rows, no II regressions, BRAM/DSP unchanged. The
+shorter combinational count also trims a little wall-clock — **−0.9 %
+sim_time_ns** (1,485,975 → 1,472,005), concentrated on the wide-W tests
+(AvgPool W=96 batch=2 −3.5 %). The remaining 5,780 LUT of `window_emitter`
+Expression is the per-`(khi, kwi)` window-gather index arithmetic, which this
+change does not touch.
+
 ---
 
-## 3. Current architecture (post-2.11)
+## 3. Current architecture (post-2.12)
 
 ```mermaid
 flowchart LR
@@ -701,7 +750,8 @@ flowchart LR
    each ow-group (size kOwParallel) emits one MultiWindow per (khi, kwi)
    gathering kOwParallel × kTileC pixels in parallel from the dual-port
    per-channel banks; emits one MultiDenom (kOwParallel valid_counts) per
-   group via a fully-unrolled adder tree.
+   group via the separable closed form `num_valid_kh × num_valid_kw`
+   (§2.12).
 3. **`process_pool_kernel_tile`** — owns `acc[kOwParallel][kTileC]`
    (both dims partitioned `complete dim=0`). Vectorized II=1 reduce on
    the MultiWindow stream — every cycle updates ALL kOwParallel × kTileC
@@ -1093,7 +1143,9 @@ kOwParallel (Global pool variants and `MaxPool 1x1 pool_full 5x5`,
 
 | File | What changed |
 |---|---|
-| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9); `cyclic factor=kOwParallel dim=3` partition on line_buf to support kOwParallel ≥ 4 reads/cycle (§2.10); `PoolGeometry` struct + `compute_pool_geometry()` — per-invocation tile geometry (`c_tiles` / `ow_tile` / `ow_tiles_w`) computed once and passed to all four stages, collapsing the per-stage `ow_tiles_w` divider (§2.11) |
+| `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9); `cyclic factor=kOwParallel dim=3` partition on line_buf to support kOwParallel ≥ 4 reads/cycle (§2.10); `PoolGeometry` struct + `compute_pool_geometry()` — per-invocation tile geometry (`c_tiles` / `ow_tile` / `ow_tiles_w`) computed once and passed to all four stages, collapsing the per-stage `ow_tiles_w` divider (§2.11); closed-form
+`valid_count` — separable `num_valid_kh × num_valid_kw` replacing the
+98-lane unrolled bounds-count (§2.12) |
 | `kernels/pool/include/Config.h.in` | Templates `kTileC`, `kMaxPoolH`, `kMaxPoolW`, `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` from CMake-side variables (sourced from the platform JSON, §4) |
 | `kernels/pool/CMakeLists.txt` | `pool_load_constants(platform_json prefix)` reads `kernels.pool.*` from `platforms/<AXI_PLATFORM>.json` via `string(JSON …)`; default-platform values drive C-sim Config.h, per-platform values drive per-platform synthesis Config.h's; `CMAKE_CONFIGURE_DEPENDS` on every platform JSON so edits auto-trigger reconfigure on next `make` |
 | `platforms/<name>.json` | Single source of truth for kernel-side bounds — `kernels.pool` object holds all six values (§4.1).  The C++ build and the Python validator both read from here. |
