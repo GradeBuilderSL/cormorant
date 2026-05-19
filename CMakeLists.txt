@@ -1,4 +1,17 @@
 cmake_minimum_required(VERSION 3.19)
+
+# ---------------------------------------------------------------------------
+# Reject in-source builds.  Configuring in the source tree scatters
+# CMakeCache.txt / CMakeFiles / generated Config.h etc. across the repo, and a
+# later `cmake <path>` silently re-targets that stale cache instead of the
+# intended build directory.  Always configure into a separate build/ dir.
+# ---------------------------------------------------------------------------
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR
+        "In-source builds are not allowed. Run cmake from a separate build "
+        "directory, e.g.:\n  mkdir build && cd build && cmake ..")
+endif()
+
 project(axi_kernels)
 
 # ---------------------------------------------------------------------------
