@@ -11,6 +11,7 @@ The repository also contains **`inference-scheduler/`**, a Python code-generator
 ## Build System
 
 All four kernels live under `kernels/` and are built from a single top-level CMake project.
+See `doc/BUILD_TARGETS.md` for a full reference of every `make` target.
 
 ```bash
 mkdir build && cd build
