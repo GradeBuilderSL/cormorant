@@ -38,9 +38,9 @@
     "driver_dir": null,
     "driver_dirs": {
       "VectorOPKernel": "/path/to/axi_demo/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
-      "MatmulKernel":   "/path/to/axi_demo/build/kernels/matmul/kv260/matmul_kv260/solution1/impl/ip/drivers/MatmulKernel_v1_0/src",
-      "ConvKernel":     "/path/to/axi_demo/build/kernels/conv/kv260/conv_kv260/solution1/impl/ip/drivers/ConvKernel_v1_0/src",
-      "PoolingKernel":  "/path/to/axi_demo/build/kernels/pool/kv260/pool_kv260/solution1/impl/ip/drivers/PoolingKernel_v1_0/src"
+      "MatmulKernel":   "/path/to/axi_demo/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "ConvKernel":     "/path/to/axi_demo/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
+      "PoolingKernel":  "/path/to/axi_demo/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel local HLS driver source paths. Merged and bundled before upload. Standard Vitis HLS output location shown; adjust to your build directory."
   },
