@@ -45,16 +45,49 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tile sizes
+# Compile-time kernel bounds — read from the platform JSON.
+#
+# These are the single source of truth, defined under "kernels.matmul" in
+# each platforms/<name>.json — there are NO CMake CACHE defaults; the JSON is
+# authoritative.  matmul_load_constants() errors out if any field is missing
+# rather than silently defaulting.  Field reference:
+#   tile_n   row interleave depth (power of 2; >= MAC latency for II=1)
+#   tile_m   parallel output columns per cycle (power of 2)
+#   tile_k   on-chip B-buffer row count (power of 2)
+#   max_k    compile-time a_buf row-length limit; K > max_k is rejected at
+#            scheduling
 # ---------------------------------------------------------------------------
-set(MM_TILE_N  4    CACHE STRING
-    "Row interleave depth (must be power-of-two; >= MAC latency for II=1)")
-set(MM_TILE_M  16   CACHE STRING
-    "Parallel output columns per cycle (must be power-of-two)")
-set(MM_TILE_K  256  CACHE STRING
-    "On-chip B-buffer row count (must be power-of-two)")
-set(MM_MAX_K   2048 CACHE STRING
-    "Compile-time a_buf row length limit; K > kMaxK is rejected at scheduling")
+function(matmul_load_constants platform_json out_var_prefix)
+    if(NOT EXISTS "${platform_json}")
+        message(FATAL_ERROR
+            "MatmulKernel: platform file not found: ${platform_json}")
+    endif()
+    file(READ "${platform_json}" _pjson)
+    set(_keys "tile_n;tile_m;tile_k;max_k")
+    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K")
+    foreach(_k _vn IN ZIP_LISTS _keys _var_names)
+        string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels matmul "${_k}")
+        if(_err)
+            message(FATAL_ERROR
+                "MatmulKernel: '${platform_json}' is missing "
+                "kernels.matmul.${_k} (CMake error: ${_err})")
+        endif()
+        set("${out_var_prefix}_${_vn}" "${_val}" PARENT_SCOPE)
+    endforeach()
+endfunction()
+matmul_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" MM)
+message(STATUS "MatmulKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
+               "TILE_N=${MM_TILE_N} TILE_M=${MM_TILE_M} "
+               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K}")
+
+# Re-run cmake configure automatically if a platform JSON changes, so the
+# generated Config.h tracks JSON edits without a manual cmake re-run.
+set_property(DIRECTORY APPEND PROPERTY
+    CMAKE_CONFIGURE_DEPENDS "${AXI_DEFAULT_PLATFORM_JSON}")
+foreach(_PF IN LISTS AXI_PLATFORM_FILES)
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${_PF}")
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -261,11 +294,27 @@ if(MM_VITIS_HLS)
         set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
         file(MAKE_DIRECTORY "${_p_build_dir}")
 
-        # Generate a platform-specific Config.h using the main type settings.
+        # Per-platform matmul constants — drives this platform's Config.h
+        # rather than the C-sim default platform's values, so each
+        # synthesised IP uses bounds tuned for that platform.  Stash the
+        # C-sim values so we can restore them after configure_file().
+        set(_save_TILE_N "${MM_TILE_N}")
+        set(_save_TILE_M "${MM_TILE_M}")
+        set(_save_TILE_K "${MM_TILE_K}")
+        set(_save_MAX_K  "${MM_MAX_K}")
+
+        matmul_load_constants("${_MM_PLATFORM_FILE}" MM)
+
+        # Generate a platform-specific Config.h using these constants.
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/include/Config.h.in"
             "${_p_build_dir}/Config.h"
             @ONLY)
+
+        set(MM_TILE_N "${_save_TILE_N}")
+        set(MM_TILE_M "${_save_TILE_M}")
+        set(MM_TILE_K "${_save_TILE_K}")
+        set(MM_MAX_K  "${_save_MAX_K}")
 
         # set_part TCL command (with optional -board)
         if(_p_board)
@@ -306,6 +355,44 @@ if(MM_VITIS_HLS)
                 "${_p_build_dir}/Config.h")
 
         message(STATUS "MatmulKernel: synthesis target 'synthesize_${_pname}' "
+                       "(${_p_part} @ ${_p_clock} MHz)")
+
+        # -------------------------------------------------------------------
+        # cosim_matmul_<name> — C synthesis + RTL co-simulation in ONE run.
+        #
+        # csynth_design and cosim_design are sequenced in a single TCL (see
+        # Cosim.tcl.in), so one vitis-run invocation produces a component
+        # whose run summary covers both — `vitis -a <component>` then shows
+        # the cosim report (measured latency / II) alongside synthesis.
+        #
+        # Separate component (matmul_<name>_cosim) so it never clobbers the
+        # synthesize target's matmul_<name> component / exported IP.  cosim
+        # RTL-simulates the whole TestMatmulSim.cpp test bench, so this target
+        # is slow (minutes) and is intentionally NOT a dependency of anything.
+        # -------------------------------------------------------------------
+        set(MM_COSIM_COMPONENT "matmul_${_pname}_cosim")
+        set(MM_TB_SYNTHESIS    "${CMAKE_CURRENT_SOURCE_DIR}/test/TestMatmulSim.cpp")
+
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Cosim.tcl.in"
+            "${_p_build_dir}/cosim_${_pname}.tcl"
+            @ONLY)
+
+        add_custom_target(
+            "cosim_matmul_${_pname}"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                    "${_p_build_dir}/${MM_COSIM_COMPONENT}"
+            COMMAND ${MM_VITIS_HLS} ${MM_HLS_TCL_FLAG}
+                    "${_p_build_dir}/cosim_${_pname}.tcl"
+            WORKING_DIRECTORY "${_p_build_dir}"
+            COMMENT "HLS synth + cosim: MatmulKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
+            DEPENDS
+                "${MM_KERNEL_SRC}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include/MatmulKernel.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/TestMatmulSim.cpp"
+                "${_p_build_dir}/Config.h")
+
+        message(STATUS "MatmulKernel: cosim target 'cosim_matmul_${_pname}' "
                        "(${_p_part} @ ${_p_clock} MHz)")
     endforeach()
 endif()

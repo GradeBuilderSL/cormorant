@@ -46,10 +46,16 @@ void MatmulKernel(
     // Three m_axi ports keep A, B, and C reads/writes on separate AXI buses
     // so the tool can issue them concurrently.  All scalar arguments go into
     // the s_axilite ctrl register file accessed by the PS driver.
+    //
+    // depth=<N> is a C/RTL co-simulation hint only — it sizes the cosim
+    // verification adapter FIFO per m_axi port and does NOT constrain the
+    // synthesised AXI master or the exported IP.  The MATMUL_COSIM_DEPTH_*
+    // macros (MatmulKernel.h) are the single source of truth; cosim of an
+    // m_axi kernel aborts without a depth specification.
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0
-    #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1
-    #pragma HLS INTERFACE m_axi port=c offset=slave bundle=gmem2
+    #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0 depth=MATMUL_COSIM_DEPTH_A
+    #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1 depth=MATMUL_COSIM_DEPTH_B
+    #pragma HLS INTERFACE m_axi port=c offset=slave bundle=gmem2 depth=MATMUL_COSIM_DEPTH_C
     #pragma HLS INTERFACE s_axilite port=a              bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=b              bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=c              bundle=ctrl

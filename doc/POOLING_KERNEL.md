@@ -330,7 +330,124 @@ called out in [POOL_OPTIMIZATION.md §6](POOL_OPTIMIZATION.md).
 
 ---
 
-## 5. Data Types and Saturation
+## 5. On-Chip Memory
+
+The kernel stages data through **three memory layers** — DDR, BRAM, and
+registers — each a smaller/faster cache of the layer below it. Unlike
+ConvKernel, PoolingKernel needs **no URAM**: its only sizeable cache is the
+16 KB line buffer, which fits comfortably in BRAM, so the entire URAM pool
+is left free. Post-§2.11 synthesis (KV260, kv260.json constants) reports
+**27 % LUT, 13 % BRAM, 10 % DSP, 7 % FF, 0 % URAM** — LUT is the tightest
+layer; BRAM and URAM keep ample headroom for wider tiling.
+
+```mermaid
+flowchart TB
+    subgraph DDR["DDR — external memory · AXI gmem0/1"]
+        Xd[("x · input tensor")]
+        Yd[("y · output tensor")]
+    end
+
+    subgraph BRAML["BRAM layer — caches + FIFOs"]
+        LB["line_buf<br/>kTileC × kMaxLineBufRows × kMaxLineBufCols · 16 KB<br/><i>input sliding-window cache; split into<br/>kTileC × kOwParallel dual-port sub-banks</i>"]
+        ID["kInvDenomLutBits ROM<br/>kMaxAvgDenom+1 × uint32 · ~4 KB · ~1 BRAM18<br/><i>constexpr 1/denom reciprocal table — AVG path only</i>"]
+        RP["row_data_pipe FIFO<br/>1 × Data_t · depth kTileC·kMaxLineBufCols·4"]
+        WP["window_pipe FIFO<br/>MultiWindow = kOwParallel × kTileC × Data_t<br/>depth pool_h·pool_w"]
+        DP["denom_pipe FIFO<br/>MultiDenom = kOwParallel × unsigned · depth 4"]
+        AS["acc_stream FIFO<br/>AccData_t · depth kOwParallel · kTileC"]
+    end
+
+    subgraph REGL["Register layer — FF/LUT · fully ARRAY_PARTITIONed"]
+        AC["acc[kOwParallel][kTileC]<br/><i>reduce accumulators — every cell a register</i>"]
+        IDr["inv_denom[kOwParallel]<br/><i>per-group reciprocals, registered</i>"]
+    end
+
+    Xd -->|burst read| RP
+    RP -->|Phase 1 drain| LB
+    LB -->|Phase 2 MultiWindow gather| WP
+    LB -.->|emitter valid-count tree| DP
+    WP -->|II=1 reduce| AC
+    DP --> IDr
+    ID -->|reciprocal| IDr
+    IDr -->|AVG finalise| AC
+    AC -->|finalise + saturate| AS
+    AS -->|burst write| Yd
+
+    classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
+    classDef bram fill:#e6f7ff,stroke:#1890ff,color:#003a8c
+    classDef reg fill:#f6ffed,stroke:#52c41a,color:#135200
+    class Xd,Yd ddr
+    class LB,ID,RP,WP,DP,AS bram
+    class AC,IDr reg
+```
+
+**`line_buf`** is the one structural cache. Owned by `window_emitter`, it
+holds the input sliding window so each input pixel is fetched from DDR at
+most once per `(ni, ct)` channel tile — or once per W-tile for inputs wider
+than `kMaxLineBufCols` (§4.7). Its three-axis layout — `ARRAY_PARTITION
+complete dim=1` (one bank per channel), `ARRAY_PARTITION cyclic
+factor=kOwParallel dim=3` (column sub-banks), and `BIND_STORAGE ram_t2p`
+(true dual-port) — gives `kTileC × kOwParallel` dual-port sub-banks, the
+exact read bandwidth the emitter needs to gather `kOwParallel` adjacent
+output positions every cycle. The full banking analysis is in §4.4.
+
+**`kInvDenomLutBits`** is a `constexpr`-built ROM holding `1/denom` as
+`ap_ufixed<24,1>` raw bits, materialised inside `process_pool_kernel_tile`
+(it backs the inlined `inv_denom_lookup`). It is read only on the
+AveragePool finalise path and is sized by `kMaxAvgDenom = kMaxLineBufRows ×
+kMaxLineBufCols`; see §2 and §6.
+
+**`acc[kOwParallel][kTileC]`** is the reduce accumulator file.
+`ARRAY_PARTITION complete dim=0` makes every one of the `kOwParallel ×
+kTileC` cells an independent register, so the fully-unrolled reduce updates
+all lanes in a single cycle. `inv_denom[kOwParallel]` is likewise fully
+partitioned into registers.
+
+The four `hls::stream` FIFOs are themselves on-chip memory; HLS maps each to
+BRAM or LUTRAM by depth. Their depths are set by explicit `#pragma HLS
+STREAM` (see the §4.1 diagram) and sized so each producer can stage the
+next unit of work while its consumer drains the current one.
+
+Buffer declarations and their pragmas:
+
+```cpp
+// window_emitter — input sliding-window cache (16 KB at default constants).
+static Data_t line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols];
+#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+#pragma HLS ARRAY_PARTITION variable=line_buf cyclic factor=kOwParallel dim=3
+#pragma HLS BIND_STORAGE   variable=line_buf type=ram_t2p
+// dim=1 complete    → kTileC independent per-channel banks.
+// cyclic dim=3      → kOwParallel column sub-banks per channel, so
+//                     adjacent ow positions land in different banks.
+// ram_t2p           → each sub-bank is true-dual-port, covering every
+//                     stride_w with gcd(stride_w, kOwParallel) ≤ 2.
+// Circular row indexing: slot = ih & (kMaxLineBufRows - 1).
+
+// process_pool_kernel_tile — AVG reciprocal ROM (namespace-scope constexpr,
+// materialised into BRAM where inv_denom_lookup is inlined).
+constexpr auto kInvDenomLutBits =
+    make_inv_denom_lut_helper(
+        std::make_integer_sequence<unsigned, kMaxAvgDenom + 1>{});
+
+// process_pool_kernel_tile — reduce accumulators + per-group reciprocals.
+AccData_t  acc[kOwParallel][kTileC];
+#pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+InvDenom_t inv_denom[kOwParallel];
+#pragma HLS ARRAY_PARTITION variable=inv_denom complete
+// complete dim=0 → all kOwParallel × kTileC accumulators are registers,
+// updated in parallel by the unrolled reduce.
+```
+
+**Packed window stream (`MultiWindow`).** Like ConvKernel's `PatchVec`, the
+`window_emitter → process_pool_kernel_tile` path carries a packed struct
+rather than scalar beats: a `MultiWindow` bundles `kOwParallel × kTileC`
+`Data_t` pixels so one FIFO beat feeds every reduce lane for one
+`(khi, kwi)` position, collapsing the reduce trip count to `pool_h × pool_w`
+cycles per ow-group. `MultiDenom` likewise packs the `kOwParallel`
+per-position valid-pixel counts into one `denom_pipe` beat per group.
+
+---
+
+## 6. Data Types and Saturation
 
 `saturate_cast<Data_t>(v)` converts `AccData_t` back to `Data_t` at
 the finalisation boundary. For `ap_fixed`, the specialisation uses
@@ -346,7 +463,7 @@ binary embeds the ROM directly (`kInvDenomLutBits`) and the
 
 ---
 
-## 6. Test Coverage (`TestPoolingSim.cpp`)
+## 7. Test Coverage (`TestPoolingSim.cpp`)
 
 33 test cases compiled and run with GCC (no Vitis required). Tolerance:
 `kTol = 0.02f`.
@@ -371,7 +488,7 @@ reporting per-test cycle counts.
 
 ---
 
-## 7. Inference Scheduler Integration
+## 8. Inference Scheduler Integration
 
 **`PoolNode` (`nodes.py`)** maps ONNX pool ops to kernel invocations:
 
@@ -403,7 +520,7 @@ comparison.
 
 ---
 
-## 8. Build Targets
+## 9. Build Targets
 
 ```bash
 # C simulation (GCC, no Vitis required).
@@ -432,7 +549,7 @@ summary.
 
 ---
 
-## 9. Key Source Files
+## 10. Key Source Files
 
 | File | Purpose |
 |------|---------|

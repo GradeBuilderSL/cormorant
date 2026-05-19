@@ -34,8 +34,6 @@ endif()
 # Domain parameters
 set(VA_DATA_TYPE "${_VA_DATA_TYPE_DEFAULT}" CACHE STRING
     "Element data type: float, double, half, uint8_t, or ap_fixed<W,I>.")
-set(VA_VECTOR_SIZE 1024 CACHE STRING
-    "Default vector length shown in generated Config.h (informational).")
 
 # ---------------------------------------------------------------------------
 # Resolve data-type byte width

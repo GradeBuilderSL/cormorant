@@ -31,9 +31,9 @@
   "local": {
     "driver_dirs": {
       "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
-      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/solution1/impl/ip/drivers/MatmulKernel_v1_0/src",
-      "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/solution1/impl/ip/drivers/ConvKernel_v1_0/src",
-      "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/solution1/impl/ip/drivers/PoolingKernel_v1_0/src"
+      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
+      "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel HLS-generated driver sources, copied into the project before upload."
   },
@@ -84,7 +84,7 @@
     "poll_interval_ms": 40,
     "_poll_interval_ms_note": "How often the host SFTP-pulls the latest annotated frame.",
     "jpeg_quality": 80,
-    "window_title": "KV260 Camera Classification",
+    "window_title": "Cormorant Camera Demo",
     "save_only": false,
     "_save_only_note": "true on a headless host: save streamed frames to build/stream/ instead of opening a window."
   },

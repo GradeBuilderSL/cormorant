@@ -38,6 +38,24 @@ inline T saturate_cast(From v) {
 }
 
 // ---------------------------------------------------------------------------
+// C/RTL co-simulation transfer depths — single source of truth.
+//
+// cosim of an m_axi kernel needs a fixed transfer depth per pointer port.
+// These macros feed BOTH sides of the cosim contract:
+//   * the depth=<N> hints on MatmulKernel.cpp's m_axi pragmas (size of the
+//     cosim memory model — must be >= the kernel's largest access), and
+//   * the fixed global buffers in test/TestMatmulSim.cpp's MATMUL_COSIM path
+//     (must be >= depth, or wrapc reads past the array end and SIGSEGVs).
+// They are cosim-only: depth does NOT constrain the synthesised AXI master
+// (runtime addresses) or the exported IP.  TestMatmulSim.cpp skips any case
+// whose matrices exceed these bounds under cosim (large matmuls are left to
+// plain C-sim); bump a port's value here to pull a larger case into cosim.
+// ---------------------------------------------------------------------------
+#define MATMUL_COSIM_DEPTH_A  8192
+#define MATMUL_COSIM_DEPTH_B  16384
+#define MATMUL_COSIM_DEPTH_C  4096
+
+// ---------------------------------------------------------------------------
 // MatmulKernel — tiled matrix multiplication.
 //
 // Computes C = A × B for a batch of 2-D matrix products.  Batch broadcasting

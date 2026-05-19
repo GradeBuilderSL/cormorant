@@ -245,6 +245,22 @@ struct TC {
 };
 
 // ---------------------------------------------------------------------------
+// cosim m_axi buffers (only the cosim build, -DPOOL_COSIM).
+//
+// Every pointer handed to PoolingKernel must be a fixed allocation >= the
+// kernel's m_axi depth= hint, or cosim's wrapc adapter reads past the buffer
+// and SIGSEGVs.  std::vector sized to the exact tensor is fine for plain
+// C-sim but not for cosim, so run_test() / run_avg_pool_strict_test() copy
+// each case into these globals.  Sizes come from the POOL_COSIM_DEPTH_*
+// macros in PoolingKernel.h — the same single source of truth that feeds the
+// depth= hints on PoolingKernel.cpp.
+// ---------------------------------------------------------------------------
+#ifdef POOL_COSIM
+static Data_t g_pool_x[POOL_COSIM_DEPTH_X];
+static Data_t g_pool_y[POOL_COSIM_DEPTH_Y];
+#endif
+
+// ---------------------------------------------------------------------------
 // compute_ow_tile_ref — mirror of compute_ow_tile() inside PoolingKernel.cpp.
 //
 // Duplicated here (instead of exposed in a header) because it's a tiny
@@ -360,7 +376,6 @@ static bool run_test(const TC& tc)
     const int out_size = tc.N * tc.C * tc.out_h * tc.out_w;
 
     std::vector<Data_t> x(in_size);
-    std::vector<Data_t> y(out_size, Data_t(0));
 
     // Deterministic fill: values in [-4, 4] in steps of 0.1
     for (int i = 0; i < in_size; i++) {
@@ -422,8 +437,26 @@ static bool run_test(const TC& tc)
 
     pool_debug_reset_duplicate_reads();
 
+    // cosim needs fixed allocations >= the kernel's m_axi depth (the g_pool_*
+    // globals); plain C-sim passes the per-test std::vector storage directly.
+#ifdef POOL_COSIM
+    if (in_size > (int)POOL_COSIM_DEPTH_X ||
+        out_size > (int)POOL_COSIM_DEPTH_Y) {
+        printf("  [SKIP] %-45s  (exceeds cosim buffers)\n", tc.name);
+        return true;
+    }
+    std::copy(x.begin(), x.end(), g_pool_x);
+    std::fill(g_pool_y, g_pool_y + out_size, Data_t(0));
+    const Data_t* x_ptr = g_pool_x;
+    Data_t*       y_ptr = g_pool_y;
+#else
+    std::vector<Data_t> y(out_size, Data_t(0));
+    const Data_t* x_ptr = x.data();
+    Data_t*       y_ptr = y.data();
+#endif
+
     PoolingKernel(
-        x.data(), y.data(),
+        x_ptr, y_ptr,
         (unsigned)tc.N,    (unsigned)tc.C,
         (unsigned)tc.H,    (unsigned)tc.W,
         (unsigned)tc.out_h,(unsigned)tc.out_w,
@@ -453,8 +486,8 @@ static bool run_test(const TC& tc)
                         tc.dil_h, tc.dil_w,
                         tc.pool_type, tc.lp_order,
                         tc.count_include_pad);
-                    float got = to_float(y[(n * tc.C + c) * tc.out_h * tc.out_w
-                                           + oh * tc.out_w + ow]);
+                    float got = to_float(y_ptr[(n * tc.C + c) * tc.out_h * tc.out_w
+                                               + oh * tc.out_w + ow]);
                     if (std::abs(ref - got) > kTol) {
                         if (failures < 4) {
                             printf("    FAIL [n=%d,c=%d,oh=%d,ow=%d]: "
@@ -543,12 +576,28 @@ static bool run_avg_pool_strict_test()
     int total_cells    = 0;
 
     for (int c_inc = 0; c_inc < 2; ++c_inc) {
-        std::vector<Data_t> y(N*C*out_h*out_w, Data_t(0));
-
         pool_debug_reset_duplicate_reads();
 
+        // cosim needs fixed allocations >= the kernel's m_axi depth; this
+        // geometry is compile-time constant and small, so a static_assert
+        // pins it under the bound rather than a runtime skip.
+#ifdef POOL_COSIM
+        static_assert(N*C*H*W         <= POOL_COSIM_DEPTH_X,
+                      "strict-test input exceeds cosim buffer");
+        static_assert(N*C*out_h*out_w <= POOL_COSIM_DEPTH_Y,
+                      "strict-test output exceeds cosim buffer");
+        std::copy(x.begin(), x.end(), g_pool_x);
+        std::fill(g_pool_y, g_pool_y + (N*C*out_h*out_w), Data_t(0));
+        const Data_t* x_ptr = g_pool_x;
+        Data_t*       y_ptr = g_pool_y;
+#else
+        std::vector<Data_t> y(N*C*out_h*out_w, Data_t(0));
+        const Data_t* x_ptr = x.data();
+        Data_t*       y_ptr = y.data();
+#endif
+
         PoolingKernel(
-            x.data(), y.data(),
+            x_ptr, y_ptr,
             (unsigned)N, (unsigned)C, (unsigned)H, (unsigned)W,
             (unsigned)out_h, (unsigned)out_w,
             (unsigned)pool_h, (unsigned)pool_w,
@@ -587,7 +636,7 @@ static bool run_avg_pool_strict_test()
                             : (unsigned)valid_count;
                         const double ref_d = ref_avg_pool_fixed(acc, denom);
                         const double got_d = (double)to_float(
-                            y[(n*C + c) * out_h*out_w + oh*out_w + ow]);
+                            y_ptr[(n*C + c) * out_h*out_w + oh*out_w + ow]);
 
                         // Strict equality on the ap_fixed<16,8> grid: any
                         // 1-LSB drift indicates the kernel deviated from
