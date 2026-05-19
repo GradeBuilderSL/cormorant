@@ -4,6 +4,24 @@
   "board": "xilinx.com:kv260_som:part0:1.4",
   "clock": 150,
   "kernels": {
+    "conv": {
+      "tile_m":                  8,
+      "tile_ic":                 16,
+      "max_kh":                  7,
+      "max_kw":                  7,
+      "max_in_ch":               1024,
+      "max_out_ch":              1024,
+      "max_line_buf_cols":       64,
+      "max_line_buf_rows":       16,
+      "max_acc_persist_entries": 65536,
+      "max_m_per_group":         4
+    },
+    "matmul": {
+      "tile_n":   4,
+      "tile_m":  16,
+      "tile_k": 256,
+      "max_k": 2048
+    },
     "pool": {
       "tile_c":            8,
       "max_kh":            7,

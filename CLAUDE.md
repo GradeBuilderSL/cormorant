@@ -58,12 +58,23 @@ Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `
 **Required JSON fields:** `part`
 **Optional JSON fields:** `board`, `clock` (default 300 MHz)
 
-**Per-kernel constants** live under `kernels.<kernel>` in the same JSON.  Today only `kernels.pool` is populated:
+**Per-kernel constants** live under `kernels.<kernel>` in the same JSON.
+`kernels.conv`, `kernels.matmul` and `kernels.pool` are populated
+(`vectorop` has none — it is a runtime-sized element-wise kernel):
 
 ```jsonc
 {
   "part": "...", "clock": 300,
   "kernels": {
+    "conv": {
+      "tile_m":                  8,  "tile_ic":           16,
+      "max_kh":                  7,  "max_kw":            7,
+      "max_in_ch":            1024,  "max_out_ch":        1024,
+      "max_line_buf_cols":      64,  "max_line_buf_rows": 16,
+      "max_acc_persist_entries": 65536,
+      "max_m_per_group":         4
+    },
+    "matmul": { "tile_n": 4, "tile_m": 16, "tile_k": 256, "max_k": 2048 },
     "pool": {
       "tile_c":            8,
       "max_kh":            7,   "max_kw":            7,
@@ -74,7 +85,15 @@ Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `
 }
 ```
 
-The C++ build reads these via `string(JSON …)` (see `kernels/pool/CMakeLists.txt::pool_load_constants`) and the Python validator in `inference-scheduler/src/_pool_hw_config.py` reads the same file via `resolve(platform_name)` — single source of truth, no `set(POOL_* CACHE …)` defaults.  `CMAKE_CONFIGURE_DEPENDS` makes `make` auto-rerun cmake when the JSON changes.  See `doc/POOL_OPTIMIZATION.md` §4 for the full field reference and `inference-scheduler/CLAUDE.md` for the validation flow.
+The C++ build reads these via `string(JSON …)` (see
+`kernels/<k>/CMakeLists.txt::<k>_load_constants` for `conv` / `matmul` /
+`pool`) — single source of truth, no `set(<K>_* CACHE …)` defaults; a
+missing field is a hard configure error.
+The Python validator in `inference-scheduler/src/_pool_hw_config.py` reads the
+same file via `resolve(platform_name)`.  `CMAKE_CONFIGURE_DEPENDS` makes
+`make` auto-rerun cmake when the JSON changes.  See `doc/POOL_OPTIMIZATION.md`
+§4 for the pool field reference and `inference-scheduler/CLAUDE.md` for the
+validation flow.
 
 Adding a new platform requires only a JSON file and a re-run of cmake.
 
@@ -108,7 +127,7 @@ HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
 - **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across multiple sizes plus saturation boundary cases. Tolerance: relative 1e-5 for FP, exact for integers.
 - **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
-- **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
+- **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.conv` / `kernels.matmul` / `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
 ### Inference Scheduler
 

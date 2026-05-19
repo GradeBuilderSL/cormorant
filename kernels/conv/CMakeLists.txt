@@ -44,28 +44,58 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tile sizes
+# Compile-time kernel bounds — read from the platform JSON.
+#
+# These are the single source of truth, defined under "kernels.conv" in each
+# platforms/<name>.json — there are NO CMake CACHE defaults; the JSON is
+# authoritative.  conv_load_constants() errors out if any field is missing
+# rather than silently defaulting.  Field reference:
+#   tile_m / tile_ic            output / input channel tiles (power of 2)
+#   max_kh / max_kw             kernel-size limits (Conv nodes above are
+#                               rejected at scheduling)
+#   max_in_ch / max_out_ch      channel-count limits (size bias_buf)
+#   max_line_buf_cols / _rows   line-buffer column / circular-row capacity
+#                               (power of 2; cols caps ow_per_tile, not in_w)
+#   max_acc_persist_entries     out_w*out_ch bound for the URAM partial-output
+#                               accumulator that survives across ic-tiles
+#   max_m_per_group             mt-tiles cached together in the weight slab
 # ---------------------------------------------------------------------------
-set(CONV_TILE_M  8  CACHE STRING
-    "Output channel tile (must be power-of-two; controls II=1 lane rotation depth)")
-set(CONV_TILE_IC 16 CACHE STRING
-    "Input channel tile (must be power-of-two; sets weight buffer IC depth)")
-set(CONV_MAX_KH  7  CACHE STRING
-    "Compile-time kernel height limit; Conv nodes with kH > MAX_KH are rejected at scheduling")
-set(CONV_MAX_KW  7  CACHE STRING
-    "Compile-time kernel width limit; Conv nodes with kW > MAX_KW are rejected at scheduling")
-set(CONV_MAX_IN_CH  1024 CACHE STRING
-    "Compile-time input-channel limit; bias_buf only — line_buf is tiled to kTileIC channels")
-set(CONV_MAX_OUT_CH 1024 CACHE STRING
-    "Compile-time output-channel limit; sizes bias_buf in bias_producer")
-set(CONV_MAX_LINE_BUF_COLS 64 CACHE STRING
-    "Column capacity of line_buf in the input patch producers (power of 2; used as a bitmask for slot wrapping). This caps ow_per_tile, NOT in_w: larger in_w is handled by ow-tiling, with the (kw-1)*dilation_w-col overlap re-fetched at tile boundaries.")
-set(CONV_MAX_LINE_BUF_ROWS 16 CACHE STRING
-    "Compile-time circular row capacity of the line buffer (must be a power of 2; supports effective_kh = (kh-1)*dh+1 up to this value)")
-set(CONV_MAX_ACC_PERSIST_ENTRIES 65536 CACHE STRING
-    "Compile-time bound on out_w*out_ch (one output row) for the partial-output accumulator that survives across ic-tiles (Option-A tiling). The buffer is bound to URAM in ConvKernel.cpp, so raising this spends URAM blocks (4096 AccData_t entries each) rather than BRAM: 65536 = 16 of the XCK26's 64 URAM blocks. oh-chunking still splits outputs whose out_h*out_w*out_ch exceeds the buffer.")
-set(CONV_MAX_M_PER_GROUP 4 CACHE STRING
-    "Max number of mt-tiles cached together in the (ict, M-group) weight slab. Larger values fit more channels in one group (eliminating weight DDR replay), at the cost of BRAM/LUT for w_cache. When m_tiles exceeds this bound, the kernel processes M in groups of this size.")
+function(conv_load_constants platform_json out_var_prefix)
+    if(NOT EXISTS "${platform_json}")
+        message(FATAL_ERROR
+            "ConvKernel: platform file not found: ${platform_json}")
+    endif()
+    file(READ "${platform_json}" _pjson)
+    set(_keys "tile_m;tile_ic;max_kh;max_kw;max_in_ch;max_out_ch;max_line_buf_cols;max_line_buf_rows;max_acc_persist_entries;max_m_per_group")
+    set(_var_names "TILE_M;TILE_IC;MAX_KH;MAX_KW;MAX_IN_CH;MAX_OUT_CH;MAX_LINE_BUF_COLS;MAX_LINE_BUF_ROWS;MAX_ACC_PERSIST_ENTRIES;MAX_M_PER_GROUP")
+    foreach(_k _vn IN ZIP_LISTS _keys _var_names)
+        string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels conv "${_k}")
+        if(_err)
+            message(FATAL_ERROR
+                "ConvKernel: '${platform_json}' is missing "
+                "kernels.conv.${_k} (CMake error: ${_err})")
+        endif()
+        set("${out_var_prefix}_${_vn}" "${_val}" PARENT_SCOPE)
+    endforeach()
+endfunction()
+conv_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" CONV)
+message(STATUS "ConvKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
+               "TILE_M=${CONV_TILE_M} TILE_IC=${CONV_TILE_IC} "
+               "MAX_KH=${CONV_MAX_KH} MAX_KW=${CONV_MAX_KW} "
+               "MAX_IN_CH=${CONV_MAX_IN_CH} MAX_OUT_CH=${CONV_MAX_OUT_CH} "
+               "MAX_LINE_BUF_COLS=${CONV_MAX_LINE_BUF_COLS} "
+               "MAX_LINE_BUF_ROWS=${CONV_MAX_LINE_BUF_ROWS} "
+               "MAX_ACC_PERSIST_ENTRIES=${CONV_MAX_ACC_PERSIST_ENTRIES} "
+               "MAX_M_PER_GROUP=${CONV_MAX_M_PER_GROUP}")
+
+# Re-run cmake configure automatically if a platform JSON changes, so the
+# generated Config.h tracks JSON edits without a manual cmake re-run.
+set_property(DIRECTORY APPEND PROPERTY
+    CMAKE_CONFIGURE_DEPENDS "${AXI_DEFAULT_PLATFORM_JSON}")
+foreach(_PF IN LISTS AXI_PLATFORM_FILES)
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${_PF}")
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -238,11 +268,39 @@ if(CONV_VITIS_HLS)
         set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
         file(MAKE_DIRECTORY "${_p_build_dir}")
 
-        # Generate a platform-specific Config.h using the main type settings.
+        # Per-platform conv constants — drives this platform's Config.h
+        # rather than the C-sim default platform's values, so each
+        # synthesised IP uses bounds tuned for that platform.  Stash the
+        # C-sim values so we can restore them after configure_file().
+        set(_save_TILE_M                  "${CONV_TILE_M}")
+        set(_save_TILE_IC                 "${CONV_TILE_IC}")
+        set(_save_MAX_KH                  "${CONV_MAX_KH}")
+        set(_save_MAX_KW                  "${CONV_MAX_KW}")
+        set(_save_MAX_IN_CH               "${CONV_MAX_IN_CH}")
+        set(_save_MAX_OUT_CH              "${CONV_MAX_OUT_CH}")
+        set(_save_MAX_LINE_BUF_COLS       "${CONV_MAX_LINE_BUF_COLS}")
+        set(_save_MAX_LINE_BUF_ROWS       "${CONV_MAX_LINE_BUF_ROWS}")
+        set(_save_MAX_ACC_PERSIST_ENTRIES "${CONV_MAX_ACC_PERSIST_ENTRIES}")
+        set(_save_MAX_M_PER_GROUP         "${CONV_MAX_M_PER_GROUP}")
+
+        conv_load_constants("${_CONV_PLATFORM_FILE}" CONV)
+
+        # Generate a platform-specific Config.h using these constants.
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/include/Config.h.in"
             "${_p_build_dir}/Config.h"
             @ONLY)
+
+        set(CONV_TILE_M                  "${_save_TILE_M}")
+        set(CONV_TILE_IC                 "${_save_TILE_IC}")
+        set(CONV_MAX_KH                  "${_save_MAX_KH}")
+        set(CONV_MAX_KW                  "${_save_MAX_KW}")
+        set(CONV_MAX_IN_CH               "${_save_MAX_IN_CH}")
+        set(CONV_MAX_OUT_CH              "${_save_MAX_OUT_CH}")
+        set(CONV_MAX_LINE_BUF_COLS       "${_save_MAX_LINE_BUF_COLS}")
+        set(CONV_MAX_LINE_BUF_ROWS       "${_save_MAX_LINE_BUF_ROWS}")
+        set(CONV_MAX_ACC_PERSIST_ENTRIES "${_save_MAX_ACC_PERSIST_ENTRIES}")
+        set(CONV_MAX_M_PER_GROUP         "${_save_MAX_M_PER_GROUP}")
 
         if(_p_board)
             set(CONV_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
