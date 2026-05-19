@@ -649,13 +649,13 @@ class TestMixedAllKernelsNodeStructure(unittest.TestCase):
         self.assertEqual(self._count(nodes, ConvNode),      1)
 
     def test_relu_conv_matmul_conv_geometry(self):
-        """Conv node: IC=4, OC=8, 1×1 kernel, no bias."""
+        """Conv node: IC=4, OC=8, 3×3 kernel, no bias."""
         nodes = self._nodes("mixed_all_relu_conv_matmul.onnx")
         conv = next(n for n in nodes if isinstance(n, ConvNode))
         self.assertEqual(conv.in_ch,  4)
         self.assertEqual(conv.out_ch, 8)
-        self.assertEqual(conv.kh,     1)
-        self.assertEqual(conv.kw,     1)
+        self.assertEqual(conv.kh,     3)
+        self.assertEqual(conv.kw,     3)
         self.assertFalse(conv.has_bias)
 
     def test_conv_matmul_relu_conv_geometry(self):

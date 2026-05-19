@@ -130,8 +130,8 @@ class TestConvNodeGeometry(unittest.TestCase):
         self.assertEqual(sn.out_ch, 8)
         self.assertEqual(sn.out_h,  8)
         self.assertEqual(sn.out_w,  8)
-        self.assertEqual(sn.kh, 1)
-        self.assertEqual(sn.kw, 1)
+        self.assertEqual(sn.kh, 3)
+        self.assertEqual(sn.kw, 3)
 
     def test_stride2_output_size(self):
         sn = self._node("conv_stride2.onnx")
@@ -435,7 +435,7 @@ class TestConvEmit(unittest.TestCase):
         comment = sn.emit_comment()
         self.assertIn("[0] Conv(", comment)
         self.assertIn("->", comment)
-        self.assertIn("k=1", comment)
+        self.assertIn("k=3", comment)
 
     def test_emit_call_format_no_bias(self):
         g = OnnxGraph(_conv_model("conv_simple.onnx"))
@@ -701,6 +701,92 @@ class TestConvDepthwise(unittest.TestCase):
         arrays = gen._simulate()
         y = arrays["Y"]
         self.assertTrue(np.all(np.isfinite(y)))
+
+
+# ---------------------------------------------------------------------------
+# Pointwise-Conv → MatMul rewrite (default on; opt-out via constructor flag)
+# ---------------------------------------------------------------------------
+
+from src.nodes import MatmulNode, ScheduledNode, ReshapeNode  # noqa: E402
+
+
+def _has_pointwise_models() -> bool:
+    return (os.path.isfile(_conv_model("conv_pointwise.onnx")) and
+            os.path.isfile(_conv_model("conv_pointwise_bias.onnx")))
+
+
+@unittest.skipUnless(_has_pointwise_models(),
+                     "Run test/gen_conv_models.py first")
+class TestPointwiseConvRewrite(unittest.TestCase):
+    """1×1 Conv (kernel_shape=[1,1], stride=1, pad=0, dilation=1, group=1)
+    is rewritten to Reshape+MatMul (+ optional bias Add) so it runs on the
+    MatmulKernel instead of ConvKernel."""
+
+    def test_pointwise_no_bias_rewritten(self):
+        g = OnnxGraph(_conv_model("conv_pointwise.onnx"))
+        self.assertEqual(g.pointwise_conv_rewritten_count, 1)
+        types = [type(n).__name__ for n in g.nodes]
+        # 2 Reshape (W, X) + 1 MatMul + 1 Reshape (Y).  No ConvNode.
+        self.assertEqual(types,
+                         ["ReshapeNode", "ReshapeNode", "MatmulNode", "ReshapeNode"])
+
+    def test_pointwise_bias_rewritten_with_add(self):
+        g = OnnxGraph(_conv_model("conv_pointwise_bias.onnx"))
+        self.assertEqual(g.pointwise_conv_rewritten_count, 1)
+        types = [type(n).__name__ for n in g.nodes]
+        # 2 Reshape (W, X) + MatMul + Add (tiled bias) + Reshape (Y).
+        self.assertEqual(types,
+                         ["ReshapeNode", "ReshapeNode", "MatmulNode",
+                          "ScheduledNode", "ReshapeNode"])
+
+    def test_pointwise_opt_out_keeps_convnode(self):
+        g = OnnxGraph(_conv_model("conv_pointwise.onnx"),
+                      rewrite_pointwise_conv=False)
+        self.assertEqual(g.pointwise_conv_rewritten_count, 0)
+        self.assertEqual(len(g.nodes), 1)
+        self.assertIsInstance(g.nodes[0], ConvNode)
+
+    def test_non_pointwise_conv_not_rewritten(self):
+        """3×3 conv (conv_simple) is NOT pointwise — never gets rewritten,
+        regardless of the flag setting."""
+        g = OnnxGraph(_conv_model("conv_simple.onnx"))
+        self.assertEqual(g.pointwise_conv_rewritten_count, 0)
+        self.assertEqual(len(g.nodes), 1)
+        self.assertIsInstance(g.nodes[0], ConvNode)
+
+    def test_pointwise_rewrite_preserves_outputs(self):
+        """The rewritten graph must produce numerically identical outputs
+        to the original (float32 onnxruntime, exact)."""
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            self.skipTest("onnxruntime not available")
+
+        for model_name in ("conv_pointwise.onnx", "conv_pointwise_bias.onnx"):
+            with self.subTest(model=model_name):
+                # Original model — load and run via onnxruntime.
+                sess = ort.InferenceSession(_conv_model(model_name))
+                x = np.random.default_rng(0).standard_normal(
+                    (1, 4, 8, 8)).astype(np.float32)
+                y_ref = sess.run(None, {"X": x})[0]
+
+                # Rewritten model — pull it out of OnnxGraph via the static
+                # method directly, save, and run through onnxruntime.
+                import onnx
+                src_model = onnx.load(_conv_model(model_name))
+                src_model = onnx.shape_inference.infer_shapes(src_model)
+                new_model, count = (
+                    OnnxGraph._rewrite_pointwise_conv_as_matmul(src_model)
+                )
+                self.assertEqual(count, 1)
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".onnx",
+                                                  delete=False) as tmp:
+                    onnx.save(new_model, tmp.name)
+                    sess2 = ort.InferenceSession(tmp.name)
+                y_got = sess2.run(None, {"X": x})[0]
+
+                np.testing.assert_allclose(y_got, y_ref, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

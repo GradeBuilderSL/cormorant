@@ -505,6 +505,7 @@ class ReportGenerator:
         starts = sum(1 for ev in events if ev[0] in ("start", "start_sync"))
 
         gemm = getattr(self.graph, "gemm_decomposed_count", 0)
+        pwconv = getattr(self.graph, "pointwise_conv_rewritten_count", 0)
         reshape_count = sum(1 for sn in self.graph.nodes if isinstance(sn, ReshapeNode))
 
         # Pool reuse summary: re-derive the saving figure already shown in §4
@@ -525,6 +526,18 @@ class ReportGenerator:
         else:
             bullets.append(
                 "- **Gemm decomposition** — none (no `Gemm` nodes in the source graph)."
+            )
+        if pwconv:
+            bullets.append(
+                f"- **Pointwise-Conv → MatMul rewrite** — {pwconv} `Conv` "
+                f"node{'s' if pwconv != 1 else ''} with `kernel_shape=[1,1]` "
+                f"rewritten to `Reshape` + `MatMul` (+ tiled `Add` for bias) "
+                f"so they run on `MatmulKernel` instead of `ConvKernel`."
+            )
+        else:
+            bullets.append(
+                "- **Pointwise-Conv → MatMul rewrite** — none "
+                "(no eligible 1×1 `Conv` nodes)."
             )
         if reshape_count:
             bullets.append(

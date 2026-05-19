@@ -117,6 +117,19 @@ def parse_args(argv=None):
         default=False,
         help="Skip writing report.md (the human-readable model summary).",
     )
+    p.add_argument(
+        "--no-rewrite-pointwise-conv",
+        action="store_false",
+        dest="rewrite_pointwise_conv",
+        default=True,
+        help=(
+            "Disable the default rewrite of eligible 1×1 (pointwise) Conv "
+            "nodes to MatMul (+ optional bias Add).  By default such Conv "
+            "nodes are sent to MatmulKernel instead of ConvKernel — "
+            "ConvKernel's line-buffer / patch-buffer machinery is pure "
+            "overhead for K=1.  Pass this flag to keep them on ConvKernel."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -161,7 +174,10 @@ def main(argv=None):
     # 2. Parse and validate the ONNX model                             #
     # ---------------------------------------------------------------- #
     try:
-        graph = OnnxGraph(args.model)
+        graph = OnnxGraph(
+            args.model,
+            rewrite_pointwise_conv=args.rewrite_pointwise_conv,
+        )
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

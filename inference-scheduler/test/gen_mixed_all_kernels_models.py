@@ -61,12 +61,12 @@ def _conv(inputs, output, kernel_shape, pads=None, **kw):
 #   MatMul: a_batch=[1,8], n=8, k=8, m=4, batch=8, a_stride=64, c_stride=32.
 # ---------------------------------------------------------------------------
 def gen_relu_conv_matmul() -> None:
-    wc = _init(RNG.standard_normal((8, 4, 1, 1)) * 0.25, "Wc")
+    wc = _init(RNG.standard_normal((8, 4, 3, 3)) * 0.25, "Wc")
     wm = _init(RNG.standard_normal((8, 4)) * 0.25,       "Wm")
 
     nodes = [
         helper.make_node("Relu",   ["X",  ],       ["Z"]),
-        _conv(                     ["Z",  "Wc"],   "A", [1, 1]),
+        _conv(                     ["Z",  "Wc"],   "A", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Relu",   ["A",  ],       ["B"]),
         helper.make_node("MatMul", ["B",  "Wm"],   ["Y"]),
     ]
@@ -164,12 +164,12 @@ def gen_norm_conv_project() -> None:
 # ---------------------------------------------------------------------------
 def gen_matmul_relu_conv() -> None:
     wm = _init(RNG.standard_normal((8, 8)) * 0.25, "Wm")
-    wc = _init(RNG.standard_normal((8, 4, 1, 1)) * 0.25, "Wc")
+    wc = _init(RNG.standard_normal((8, 4, 3, 3)) * 0.25, "Wc")
 
     nodes = [
         helper.make_node("MatMul", ["X", "Wm"],         ["Z"]),
         helper.make_node("Relu",   ["Z"],                ["A"]),
-        _conv(                     ["A", "Wc"],          "B", [1, 1]),
+        _conv(                     ["A", "Wc"],          "B", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Clip",   ["B", "clip_min", "clip_max"], ["Y"]),
     ]
     clip_min = numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="clip_min")
@@ -198,11 +198,11 @@ def gen_matmul_relu_conv() -> None:
 #   MatMul: a_batch=[1,8], n=4, k=4, m=4, batch=8, a_stride=16, c_stride=16.
 # ---------------------------------------------------------------------------
 def gen_skip_conv_matmul() -> None:
-    wc = _init(RNG.standard_normal((8, 8, 1, 1)) * 0.25, "Wc")
+    wc = _init(RNG.standard_normal((8, 8, 3, 3)) * 0.25, "Wc")
     wm = _init(RNG.standard_normal((4, 4)) * 0.25,       "Wm")
 
     nodes = [
-        _conv(                     ["X", "Wc"],  "Z", [1, 1]),
+        _conv(                     ["X", "Wc"],  "Z", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Relu",   ["Z"],        ["A"]),
         helper.make_node("Add",    ["X", "A"],   ["B"]),
         helper.make_node("MatMul", ["B", "Wm"],  ["Y"]),
@@ -234,7 +234,7 @@ def gen_skip_conv_matmul() -> None:
 def gen_two_conv_matmul_relu6() -> None:
     wc1  = _init(RNG.standard_normal((8, 3, 3, 3)) * 0.25, "Wc1")
     bc1  = _init(np.zeros(8),                               "Bc1")
-    wc2  = _init(RNG.standard_normal((8, 8, 1, 1)) * 0.25, "Wc2")
+    wc2  = _init(RNG.standard_normal((8, 8, 3, 3)) * 0.25, "Wc2")
     wm   = _init(RNG.standard_normal((8, 4)) * 0.25,       "Wm")
 
     clip_min = numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="clip_min2")
@@ -243,7 +243,7 @@ def gen_two_conv_matmul_relu6() -> None:
     nodes = [
         _conv(                     ["X",  "Wc1", "Bc1"],           "Z1", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Relu",   ["Z1"],                          ["A1"]),
-        _conv(                     ["A1", "Wc2"],                   "Z2", [1, 1]),
+        _conv(                     ["A1", "Wc2"],                   "Z2", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Relu",   ["Z2"],                          ["A2"]),
         helper.make_node("MatMul", ["A2", "Wm"],                    ["B"]),
         helper.make_node("Clip",   ["B", "clip_min2", "clip_max2"], ["Y"]),
@@ -274,7 +274,7 @@ def gen_two_conv_matmul_relu6() -> None:
 def gen_sub_matmul_conv() -> None:
     norm_w = _init(np.zeros((1, 4, 4, 8)),                    "norm_w")
     wm     = _init(RNG.standard_normal((8, 8)) * 0.25,        "Wm")
-    wc     = _init(RNG.standard_normal((8, 4, 1, 1)) * 0.25,  "Wc")
+    wc     = _init(RNG.standard_normal((8, 4, 3, 3)) * 0.25,  "Wc")
 
     clip_min = numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="clip_min")
     clip_max = numpy_helper.from_array(np.array(6.0, dtype=np.float32), name="clip_max")
@@ -283,7 +283,7 @@ def gen_sub_matmul_conv() -> None:
         helper.make_node("Sub",    ["X",  "norm_w"],             ["Z1"]),
         helper.make_node("MatMul", ["Z1", "Wm"],                 ["Z2"]),
         helper.make_node("Relu",   ["Z2"],                       ["A"]),
-        _conv(                     ["A",  "Wc"],                 "B", [1, 1]),
+        _conv(                     ["A",  "Wc"],                 "B", [3, 3], pads=[1, 1, 1, 1]),
         helper.make_node("Clip",   ["B", "clip_min", "clip_max"], ["Y"]),
     ]
     graph = helper.make_graph(

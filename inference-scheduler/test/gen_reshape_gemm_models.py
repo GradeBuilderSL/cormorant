@@ -155,14 +155,17 @@ def gen_reshape_gemm_pipeline() -> None:
 # This model exercises the output-alias redirect code path in inference_run().
 # ---------------------------------------------------------------------------
 def gen_conv_then_squeeze() -> None:
-    w_data = np.eye(2, 4, dtype=np.float32)  # [2, 4] as [2, 4, 1, 1]
-    w_data = w_data.reshape(2, 4, 1, 1)
+    # 3×3 weights with pads=1: out-spatial = (1+2-3)+1 = 1, same as 1×1.
+    # Kept non-pointwise so the fixture stays on ConvKernel rather than
+    # being rewritten to MatMul.
+    w_data = np.zeros((2, 4, 3, 3), dtype=np.float32)
+    w_data[:, :, 1, 1] = np.eye(2, 4, dtype=np.float32)   # centre tap only
     b_data = np.zeros(2, dtype=np.float32)
     w_init = _init("W", w_data)
     b_init = _init("B", b_data)
 
     conv    = oh.make_node("Conv",    inputs=["X", "W", "B"], outputs=["C"],
-                           kernel_shape=[1, 1])
+                           kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
     squeeze = oh.make_node("Squeeze", inputs=["C"],           outputs=["Y"],
                            axes=[2, 3])
     graph = oh.make_graph(

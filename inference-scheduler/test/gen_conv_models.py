@@ -24,14 +24,14 @@ def _vi(name: str, shape) -> onnx.TensorProto:
 # X[1,4,8,8] * W[8,4,1,1] → Y[1,8,8,8]
 # ---------------------------------------------------------------------------
 def gen_conv_simple() -> None:
-    w_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    w_data = (np.random.randn(8, 4, 3, 3) * 0.25).astype(np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
 
     conv = helper.make_node(
         "Conv",
         inputs=["X", "W"],
         outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_simple",
@@ -128,14 +128,14 @@ def gen_conv_padded() -> None:
 # X[2,4,4,4] * W[8,4,1,1] → Y[2,8,4,4]
 # ---------------------------------------------------------------------------
 def gen_conv_batch2() -> None:
-    w_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    w_data = (np.random.randn(8, 4, 3, 3) * 0.25).astype(np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
 
     conv = helper.make_node(
         "Conv",
         inputs=["X", "W"],
         outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_batch2",
@@ -152,10 +152,10 @@ def gen_conv_batch2() -> None:
 # X[1,4,8,8] * W[8,4,1,1] → Z[1,8,8,8] → Relu → Y[1,8,8,8]
 # ---------------------------------------------------------------------------
 def gen_conv_then_relu() -> None:
-    w_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    w_data = (np.random.randn(8, 4, 3, 3) * 0.25).astype(np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
 
-    conv = helper.make_node("Conv",  inputs=["X", "W"], outputs=["Z"], kernel_shape=[1, 1])
+    conv = helper.make_node("Conv",  inputs=["X", "W"], outputs=["Z"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
     relu = helper.make_node("Relu",  inputs=["Z"],      outputs=["Y"])
 
     graph = helper.make_graph(
@@ -221,12 +221,12 @@ def gen_conv_mnist_second_layer() -> None:
 # Z[1,8,8,8] + scale[1,8,8,8] → Y  (no broadcasting, flat layout)
 # ---------------------------------------------------------------------------
 def gen_conv_then_add_flat() -> None:
-    w_data     = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    w_data     = (np.random.randn(8, 4, 3, 3) * 0.25).astype(np.float32)
     scale_data = np.ones((1, 8, 8, 8), dtype=np.float32)
     w_init     = numpy_helper.from_array(w_data,     name="W")
     scale_init = numpy_helper.from_array(scale_data, name="scale")
 
-    conv = helper.make_node("Conv", inputs=["X", "W"],       outputs=["Z"], kernel_shape=[1, 1])
+    conv = helper.make_node("Conv", inputs=["X", "W"],       outputs=["Z"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
     add  = helper.make_node("Add",  inputs=["Z", "scale"],   outputs=["Y"])
 
     graph = helper.make_graph(
@@ -245,16 +245,16 @@ def gen_conv_then_add_flat() -> None:
 # X[1,4,8,8] → [1,8,8,8] → [1,4,8,8]
 # ---------------------------------------------------------------------------
 def gen_conv_relu_chain() -> None:
-    w1_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
-    w2_data = (np.random.randn(4, 8, 1, 1) * 0.25).astype(np.float32)
+    w1_data = (np.random.randn(8, 4, 3, 3) * 0.25).astype(np.float32)
+    w2_data = (np.random.randn(4, 8, 3, 3) * 0.25).astype(np.float32)
     b2_data = np.zeros(4, dtype=np.float32)
     w1_init = numpy_helper.from_array(w1_data, name="W1")
     w2_init = numpy_helper.from_array(w2_data, name="W2")
     b2_init = numpy_helper.from_array(b2_data, name="B2")
 
-    conv1 = helper.make_node("Conv", inputs=["X", "W1"],      outputs=["Z1"], kernel_shape=[1, 1])
+    conv1 = helper.make_node("Conv", inputs=["X", "W1"],      outputs=["Z1"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
     relu1 = helper.make_node("Relu", inputs=["Z1"],            outputs=["Z2"])
-    conv2 = helper.make_node("Conv", inputs=["Z2", "W2", "B2"], outputs=["Z3"], kernel_shape=[1, 1])
+    conv2 = helper.make_node("Conv", inputs=["Z2", "W2", "B2"], outputs=["Z3"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
     relu2 = helper.make_node("Relu", inputs=["Z3"],            outputs=["Y"])
 
     graph = helper.make_graph(
@@ -445,6 +445,48 @@ def gen_conv_two_layer_vgg() -> None:
     _save(model, "conv_two_layer_vgg.onnx")
 
 
+# ---------------------------------------------------------------------------
+# conv_pointwise: 1x1 conv, no bias — triggers the default pointwise → MatMul
+# rewrite in OnnxGraph.  X[1,4,8,8] * W[8,4,1,1] → Y[1,8,8,8].
+# ---------------------------------------------------------------------------
+def gen_conv_pointwise() -> None:
+    w_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"], kernel_shape=[1, 1])
+    graph = helper.make_graph(
+        [conv], "conv_pointwise",
+        inputs=[_vi("X", [1, 4, 8, 8])],
+        outputs=[_vi("Y", [1, 8, 8, 8])],
+        initializer=[w_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_pointwise.onnx")
+
+
+# ---------------------------------------------------------------------------
+# conv_pointwise_bias: 1x1 conv WITH bias — exercises the tiled-bias path of
+# the pointwise → MatMul rewrite.  X[1,4,8,8] * W[8,4,1,1] + B[8] → Y[1,8,8,8].
+# ---------------------------------------------------------------------------
+def gen_conv_pointwise_bias() -> None:
+    w_data = (np.random.randn(8, 4, 1, 1) * 0.25).astype(np.float32)
+    b_data = np.zeros(8, dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    b_init = numpy_helper.from_array(b_data, name="B")
+
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W", "B"], outputs=["Y"], kernel_shape=[1, 1])
+    graph = helper.make_graph(
+        [conv], "conv_pointwise_bias",
+        inputs=[_vi("X", [1, 4, 8, 8])],
+        outputs=[_vi("Y", [1, 8, 8, 8])],
+        initializer=[w_init, b_init],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    _save(model, "conv_pointwise_bias.onnx")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -470,4 +512,6 @@ if __name__ == "__main__":
     gen_conv_dilation()
     gen_conv_auto_pad_valid()
     gen_conv_two_layer_vgg()
+    gen_conv_pointwise()
+    gen_conv_pointwise_bias()
     print("Done.")

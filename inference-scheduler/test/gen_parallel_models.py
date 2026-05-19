@@ -33,9 +33,15 @@ def _vi(name: str, shape):
 
 
 def _conv1x1_init(name: str, c: int, seed: int) -> onnx.TensorProto:
-    """Identity-ish 1×1 conv weight [c, c, 1, 1]."""
+    """Branch-fixture conv weight [c, c, 3, 3].
+
+    Historically 1×1; widened to 3×3 (paired with pad=1 in the make_node
+    calls below) so these fixtures keep going through ConvKernel rather
+    than being silently rewritten to MatMul.  The function name is kept for
+    backwards compatibility with existing callers — the spatial dim is the
+    only thing that changed."""
     rng = np.random.default_rng(seed)
-    w = (rng.standard_normal((c, c, 1, 1)) * 0.25).astype(np.float32)
+    w = (rng.standard_normal((c, c, 3, 3)) * 0.10).astype(np.float32)
     return numpy_helper.from_array(w, name=name)
 
 
@@ -85,7 +91,7 @@ def gen_parallel_conv_pool_join(c=4, h=8, w=8) -> None:
     inits = [_conv1x1_init("Wc", c, seed=1)]
     nodes = [
         helper.make_node("Conv", ["X", "Wc"], ["cv"], name="conv",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("MaxPool", ["X"], ["pl"], name="pool",
                          kernel_shape=[3, 3], pads=[1, 1, 1, 1],
@@ -142,7 +148,7 @@ def gen_parallel_three_kernel_branches(c=4, h=8, w=8) -> None:
     inits = [_conv1x1_init("Wc", c, seed=3)]
     nodes = [
         helper.make_node("Conv", ["X", "Wc"], ["c0"], name="conv",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("MaxPool", ["X"], ["c1"], name="pool",
                          kernel_shape=[3, 3], pads=[1, 1, 1, 1],
@@ -186,14 +192,14 @@ def gen_parallel_two_chains(c=4, h=8, w=8) -> None:
              _conv1x1_init("Wb", c, seed=5)]
     nodes = [
         helper.make_node("Conv", ["X", "Wa"], ["ca0"], name="convA",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Relu", ["ca0"], ["ca1"], name="reluA"),
         helper.make_node("MaxPool", ["ca1"], ["ca2"], name="poolA",
                          kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Conv", ["X", "Wb"], ["cb0"], name="convB",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Relu", ["cb0"], ["cb1"], name="reluB"),
         helper.make_node("Add",  ["ca2", "cb1"], ["Y"], name="join"),
@@ -231,10 +237,10 @@ def gen_parallel_same_kernel_branches(c=4, h=8, w=8) -> None:
              _conv1x1_init("Wb", c, seed=7)]
     nodes = [
         helper.make_node("Conv", ["X", "Wa"], ["a"], name="convA",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Conv", ["X", "Wb"], ["b"], name="convB",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Add",  ["a", "b"], ["Y"], name="add"),
     ]
@@ -332,11 +338,11 @@ def gen_asymmetric_nested_branches(c=4, h=8, w=8) -> None:
     nodes = [
         # branch A — deep Conv/VectorOP chain
         helper.make_node("Conv", ["X", "W_a1"], ["ar0"], name="convA1",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Relu", ["ar0"], ["ar1"], name="reluA1"),
         helper.make_node("Conv", ["ar1", "W_a2"], ["ar2"], name="convA2",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Relu", ["ar2"], ["ar3"], name="reluA2"),
         # branch B — sub-branch 1 (Pool)
@@ -398,7 +404,7 @@ def gen_nop_dropout_fork(c=4, h=8, w=8) -> None:
     inits = [_conv1x1_init("Wc", c, seed=20)]
     nodes = [
         helper.make_node("Conv", ["X", "Wc"], ["C"], name="conv",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Dropout", ["C"], ["D"], name="drop",
                          ratio=0.5),
@@ -435,7 +441,7 @@ def gen_nop_chain_dropout_fork(c=4, h=8, w=8) -> None:
     inits = [_conv1x1_init("Wc", c, seed=21)]
     nodes = [
         helper.make_node("Conv", ["X", "Wc"], ["C"], name="conv",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Dropout", ["C"],  ["D1"], name="drop1", ratio=0.1),
         helper.make_node("Dropout", ["D1"], ["D2"], name="drop2", ratio=0.1),
@@ -510,7 +516,7 @@ def gen_nop_asymmetric_branch(c=4, h=8, w=8) -> None:
     inits = [_conv1x1_init("Wc", c, seed=22)]
     nodes = [
         helper.make_node("Conv", ["X", "Wc"], ["C"], name="conv",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("MaxPool", ["C"], ["P"], name="pool",
                          kernel_shape=[3, 3], pads=[1, 1, 1, 1],
@@ -558,13 +564,13 @@ def gen_nop_nested_inner_branch(c=4, h=8, w=8) -> None:
     ]
     nodes = [
         helper.make_node("Conv", ["X", "W_outer"], ["outer_C"], name="conv_outer",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("MaxPool", ["outer_C"], ["A_p"], name="pool_A",
                          kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Conv", ["outer_C", "W_b"], ["b_c"], name="conv_B",
-                         kernel_shape=[1, 1], pads=[0, 0, 0, 0],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1],
                          strides=[1, 1]),
         helper.make_node("Dropout", ["b_c"], ["b_d"],  name="drop_b1", ratio=0.0),
         helper.make_node("Dropout", ["b_d"], ["b_d2"], name="drop_b2", ratio=0.0),

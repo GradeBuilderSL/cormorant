@@ -29,6 +29,7 @@ from .tensor import TensorInfo
 from .nodes  import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
                      POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
+from ._matmul_hw_config import MM_MAX_K
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm"} | POOL_OP_TYPES | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES
@@ -234,8 +235,199 @@ class OnnxGraph:
         new_model.ir_version = model.ir_version
         return new_model, gemm_counter[0]
 
+    @staticmethod
+    def _is_pointwise_conv(node: onnx.NodeProto) -> bool:
+        """True iff ``node`` is a vanilla 1×1 ONNX Conv: kernel 1×1, stride 1,
+        pad 0, dilation 1, group 1.  Anything else (3×3, depthwise, strided,
+        padded) is rejected and stays on ConvKernel."""
+        if node.op_type != "Conv":
+            return False
+        attrs = {a.name: a for a in node.attribute}
+
+        def _ints(name, default):
+            return list(attrs[name].ints) if name in attrs else default
+
+        if _ints("kernel_shape", [1, 1])      != [1, 1]:       return False
+        if _ints("strides",      [1, 1])      != [1, 1]:       return False
+        if _ints("pads",         [0, 0, 0, 0]) != [0, 0, 0, 0]: return False
+        if _ints("dilations",    [1, 1])      != [1, 1]:       return False
+        if (attrs["group"].i if "group" in attrs else 1) != 1: return False
+        return True
+
+    @staticmethod
+    def _rewrite_pointwise_conv_as_matmul(
+        model: onnx.ModelProto,
+        mm_max_k: int = MM_MAX_K,
+        max_bias_tile_elems: int = 65536,
+    ):
+        """Rewrite pointwise (1×1) Conv nodes as MatMul (+ optional bias Add).
+
+        For each eligible ``Conv`` node:
+
+          1. Reshape  W [OC, IC, 1, 1]   → W2 [OC, IC]            (alias)
+          2. Reshape  X [N,  IC, H,  W]  → X2 [N, IC, H*W]        (alias)
+          3. MatMul   W2 × X2            → Y2 [N, OC, H*W]
+          4. (bias)   Tile B[OC] to B2[OC, H*W] offline,
+                      Add Y2 + B2        → Y2b [N, OC, H*W]
+                      (broadcast on the leading N dim — fits the
+                       contiguous-leading-block rule the VectorOPKernel
+                       scheduler expects)
+          5. Reshape  Y2(b) [N,OC,H*W]   → Y [N, OC, H, W]        (alias)
+
+        A Conv is rewritten iff all of:
+          * ``_is_pointwise_conv(node)`` (1×1, stride=1, pad=0, dil=1, group=1)
+          * static rank-4 shapes for X and W with all dims known
+          * ``IC ≤ mm_max_k``                       (MatmulKernel constraint)
+          * if biased: bias is a constant initializer and
+            ``OC * H * W ≤ max_bias_tile_elems``    (avoid weight blowup)
+
+        Otherwise the original Conv is left untouched (and stays on ConvKernel).
+
+        Returns ``(rewritten_model, count)``.
+        """
+        graph = model.graph
+
+        # Shape map covering initializers + value_info + inputs + outputs.
+        shape_map: Dict[str, List[int]] = {}
+        for init in graph.initializer:
+            shape_map[init.name] = list(nph.to_array(init).shape)
+        for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
+            dims = [
+                d.dim_value if d.HasField("dim_value") else 0
+                for d in vi.type.tensor_type.shape.dim
+            ]
+            shape_map[vi.name] = dims
+
+        inits_by_name = {init.name: idx for idx, init in enumerate(graph.initializer)}
+
+        counter            = [0]
+        new_nodes          : List[onnx.NodeProto]      = []
+        new_value_info     : List[onnx.ValueInfoProto] = []
+        new_initializers   : List[onnx.TensorProto]    = []
+
+        for node in graph.node:
+            if not OnnxGraph._is_pointwise_conv(node):
+                new_nodes.append(node)
+                continue
+
+            X  = node.input[0]
+            Wt = node.input[1]
+            Bt = node.input[2] if len(node.input) >= 3 and node.input[2] else None
+            Y  = node.output[0]
+
+            x_shape = shape_map.get(X,  [])
+            w_shape = shape_map.get(Wt, [])
+            if (len(x_shape) != 4 or len(w_shape) != 4
+                    or any(d <= 0 for d in x_shape)
+                    or any(d <= 0 for d in w_shape)):
+                new_nodes.append(node)
+                continue
+
+            N, IC, H, W = x_shape
+            OC, _, kH, kW = w_shape
+            if (kH, kW) != (1, 1):
+                new_nodes.append(node)   # shape disagrees with kernel_shape attr; bail
+                continue
+            if IC > mm_max_k:
+                new_nodes.append(node)   # MatmulKernel can't handle this IC
+                continue
+
+            biased = Bt is not None
+            if biased:
+                # Need the bias as a constant so we can tile it offline.
+                if Bt not in inits_by_name:
+                    new_nodes.append(node)
+                    continue
+                tile_elems = OC * H * W
+                if tile_elems > max_bias_tile_elems:
+                    new_nodes.append(node)
+                    continue
+
+            counter[0] += 1
+            n = counter[0]
+
+            def _mk_shape_init(name: str, shape):
+                arr = np.array(list(shape), dtype=np.int64)
+                new_initializers.append(nph.from_array(arr, name=name))
+
+            # 1. Reshape W [OC, IC, 1, 1] → W2 [OC, IC]
+            W2       = f"_pwconv_{n}_W2"
+            W2_shape = f"_pwconv_{n}_W2_shape"
+            _mk_shape_init(W2_shape, [OC, IC])
+            new_nodes.append(onnx_helper.make_node(
+                "Reshape", inputs=[Wt, W2_shape], outputs=[W2],
+                name=f"_pwconv_{n}_reshape_W"))
+            new_value_info.append(onnx_helper.make_tensor_value_info(
+                W2, TensorProto.FLOAT, [OC, IC]))
+
+            # 2. Reshape X [N, IC, H, W] → X2 [N, IC, H*W]
+            X2       = f"_pwconv_{n}_X2"
+            X2_shape = f"_pwconv_{n}_X2_shape"
+            _mk_shape_init(X2_shape, [N, IC, H * W])
+            new_nodes.append(onnx_helper.make_node(
+                "Reshape", inputs=[X, X2_shape], outputs=[X2],
+                name=f"_pwconv_{n}_reshape_X"))
+            new_value_info.append(onnx_helper.make_tensor_value_info(
+                X2, TensorProto.FLOAT, [N, IC, H * W]))
+
+            # 3. MatMul: W2 [OC, IC] @ X2 [N, IC, H*W] → Y2 [N, OC, H*W]
+            Y2 = f"_pwconv_{n}_Y2"
+            new_nodes.append(onnx_helper.make_node(
+                "MatMul", inputs=[W2, X2], outputs=[Y2],
+                name=f"_pwconv_{n}_matmul"))
+            new_value_info.append(onnx_helper.make_tensor_value_info(
+                Y2, TensorProto.FLOAT, [N, OC, H * W]))
+
+            post = Y2
+            if biased:
+                # 4. Tile bias [OC] → [OC, H*W] so the Add broadcasts on the
+                #    LEADING N dim only (contiguous-leading-block rule).
+                b_init = graph.initializer[inits_by_name[Bt]]
+                b_arr  = nph.to_array(b_init).astype(np.float32)
+                if b_arr.shape != (OC,):
+                    new_nodes.append(node)
+                    counter[0] -= 1
+                    continue
+                b_tiled = np.tile(b_arr.reshape(OC, 1), (1, H * W)).astype(np.float32)
+                B2 = f"_pwconv_{n}_B_tiled"
+                new_initializers.append(nph.from_array(b_tiled, name=B2))
+
+                Y2b = f"_pwconv_{n}_Y2b"
+                new_nodes.append(onnx_helper.make_node(
+                    "Add", inputs=[Y2, B2], outputs=[Y2b],
+                    name=f"_pwconv_{n}_bias_add"))
+                new_value_info.append(onnx_helper.make_tensor_value_info(
+                    Y2b, TensorProto.FLOAT, [N, OC, H * W]))
+                post = Y2b
+
+            # 5. Reshape post [N, OC, H*W] → Y [N, OC, H, W]  (alias)
+            Y_shape = f"_pwconv_{n}_Y_shape"
+            _mk_shape_init(Y_shape, [N, OC, H, W])
+            new_nodes.append(onnx_helper.make_node(
+                "Reshape", inputs=[post, Y_shape], outputs=[Y],
+                name=f"_pwconv_{n}_reshape_Y"))
+            # Y already has value_info from the original Conv output.
+
+        if counter[0] == 0:
+            return model, 0
+
+        new_graph = onnx_helper.make_graph(
+            new_nodes,
+            graph.name,
+            list(graph.input),
+            list(graph.output),
+            initializer=list(graph.initializer) + new_initializers,
+            value_info=list(graph.value_info) + new_value_info,
+        )
+        new_model = onnx_helper.make_model(
+            new_graph, opset_imports=list(model.opset_import)
+        )
+        new_model.ir_version = model.ir_version
+        return new_model, counter[0]
+
     def __init__(self, model_path: str,
-                 dtype: DataType = None) -> None:
+                 dtype: DataType = None,
+                 rewrite_pointwise_conv: bool = True) -> None:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
         _dtype      = dtype if dtype is not None else AP_FIXED_16_8
@@ -252,6 +444,19 @@ class OnnxGraph:
         # ``self.gemm_decomposed_count`` so the report generator can list it
         # as an applied transformation.
         model, self.gemm_decomposed_count = OnnxGraph._preprocess_model(model)
+
+        # Rewrite 1×1 (pointwise) Conv → MatMul (+ optional bias Add).  On
+        # by default — opt out with rewrite_pointwise_conv=False (CLI:
+        # --no-rewrite-pointwise-conv).  ConvKernel's line-buffer /
+        # patch-buffer machinery is pure overhead for K=1; MatmulKernel
+        # handles these much more cleanly and lets the scheduler overlap
+        # pointwise + depthwise on separate lanes.
+        if rewrite_pointwise_conv:
+            model, self.pointwise_conv_rewritten_count = (
+                OnnxGraph._rewrite_pointwise_conv_as_matmul(model)
+            )
+        else:
+            self.pointwise_conv_rewritten_count = 0
 
         graph = model.graph
 
