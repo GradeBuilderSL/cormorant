@@ -20,6 +20,11 @@
  *   BENCH_DATA_DIR     directory containing images.bin/manifest.txt/labels.txt
  *                      (default ".")
  *   BENCH_TOP_K        default top-K (override at runtime via the third arg)
+ *   BENCH_LABEL_OFFSET added to each class index before indexing into the
+ *                      shared 1001-line labels file (default 0).  Use 1 for
+ *                      models whose output emits the 1000 ImageNet classes
+ *                      without the synthetic "background" slot — i.e. the
+ *                      ONNX Model Zoo MobileNetV2 / ResNet etc.
  *
  * Runtime arguments:
  *   ./classify_images [warmup] [top_k]
@@ -50,6 +55,9 @@
 #endif
 #ifndef BENCH_DEFAULT_WARMUP
 #  define BENCH_DEFAULT_WARMUP 1u
+#endif
+#ifndef BENCH_LABEL_OFFSET
+#  define BENCH_LABEL_OFFSET 0u
 #endif
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -274,9 +282,16 @@ int main(int argc, char **argv) {
     char **labels = NULL;
     unsigned n_labels = 0;
     if (read_labels(lbl_path, &labels, &n_labels) != 0) return 1;
-    if (n_labels < BENCH_NUM_CLASSES) {
-        fprintf(stderr, "error: %s has %u lines, expected at least %u\n",
-                lbl_path, n_labels, (unsigned)BENCH_NUM_CLASSES);
+    /* Indices land at [BENCH_LABEL_OFFSET, BENCH_LABEL_OFFSET + NUM_CLASSES) —
+     * verify the labels file is wide enough.  For BENCH_LABEL_OFFSET=1 this
+     * means the file must have at least NUM_CLASSES + 1 lines. */
+    const unsigned labels_required = (unsigned)BENCH_NUM_CLASSES
+                                     + (unsigned)BENCH_LABEL_OFFSET;
+    if (n_labels < labels_required) {
+        fprintf(stderr, "error: %s has %u lines, expected at least %u "
+                        "(num_classes=%u + label_offset=%u)\n",
+                lbl_path, n_labels, labels_required,
+                (unsigned)BENCH_NUM_CLASSES, (unsigned)BENCH_LABEL_OFFSET);
         return 1;
     }
 
@@ -382,8 +397,8 @@ int main(int argc, char **argv) {
         /* Human-readable per-image report on stderr (host streams it live). */
         fprintf(stderr, "image: %s  latency=%.3f ms\n", m->name, dt);
         for (unsigned k = 0; k < topk; ++k) {
-            const char *lab = (preds[k].idx < n_labels)
-                              ? labels[preds[k].idx] : "<unknown>";
+            const unsigned lidx = preds[k].idx + (unsigned)BENCH_LABEL_OFFSET;
+            const char *lab = (lidx < n_labels) ? labels[lidx] : "<unknown>";
             fprintf(stderr, "  %u) [%4u] %-32.32s  prob=%6.2f%%  logit=%6d\n",
                     k + 1u, preds[k].idx, lab,
                     100.0f * preds[k].prob, preds[k].logit);
@@ -396,8 +411,8 @@ int main(int argc, char **argv) {
         fprintf(jbuf, ",\"latency_ms\":%.4f,\"top\":[", dt);
         for (unsigned k = 0; k < topk; ++k) {
             if (k > 0) fputc(',', jbuf);
-            const char *lab = (preds[k].idx < n_labels)
-                              ? labels[preds[k].idx] : "";
+            const unsigned lidx = preds[k].idx + (unsigned)BENCH_LABEL_OFFSET;
+            const char *lab = (lidx < n_labels) ? labels[lidx] : "";
             fprintf(jbuf, "{\"class_id\":%u,\"label\":", preds[k].idx);
             json_escape(jbuf, lab);
             fprintf(jbuf, ",\"prob\":%.6f,\"logit\":%d}",

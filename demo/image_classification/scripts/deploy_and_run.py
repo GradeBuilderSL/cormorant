@@ -239,9 +239,34 @@ _UIO_CMAKE_DEFINE = {
 }
 
 
+def _find_model_cfg(cfg: dict, model_name: str) -> Optional[dict]:
+    """Look up the entry under cfg['models'] whose 'name' matches.  Returns
+    ``None`` if absent — callers should treat that as 'use defaults'."""
+    for m in cfg.get("models", []):
+        if m.get("name") == model_name:
+            return m
+    return None
+
+
+def _model_label_offset(model_cfg: Optional[dict]) -> int:
+    """Return BENCH_LABEL_OFFSET (0 or 1) for a model entry.
+
+    ``labels.skip_background_class: true`` shifts label lookup by +1 so
+    a 1000-class model (no synthetic 'background' slot) can re-use the
+    shared 1001-line labels file without printing 'background' / off-by-one
+    labels.
+    """
+    if not model_cfg:
+        return 0
+    labels = (model_cfg.get("labels") or {})
+    return 1 if labels.get("skip_background_class") else 0
+
+
 def configure_and_build(session: RemoteSession, cfg: dict,
                         remote_proj: str, remote_assets: str,
-                        active_kernels: List[str]) -> Tuple[StepLog, StepLog]:
+                        active_kernels: List[str],
+                        model_cfg: Optional[dict] = None,
+                        ) -> Tuple[StepLog, StepLog]:
     build_dir = f"{remote_proj}/build"
     extra     = " ".join(cfg["remote"].get("cmake_args", []))
 
@@ -262,12 +287,16 @@ def configure_and_build(session: RemoteSession, cfg: dict,
     if top_k:
         top_k_def = f"-DBENCH_TOP_K={top_k}"
 
+    label_offset_def = (f"-DBENCH_LABEL_OFFSET={_model_label_offset(model_cfg)}"
+                        if model_cfg is not None else "")
+
     cmake_cmd = (
         f"cmake -S {shlex.quote(remote_proj)} -B {shlex.quote(build_dir)} "
         f"-DCMAKE_BUILD_TYPE=Release "
         f"-DINFERENCE_TARGET=LINUX "
         f"-DBENCH_DATA_DIR={shlex.quote(remote_assets)} "
-        f"{top_k_def} {profile_def} {' '.join(uio_defs)} {extra} 2>&1"
+        f"{top_k_def} {label_offset_def} {profile_def} "
+        f"{' '.join(uio_defs)} {extra} 2>&1"
     )
 
     t0 = time.monotonic()
@@ -627,8 +656,10 @@ def deploy_models(cfg: dict, projects: List[dict],
             if not up.ok:
                 results.append(res); continue
 
+            model_cfg = _find_model_cfg(cfg, name)
             cm, mk = configure_and_build(session, cfg, remote_proj, remote_assets,
-                                         proj.get("active", []))
+                                         proj.get("active", []),
+                                         model_cfg=model_cfg)
             _record(res, cm)
             if not cm.ok:
                 results.append(res); continue

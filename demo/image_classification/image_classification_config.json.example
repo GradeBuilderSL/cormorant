@@ -71,12 +71,23 @@
       "drive_filename": "mobilenet_v1_1.0_224_no_softmax.onnx",
       "_drive_filename_note": "File name inside the Google Drive folder. The Softmax tail is already stripped in this variant; argmax over the 1001 logits is identical.",
       "preprocess": { "normalize": "tf" },
-      "_preprocess_note": "Per-model preprocess overrides the top-level defaults. Fields not set here inherit from the top-level preprocess block."
+      "_preprocess_note": "TF MobileNetV1 expects (pixel/127.5) - 1.0.",
+      "labels": { "skip_background_class": false },
+      "_labels_note": "TF MobileNetV1 emits 1001 logits, slot 0 == 'background'; label indices align 1:1 with the shared labels file."
+    },
+    {
+      "name": "mobilenet_v2",
+      "drive_filename": "mobilenetv2-12_simplified.onnx",
+      "_drive_filename_note": "File name inside the Google Drive folder.",
+      "preprocess": { "normalize": "imagenet" },
+      "_preprocess_note": "ONNX Model Zoo MobileNetV2 (PyTorch-trained) expects pixel/255 then per-channel (x - mean) / std.",
+      "labels": { "skip_background_class": true },
+      "_labels_note": "ONNX Model Zoo MobileNetV2 emits 1000 logits; shift label lookup by +1 to skip the synthetic 'background' slot at the top of the shared file."
     }
   ],
 
   "drive": {
-    "folder_url": "https://drive.google.com/drive/folders/1sPOCW7-wAs8nOWQwPh7UGjnrWKPkAmiF",
+    "folder_url": "https://drive.google.com/drive/u/0/folders/10B29ZArpvtMsGm0McBC0enFPrkq0Z1vD",
     "_folder_url_note": "Google Drive folder containing the ONNX models. Downloaded with `gdown --folder`."
   },
 

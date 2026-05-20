@@ -153,6 +153,13 @@ Edit `image_classification_config.json`:
   one bin per model under `assets/preprocessed/<model>/images.bin`, and
   `deploy_and_run.py` swaps the right one into the canonical
   `preprocessed/images.bin` path before each model runs on the board.
+* **`labels.skip_background_class`** (per-model) — set to `true` for
+  models whose output has 1000 logits (no synthetic 'background' slot at
+  index 0), e.g. the ONNX Model Zoo MobileNetV2 / ResNet.  The host
+  rebuilds `classify_images` per model with `-DBENCH_LABEL_OFFSET=1`,
+  so the shared 1001-line labels file maps each predicted class index
+  `i` to `labels[i+1]` instead of `labels[i]`.  Leave at `false`
+  (or omit) for TF MobileNetV1 (1001 logits, slot 0 == `background`).
 * **`run.top_k`** — how many predictions to print per image.
 * **`run.warmup`** — inferences run before timing starts.
 

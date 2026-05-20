@@ -142,6 +142,10 @@ def _patch_cmake_for_classifier(project_dir: Path) -> None:
         "        target_compile_definitions(classify_images PRIVATE\n"
         "            BENCH_TOP_K=${BENCH_TOP_K})\n"
         "    endif()\n"
+        "    if(DEFINED BENCH_LABEL_OFFSET)\n"
+        "        target_compile_definitions(classify_images PRIVATE\n"
+        "            BENCH_LABEL_OFFSET=${BENCH_LABEL_OFFSET})\n"
+        "    endif()\n"
         "    foreach(_macro IN ITEMS\n"
         "            INFERENCE_VECTOROPKERNEL_INSTANCE\n"
         "            INFERENCE_MATMULKERNEL_INSTANCE\n"
@@ -170,9 +174,11 @@ def _emit_glue(project_dir: Path, *, model_name: str,
     in_size_macro  = f"INFERENCE_{in_t.c_name.upper()}_SIZE"
     out_size_macro = f"INFERENCE_{out_t.c_name.upper()}_SIZE"
 
-    if out_t.numel != 1001:
-        _log(f"  warning: output numel={out_t.numel}, expected 1001 "
-             "(MobileNetV1 1.0/224 with background class)")
+    if out_t.numel not in (1000, 1001):
+        _log(f"  warning: output numel={out_t.numel}, expected 1000 "
+             "(ONNX Model Zoo MobileNetV2 / ResNet — set "
+             "labels.skip_background_class=true) or 1001 (TF "
+             "MobileNetV1 with the synthetic 'background' slot)")
 
     active = [kd.name for kd in gen._active_kernels]
     init_args = ", ".join(_KERNEL_INIT_MACRO[k] for k in active)
