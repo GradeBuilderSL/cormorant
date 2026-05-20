@@ -29,9 +29,11 @@ using AccData_t = @MM_ACC_DATA_TYPE@;
 // ---------------------------------------------------------------------------
 // Tile-size constants — compile-time parameters for the HLS kernel.
 //
-// kTileN  Row interleave depth.  Must be ≥ MAC latency (≈3 for ap_fixed<16,8>)
-//         to achieve II=1 in the inner pipeline.  Must be a power of two so
-//         that ki % kTileN compiles to a bitwise AND.
+// kTileN  Row-lane interleave depth.  Must be ≥ MAC latency (≈3 for
+//         ap_fixed<16,8>) to achieve II=1 in the inner pipeline.  Must be a
+//         power of two so that ki % kTileN compiles to a bitwise AND.
+//         kTileN rows are processed per inner ki sweep; larger N is handled
+//         by the outer n_grp loop (see kMaxN).
 //
 // kTileM  Parallel output columns per pipeline cycle.  Each column maps to
 //         one DSP accumulator lane.  Must be a power of two (AXI burst
@@ -41,12 +43,21 @@ using AccData_t = @MM_ACC_DATA_TYPE@;
 //         Must be a power of two (Q6 in design doc: avoids divider in HLS).
 //
 // kMaxK   Compile-time upper bound on the inner dimension K.
-//         Determines a_buf row length: a_buf[kTileN][kMaxK].
+//         Determines a_buf row length: a_buf[kMaxN][kMaxK].
 //         Models with K > kMaxK are rejected by the inference scheduler.
+//
+// kMaxN   Compile-time upper bound on the rows held in the on-chip A buffer
+//         in one pass.  The kernel processes N in blocks of kMaxN rows;
+//         within a block, B is loaded once per (m_tile, k_tile) and reused
+//         across ALL block rows (the persistent-A loop-swap optimisation).
+//         For N ≤ kMaxN the outer n_block loop runs exactly once and A is
+//         loaded into BRAM only once per kernel invocation.  Must be a
+//         multiple of kTileN so the n_grp partitioning is exact.
 // ---------------------------------------------------------------------------
 static constexpr unsigned kTileN = @MM_TILE_N@;
 static constexpr unsigned kTileM = @MM_TILE_M@;
 static constexpr unsigned kTileK = @MM_TILE_K@;
 static constexpr unsigned kMaxK  = @MM_MAX_K@;
+static constexpr unsigned kMaxN  = @MM_MAX_N@;
 
 static constexpr unsigned kSeed  = 42;

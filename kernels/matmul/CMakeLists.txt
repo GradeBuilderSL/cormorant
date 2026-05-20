@@ -63,8 +63,8 @@ function(matmul_load_constants platform_json out_var_prefix)
             "MatmulKernel: platform file not found: ${platform_json}")
     endif()
     file(READ "${platform_json}" _pjson)
-    set(_keys "tile_n;tile_m;tile_k;max_k")
-    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K")
+    set(_keys "tile_n;tile_m;tile_k;max_k;max_n")
+    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K;MAX_N")
     foreach(_k _vn IN ZIP_LISTS _keys _var_names)
         string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels matmul "${_k}")
         if(_err)
@@ -78,7 +78,8 @@ endfunction()
 matmul_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" MM)
 message(STATUS "MatmulKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
                "TILE_N=${MM_TILE_N} TILE_M=${MM_TILE_M} "
-               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K}")
+               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K} "
+               "MAX_N=${MM_MAX_N}")
 
 # Re-run cmake configure automatically if a platform JSON changes, so the
 # generated Config.h tracks JSON edits without a manual cmake re-run.
@@ -233,7 +234,8 @@ message(STATUS "MatmulKernel: targets — matmul_kernel, matmul_kernel_float, Te
 message(STATUS "MatmulKernel: Data_t=${MM_DATA_TYPE}  "
                "AccData_t=${MM_ACC_DATA_TYPE}  "
                "TILE_N=${MM_TILE_N}  TILE_M=${MM_TILE_M}  "
-               "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}")
+               "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}  "
+               "MAX_N=${MM_MAX_N}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
@@ -302,6 +304,7 @@ if(MM_VITIS_HLS)
         set(_save_TILE_M "${MM_TILE_M}")
         set(_save_TILE_K "${MM_TILE_K}")
         set(_save_MAX_K  "${MM_MAX_K}")
+        set(_save_MAX_N  "${MM_MAX_N}")
 
         matmul_load_constants("${_MM_PLATFORM_FILE}" MM)
 
@@ -315,6 +318,7 @@ if(MM_VITIS_HLS)
         set(MM_TILE_M "${_save_TILE_M}")
         set(MM_TILE_K "${_save_TILE_K}")
         set(MM_MAX_K  "${_save_MAX_K}")
+        set(MM_MAX_N  "${_save_MAX_N}")
 
         # set_part TCL command (with optional -board)
         if(_p_board)

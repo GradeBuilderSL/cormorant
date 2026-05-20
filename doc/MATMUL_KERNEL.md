@@ -8,11 +8,18 @@ the `axi_demo` project. The kernel computes a batch of independent 2-D
 matrix products on row-major matrices, with optional per-operand batch
 broadcasting (a stride of 0 reuses `A` or `B` across every batch step).
 
-A three-level tiling strategy (output rows `kTileN` × output columns
-`kTileM` × inner dimension `kTileK`) keeps the working set on-chip and feeds
-an II=1 K-reduction loop. Row-lane rotation (`n1 = ki % kTileN`) breaks the
-accumulator read-after-write hazard so the inner loop sustains one K-step per
-clock across `kTileM` parallel MAC lanes.
+A four-level tiling strategy (N-block `kMaxN` × output rows `kTileN`
+lane-rotation × output columns `kTileM` × inner dimension `kTileK`) keeps
+the working set on-chip and feeds an II=1 K-reduction loop.  The kernel
+loads up to `kMaxN` rows of A into BRAM once per outer pass and **shares
+each loaded B-tile across all those rows** (n_grp wrapper inside the
+m_tile/k_tile nest) — eliminating the `n_tiles − 1` redundant B-tile DDR
+reads that the prior single-loop-nest version paid per (m_tile, k_tile).
+Row-lane rotation (`n1 = ki % kTileN`) still breaks the accumulator
+read-after-write hazard so the inner loop sustains one K-step per clock
+across `kTileM` parallel MAC lanes.  See
+[MATMUL_OPTIMISATION.md §3](MATMUL_OPTIMISATION.md) for the measured
+-38.6 % impact.
 
 ---
 
@@ -56,10 +63,11 @@ CMake substitutes the data types and tile constants into `Config.h`:
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `AccData_t` | `ap_fixed<32,16>` | Accumulator type (wider range, avoids overflow) |
-| `kTileN` | 4 | Output-row tile / accumulator-lane interleave depth. Power of 2; must be ≥ MAC latency (≈3) for II=1 |
+| `kTileN` | 4 | Lane-rotation interleave depth (rows processed per inner ki sweep). Power of 2; must be ≥ MAC latency (≈3) for II=1 |
 | `kTileM` | 16 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2 |
 | `kTileK` | 256 | On-chip B-buffer K-slice depth. Power of 2 (so `k_tile` indexing needs no divider) |
-| `kMaxK` | 2048 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf`. Models with `K > kMaxK` are rejected by the scheduler |
+| `kMaxK` | 2048 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf` column count. Models with `K > kMaxK` are rejected by the scheduler |
+| `kMaxN` | 16 | Compile-time upper bound on rows held in the on-chip A buffer per outer pass. `N > kMaxN` is split into ceil(N/kMaxN) outer n_block iterations, each reloading A; tests with `N ≤ kMaxN` load A exactly once |
 
 If Vitis HLS headers are unavailable at configure time, the types fall back
 to `float` / `double`.
@@ -85,27 +93,42 @@ it is read within a call):
 
 | Buffer | Shape | Storage | Holds |
 |--------|-------|---------|-------|
-| `a_buf` | `[kTileN][kMaxK]` | `kTileN` BRAMs (partition dim 1) | `kTileN` full rows of A for the current `n_tile`; loaded once, reused across all `m_tile`s and `k_tile`s |
-| `b_tile` | `[kTileK][kTileM]` | `kTileM` BRAMs (partition dim 2) | One `kTileK × kTileM` block of B; reloaded from DDR per `(m_tile, k_tile)` |
-| `acc` | `[kTileN][kTileM]` | registers (partition dim 0) | `kTileN × kTileM` partial dot products; cleared per `m_tile` |
+| `a_buf` | `[kMaxN][kMaxK]` | cyclic factor=`kTileN` on dim 1 → `kTileN` BRAMs each `(kMaxN/kTileN)·kMaxK` deep | Up to `kMaxN` full rows of A for the current `n_block`; loaded once, reused across all `m_tile`s, `k_tile`s, and `n_grp`s |
+| `b_tile` | `[kTileK][kTileM]` | `kTileM` BRAMs (partition complete dim 2) | One `kTileK × kTileM` block of B; reloaded from DDR per `(m_tile, k_tile)` — shared across every `n_grp` in the block (no per-`n_tile` reload, unlike the prior version) |
+| `acc` | `[kMaxN][kTileM]` | registers (partition complete dim 0) | `kMaxN × kTileM` partial dot products; cleared per `m_tile`; runtime `n_idx` index synthesises as a kMaxN-way MUX + decoder |
 
 ```cpp
-static Data_t    a_buf [kTileN][kMaxK];
+static Data_t    a_buf [kMaxN ][kMaxK];
 static Data_t    b_tile[kTileK][kTileM];
-static AccData_t acc   [kTileN][kTileM];
-#pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=1   // kTileN parallel row banks
-#pragma HLS ARRAY_PARTITION variable=b_tile complete dim=2   // kTileM parallel column banks
-#pragma HLS ARRAY_PARTITION variable=acc    complete dim=0   // all kTileN·kTileM in registers
+static AccData_t acc   [kMaxN ][kTileM];
+#pragma HLS ARRAY_PARTITION variable=a_buf  cyclic factor=kTileN dim=1
+#pragma HLS ARRAY_PARTITION variable=b_tile complete             dim=2
+#pragma HLS ARRAY_PARTITION variable=acc    complete             dim=0
 ```
 
-`a_buf` is partitioned on dim 1 so all `kTileN` rows can be read in the same
-cycle — the II=1 K-reduction reads `a_buf[n1][…]` for a different `n1` each
-iteration. `b_tile` is partitioned on dim 2 so the `kTileM`-wide unrolled
-inner loop reads one element per column bank per cycle. `acc` is fully
-partitioned so all `kTileN·kTileM` accumulators are independent registers.
+`a_buf` is cyclically partitioned on dim 1 with factor `kTileN`: the bank
+index is `n_idx % kTileN` (the rotating `n1` from the K-loop — compile-time
+within each pipeline iteration), and the within-bank address is
+`(n_idx / kTileN, k_off + kk) = (n_grp, k_off + kk)` (constant per ki sweep,
+varying per n_grp).  Each bank is therefore a single-port BRAM that issues
+one read per cycle.
 
-The kernel is **not** a `DATAFLOW` design — it is a single sequential loop
-nest with each load / reduce / write loop pipelined at II=1.
+`b_tile` is partitioned on dim 2 so the `kTileM`-wide unrolled inner loop
+reads one element per column bank per cycle.
+
+`acc` is fully partitioned on dim 0 — every `(n, m)` is an individual
+register.  An earlier cyclic-on-dim-1 layout (matching `a_buf`) forced
+II=2 because HLS treated the depth-(kMaxN/kTileN) register-array banks as
+constrained-port memories; full register partitioning sidesteps that.  The
+lane-rotation WAW distance is still `kTileN` cycles per register, enough
+for the ap_fixed MAC pipeline.
+
+The kernel is **not** a `DATAFLOW` design — it is a sequential loop nest
+with each load / reduce / write loop pipelined at II=1.  A DATAFLOW variant
+was tried and rejected in 2026-05 (see [MATMUL_OPTIMISATION.md §2](MATMUL_OPTIMISATION.md));
+the speedup that did land instead is the persistent-A loop swap in §3 of
+that document, which keeps the same sequential structure but eliminates
+per-n_tile B-tile DDR reloads.
 
 ---
 
@@ -113,43 +136,54 @@ nest with each load / reduce / write loop pipelined at II=1.
 
 ```
 for bi in [0, batch)                              // a/b/c advanced by *_batch_stride
-  for n_tile in [0, ceil(n / kTileN))
-    n_off, n_valid = n_tile·kTileN, min(kTileN, n - n_off)
+  for n_block in [0, ceil(n / kMaxN))             // A loaded once per n_block
+    n_block_off   = n_block · kMaxN
+    n_block_valid = min(kMaxN, n - n_block_off)
+    n_grps        = ceil(n_block_valid / kTileN)
 
-    // LOAD a_buf — n_valid rows × k columns, one burst read per row   PIPELINE II=1
-    for n1 in [0, n_valid): for ki in [0, k):
-      a_buf[n1][ki] = a[(n_off + n1)·k + ki]
+    // LOAD a_buf — n_block_valid rows × k columns, one burst per row   PIPELINE II=1
+    for n1 in [0, n_block_valid): for ki in [0, k):
+      a_buf[n1][ki] = a[(n_block_off + n1)·k + ki]
 
     for m_tile in [0, ceil(m / kTileM))
       m_off, m_valid = m_tile·kTileM, min(kTileM, m - m_off)
 
-      // CLEAR acc — kTileN × kTileM registers, fully unrolled → 1 cycle
+      // CLEAR acc — kMaxN × kTileM registers, fully unrolled → 1 cycle
       for n1, m1 (UNROLL): acc[n1][m1] = 0
 
       for k_tile in [0, ceil(k / kTileK))
         k_off, k_valid = k_tile·kTileK, min(kTileK, k - k_off)
 
-        // LOAD b_tile — k_valid rows × m_valid cols, burst read per row  PIPELINE II=1
+        // LOAD b_tile — k_valid rows × m_valid cols, burst per row     PIPELINE II=1
+        //   ↳ issued ONCE per (m_tile, k_tile) — broadcast across every
+        //     n_grp below; the prior version reissued this DDR read per n_tile.
         for k1 in [0, k_valid): for m1 in [0, m_valid):
           b_tile[k1][m1] = b[(k_off + k1)·m + (m_off + m1)]
 
-        // K-REDUCTION — iterates k_valid·kTileN times                    PIPELINE II=1
-        for ki in [0, k_valid·kTileN):
-          n1 = ki % kTileN          // row lane — rotates 0..kTileN-1
-          kk = ki / kTileN          // K index local to this k_tile
-          a_val = a_buf[n1][k_off + kk]
-          for m1 in [0, kTileM) UNROLL:
-            acc[n1][m1] += AccData_t(a_val) · AccData_t(b_tile[kk][m1])
+        // K-REDUCTION — n_grp wrapper iterates ceil(n_block_valid / kTileN) groups,
+        // each group's ki sweep is k_valid·kTileN cycles                PIPELINE II=1
+        for n_grp in [0, n_grps):
+          for ki in [0, k_valid·kTileN):
+            n1     = ki % kTileN          // lane within group — rotates 0..kTileN-1
+            kk     = ki / kTileN          // K index local to this k_tile
+            n_idx  = n_grp·kTileN + n1    // absolute row in a_buf / acc
+            a_val  = a_buf[n_idx][k_off + kk]
+            for m1 in [0, kTileM) UNROLL:
+              acc[n_idx][m1] += AccData_t(a_val) · AccData_t(b_tile[kk][m1])
 
-      // WRITE C — saturate_cast acc → C, burst write per row             PIPELINE II=1
-      for n1 in [0, n_valid): for m1 in [0, m_valid):
-        c[(n_off + n1)·m + (m_off + m1)] = saturate_cast<Data_t>(acc[n1][m1])
+      // WRITE C — saturate_cast acc → C, burst write per row            PIPELINE II=1
+      for n1 in [0, n_block_valid): for m1 in [0, m_valid):
+        c[(n_block_off + n1)·m + (m_off + m1)] = saturate_cast<Data_t>(acc[n1][m1])
 ```
 
-`A` is loaded once per `n_tile` and reused across every `m_tile`/`k_tile`;
-`B` is reloaded per `(m_tile, k_tile)`. Partial last tiles load only the
-valid rows/columns — unused `a_buf`/`b_tile` lanes hold stale data but feed
-`acc` lanes that are never written out to `C`.
+`A` is loaded once per `n_block` (i.e. once per kernel invocation when
+`N ≤ kMaxN`, which covers every test geometry shipping today); the single
+loaded copy is reused across every `m_tile` × `k_tile` × `n_grp`.  `B` is
+reloaded per `(m_tile, k_tile)` and shared across every `n_grp` in the
+n_block.  Partial last tiles load only the valid rows/columns — unused
+`a_buf`/`b_tile` lanes hold stale data and the trailing `acc` lanes
+(`n_idx ≥ n_block_valid`) are written by spurious MACs but never emitted
+to C.
 
 ### HLS pragmas applied
 
@@ -157,9 +191,9 @@ valid rows/columns — unused `a_buf`/`b_tile` lanes hold stale data but feed
 |--------|----------|--------|
 | `INTERFACE m_axi … bundle=gmem0/1/2` | top-level | AXI memory ports for A / B / C |
 | `INTERFACE s_axilite … bundle=ctrl` | every scalar + `return` | AXI-Lite register file |
-| `ARRAY_PARTITION variable=a_buf complete dim=1` | `a_buf[kTileN][kMaxK]` | `kTileN` parallel row banks |
+| `ARRAY_PARTITION variable=a_buf cyclic factor=kTileN dim=1` | `a_buf[kMaxN][kMaxK]` | `kTileN` parallel row banks; n_grp selects within-bank position |
 | `ARRAY_PARTITION variable=b_tile complete dim=2` | `b_tile[kTileK][kTileM]` | `kTileM` parallel column banks |
-| `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileN][kTileM]` | all accumulators in registers |
+| `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kMaxN][kTileM]` | all `kMaxN·kTileM` accumulators in registers (kMaxN-way runtime MUX) |
 | `PIPELINE II=1` | a_buf load / b_tile load / K-reduction / C write | One iteration per clock |
 | `UNROLL` | inner `m1` loop + the `acc` clear | `kTileM` parallel MAC lanes |
 
@@ -308,15 +342,16 @@ an IP-catalog archive.
 | **Operation** | `C = A × B`, batched, row-major |
 | **Data type** | `ap_fixed<16,8>` (default) or `float` |
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `double` |
-| **Tiling** | `kTileN=4` rows × `kTileM=16` columns × `kTileK=256` inner |
+| **Tiling** | `kMaxN=16` n_block × `kTileN=4` lane-rotation × `kTileM=16` columns × `kTileK=256` inner |
 | **Inner-loop parallelism** | `kTileM=16` MACs/cycle (unrolled `m1` lanes) |
 | **Initiation interval** | II=1 in every load / reduce / write loop |
-| **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
-| **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`) |
-| **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM), `acc` (registers) |
-| **A reuse** | `a_buf` loaded once per `n_tile`, reused across all `m_tile`/`k_tile` |
+| **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` within each n_grp (RAW distance = `kTileN`) |
+| **Architecture** | Sequential tiled loop nest (not `DATAFLOW`) with persistent-A loop swap |
+| **On-chip buffers** | `a_buf` (BRAM, kMaxN rows), `b_tile` (BRAM), `acc` (registers, kMaxN×kTileM) |
+| **A reuse** | `a_buf` loaded once per `n_block`; for `N ≤ kMaxN` (every shipping test), exactly once per kernel call |
+| **B reuse** | `b_tile` loaded once per `(m_tile, k_tile)`; broadcast across every `n_grp` in the n_block (vs prior version reloading per n_tile) |
 | **Batch broadcasting** | `a_batch_stride` / `b_batch_stride` = 0 reuses A / B |
-| **Inner-dimension limit** | `k ≤ kMaxK` (2048, compile-time); `n` / `m` / `batch` unbounded |
+| **Inner-dimension limit** | `k ≤ kMaxK` (2048, compile-time); `n` / `m` / `batch` unbounded (large `N` paginates over multiple `n_block`s) |
 | **AXI master ports** | 3 (gmem0 `a`, gmem1 `b`, gmem2 `c`) |
 | **AXI-Lite registers** | 10 scalars/pointers + `return` |
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` at the C-write |
