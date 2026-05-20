@@ -109,6 +109,200 @@ class TestConvNodeValidation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# ConvNode hardware-bound validation
+#
+# These bounds come from platforms/<AXI_PLATFORM>.json (see _conv_hw_config)
+# and match the kernel's compile-time bias_buf / line_buf /
+# partial_outputs sizes.  Each model below violates exactly one bound by
+# exactly one unit; the tests assert that SchedulerError fires AND that
+# the message names the violated constraint so users get an actionable
+# error.  Boundary-ok models confirm the inequality is `≤` (limit value
+# passes) rather than `<`.
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(_conv_models_exist(),
+                     "Run test/gen_conv_models.py first")
+class TestConvNodeHardwareBounds(unittest.TestCase):
+    """ConvNode rejects layer geometries the kernel cannot service."""
+
+    def test_in_ch_too_large_raises(self):
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_conv_model("conv_unsupported_in_ch.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("in_ch=1025", msg)
+        self.assertIn("kMaxInCh", msg)
+
+    def test_out_ch_too_large_raises(self):
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_conv_model("conv_unsupported_out_ch.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("out_ch=1025", msg)
+        self.assertIn("kMaxOutCh", msg)
+
+    def test_dil_h_overflows_line_buf_rows_raises(self):
+        """kh=4 dilation_h=6 → vertical span 19 > kMaxLineBufRows=16."""
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_conv_model("conv_unsupported_dil_h.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("vertical span", msg)
+        self.assertIn("kMaxLineBufRows", msg)
+        self.assertIn("19", msg)   # the computed span
+
+    def test_dil_w_overflows_line_buf_cols_raises(self):
+        """kw=4 dilation_w=22 → horizontal span 67 > kMaxLineBufCols=64."""
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_conv_model("conv_unsupported_dil_w.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("horizontal span", msg)
+        self.assertIn("kMaxLineBufCols", msg)
+        self.assertIn("67", msg)
+
+    def test_acc_persist_overflow_raises(self):
+        """out_w*out_ch = 256*257 = 65792 > kMaxAccPersistEntries=65536."""
+        with self.assertRaises(SchedulerError) as cm:
+            OnnxGraph(_conv_model("conv_unsupported_acc_persist.onnx"))
+        msg = str(cm.exception)
+        self.assertIn("out_w*out_ch", msg)
+        self.assertIn("kMaxAccPersistEntries", msg)
+        self.assertIn("65792", msg)
+
+    def test_in_ch_at_limit_parses(self):
+        """in_ch=1024 == kMaxInCh must parse — bound is `≤`, not `<`."""
+        g = OnnxGraph(_conv_model("conv_in_ch_at_limit.onnx"))
+        sn = g.nodes[0]
+        self.assertIsInstance(sn, ConvNode)
+        self.assertEqual(sn.in_ch, 1024)
+
+    def test_dil_h_span_at_limit_parses(self):
+        """span=16 == kMaxLineBufRows must parse — boundary inclusive."""
+        g = OnnxGraph(_conv_model("conv_dil_h_at_limit.onnx"))
+        sn = g.nodes[0]
+        self.assertIsInstance(sn, ConvNode)
+        self.assertEqual((sn.kh - 1) * sn.dilation_h + 1, 16)
+
+    def test_acc_persist_at_limit_parses(self):
+        """out_w*out_ch = 256*256 = 65536 must parse — boundary inclusive."""
+        g = OnnxGraph(_conv_model("conv_acc_persist_at_limit.onnx"))
+        sn = g.nodes[0]
+        self.assertIsInstance(sn, ConvNode)
+        self.assertEqual(sn.out_w * sn.out_ch, 65536)
+
+
+class TestConvHwConfigResolver(unittest.TestCase):
+    """The hardware-bound resolver reads from the platform JSON
+    (platforms/<AXI_PLATFORM>.json), the same source the C++ CMake build
+    consumes via ``conv_load_constants()``.  Tests use the public
+    ``resolve()`` function so failure paths can be probed without
+    reloading the module — that would replace the
+    ``ConvHwConfigError`` class object and break ``assertRaises``."""
+
+    def _platforms_dir(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parent.parent.parent / "platforms")
+
+    def test_constants_match_kv260_json(self):
+        """Resolved values match platforms/kv260.json's kernels.conv —
+        guards against drift between the Python validator and the JSON
+        the C++ build reads."""
+        import json
+
+        from src._conv_hw_config import (
+            CONV_MAX_IN_CH, CONV_MAX_OUT_CH,
+            CONV_MAX_LINE_BUF_ROWS, CONV_MAX_LINE_BUF_COLS,
+            CONV_MAX_ACC_PERSIST_ENTRIES,
+        )
+        with (self._platforms_dir() / "kv260.json").open() as f:
+            cfg = json.load(f)["kernels"]["conv"]
+        self.assertEqual(CONV_MAX_IN_CH,               cfg["max_in_ch"])
+        self.assertEqual(CONV_MAX_OUT_CH,              cfg["max_out_ch"])
+        self.assertEqual(CONV_MAX_LINE_BUF_ROWS,       cfg["max_line_buf_rows"])
+        self.assertEqual(CONV_MAX_LINE_BUF_COLS,       cfg["max_line_buf_cols"])
+        self.assertEqual(CONV_MAX_ACC_PERSIST_ENTRIES, cfg["max_acc_persist_entries"])
+
+    def test_resolve_alternate_platform_picks_up_overrides(self):
+        """``resolve('<name>')`` reads ``platforms/<name>.json`` — same
+        mechanism the CMake build uses when ``-DAXI_PLATFORM=<name>``
+        is passed."""
+        import json
+        from src._conv_hw_config import resolve
+
+        alt = self._platforms_dir() / "_test_conv_override.json"
+        alt.write_text(json.dumps({
+            "description": "test-only override",
+            "part": "x", "clock": 100,
+            "kernels": {"conv": {
+                "tile_m": 8, "tile_ic": 16,
+                "max_kh": 7, "max_kw": 7,
+                "max_in_ch":               512,          # <-- the override
+                "max_out_ch":              1024,
+                "max_line_buf_rows":       16,
+                "max_line_buf_cols":       64,
+                "max_acc_persist_entries": 65536,
+                "max_m_per_group":         4,
+            }},
+        }))
+        try:
+            cfg = resolve("_test_conv_override")
+            self.assertEqual(cfg["CONV_MAX_IN_CH"],  512)
+            self.assertEqual(cfg["CONV_MAX_OUT_CH"], 1024)
+        finally:
+            alt.unlink(missing_ok=True)
+
+    def test_missing_platform_file_raises(self):
+        """``resolve()`` with an unknown platform name must error loudly
+        rather than silently fall back to defaults."""
+        from src._conv_hw_config import ConvHwConfigError, resolve
+
+        with self.assertRaises(ConvHwConfigError) as cm:
+            resolve("_does_not_exist_xyzzy_conv")
+        self.assertIn("not found", str(cm.exception))
+
+    def test_missing_kernels_conv_section_raises(self):
+        """A platform JSON with no ``kernels.conv`` object must error —
+        no silent default fallback."""
+        import json
+        from src._conv_hw_config import ConvHwConfigError, resolve
+
+        bad = self._platforms_dir() / "_test_no_conv_section.json"
+        bad.write_text(json.dumps({"description": "no kernels section",
+                                   "part": "x", "clock": 100}))
+        try:
+            with self.assertRaises(ConvHwConfigError) as cm:
+                resolve("_test_no_conv_section")
+            self.assertIn("kernels.conv", str(cm.exception))
+        finally:
+            bad.unlink(missing_ok=True)
+
+    def test_missing_required_field_raises(self):
+        """A platform JSON missing one of the mandatory ``kernels.conv``
+        fields (e.g. max_in_ch) must error and name the missing field."""
+        import json
+        from src._conv_hw_config import ConvHwConfigError, resolve
+
+        bad = self._platforms_dir() / "_test_conv_missing_field.json"
+        bad.write_text(json.dumps({
+            "description": "missing max_in_ch",
+            "part": "x", "clock": 100,
+            "kernels": {"conv": {
+                "tile_m": 8, "tile_ic": 16,
+                "max_kh": 7, "max_kw": 7,
+                # max_in_ch deliberately absent
+                "max_out_ch":              1024,
+                "max_line_buf_rows":       16,
+                "max_line_buf_cols":       64,
+                "max_acc_persist_entries": 65536,
+                "max_m_per_group":         4,
+            }},
+        }))
+        try:
+            with self.assertRaises(ConvHwConfigError) as cm:
+                resolve("_test_conv_missing_field")
+            self.assertIn("max_in_ch", str(cm.exception))
+        finally:
+            bad.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # ConvNode geometry fields
 # ---------------------------------------------------------------------------
 

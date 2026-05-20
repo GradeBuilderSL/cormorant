@@ -831,6 +831,24 @@ class MatmulNode:
 # ConvNode                                                             #
 # ------------------------------------------------------------------ #
 
+# ---------------------------------------------------------------------------
+# Hardware-side bounds — single source of truth is the platform JSON
+# (platforms/<AXI_PLATFORM>.json, ``kernels.conv`` object — see
+# doc/CONV_KERNEL.md §3 for the field reference).  The resolver in
+# ``_conv_hw_config`` reads the same file the C++ CMake build consumes via
+# ``conv_load_constants()`` in kernels/conv/CMakeLists.txt, so a CLI
+# invocation targeting a non-default board can stay in sync with
+# ``cmake -DAXI_PLATFORM=<name>``.
+# ---------------------------------------------------------------------------
+from ._conv_hw_config import (  # noqa: E402
+    CONV_MAX_IN_CH,
+    CONV_MAX_OUT_CH,
+    CONV_MAX_LINE_BUF_ROWS,
+    CONV_MAX_LINE_BUF_COLS,
+    CONV_MAX_ACC_PERSIST_ENTRIES,
+)
+
+
 @dataclass
 class ConvNode:
     """One ONNX Conv operator mapped to one XConvkernel invocation.
@@ -1055,6 +1073,71 @@ class ConvNode:
         inputs_list: List[TensorInfo] = [x_info, w_info]
         if has_b and b_info is not None:
             inputs_list.append(b_info)
+
+        # ------------------------------------------------------------------
+        # Hardware-bound validation — see _conv_hw_config for where these
+        # constants come from (platforms/<AXI_PLATFORM>.json `kernels.conv`).
+        # ConvKernel sizes its bias buffer, line buffer and persistent
+        # accumulator at compile time, so a layer violating any of these
+        # bounds has no runtime fallback — reject at parse time rather than
+        # emit code the kernel can't service.  Reference: doc/CONV_KERNEL.md
+        # §3 "Runtime constraints validated by the inference scheduler".
+        #
+        # in_h, in_w, and out_h are NOT capped — the kernel handles them
+        # via transparent tiling (ow-tiling, oh-chunking, M-grouping).
+        # ------------------------------------------------------------------
+        node_label = node.name or "Conv"
+        if c_in > CONV_MAX_IN_CH:
+            raise SchedulerError(
+                f"Conv node '{node_label}': in_ch={c_in} exceeds "
+                f"ConvKernel's compile-time limit "
+                f"kMaxInCh={CONV_MAX_IN_CH}.  Raise "
+                f"'kernels.conv.max_in_ch' in the platform JSON "
+                f"(platforms/<AXI_PLATFORM>.json) and rebuild."
+            )
+        if m_val > CONV_MAX_OUT_CH:
+            raise SchedulerError(
+                f"Conv node '{node_label}': out_ch={m_val} exceeds "
+                f"ConvKernel's compile-time limit "
+                f"kMaxOutCh={CONV_MAX_OUT_CH}.  Raise "
+                f"'kernels.conv.max_out_ch' in the platform JSON "
+                f"(platforms/<AXI_PLATFORM>.json) and rebuild."
+            )
+        v_span = (kh_val - 1) * dh + 1
+        if v_span > CONV_MAX_LINE_BUF_ROWS:
+            raise SchedulerError(
+                f"Conv node '{node_label}': dilated vertical span "
+                f"(kh-1)*dilation_h + 1 = ({kh_val}-1)*{dh} + 1 = "
+                f"{v_span} exceeds line-buffer row capacity "
+                f"kMaxLineBufRows={CONV_MAX_LINE_BUF_ROWS} (one "
+                f"kernel-height window must fit).  Reduce dilation_h "
+                f"or raise 'kernels.conv.max_line_buf_rows' in the "
+                f"platform JSON (must remain a power of 2)."
+            )
+        h_span = (kw_val - 1) * dw + 1
+        if h_span > CONV_MAX_LINE_BUF_COLS:
+            raise SchedulerError(
+                f"Conv node '{node_label}': dilated horizontal span "
+                f"(kw-1)*dilation_w + 1 = ({kw_val}-1)*{dw} + 1 = "
+                f"{h_span} exceeds line-buffer column capacity "
+                f"kMaxLineBufCols={CONV_MAX_LINE_BUF_COLS} (one "
+                f"kernel-width window must fit; in_w wider than this "
+                f"is auto-tiled along ow).  Reduce dilation_w or "
+                f"raise 'kernels.conv.max_line_buf_cols' in the "
+                f"platform JSON (must remain a power of 2)."
+            )
+        row_entries = w_out * m_val
+        if row_entries > CONV_MAX_ACC_PERSIST_ENTRIES:
+            raise SchedulerError(
+                f"Conv node '{node_label}': out_w*out_ch = "
+                f"{w_out}*{m_val} = {row_entries} exceeds persistent "
+                f"accumulator capacity "
+                f"kMaxAccPersistEntries={CONV_MAX_ACC_PERSIST_ENTRIES} "
+                f"(one output row must fit; taller out_h is auto-chunked "
+                f"along oh).  Raise 'kernels.conv.max_acc_persist_entries' "
+                f"in the platform JSON (each 4096 entries spends one URAM "
+                f"block)."
+            )
 
         return cls(
             onnx_node=node,

@@ -445,6 +445,170 @@ def gen_conv_two_layer_vgg() -> None:
     _save(model, "conv_two_layer_vgg.onnx")
 
 
+# ---------------------------------------------------------------------------
+# Hardware-bound violation models — must each raise SchedulerError when
+# loaded by OnnxGraph.  The bounds come from
+# platforms/kv260.json (kernels.conv): max_in_ch=1024, max_out_ch=1024,
+# max_line_buf_rows=16, max_line_buf_cols=64, max_acc_persist_entries=65536.
+#
+# Each model violates exactly one bound by exactly one unit so the test
+# can identify which constraint fired.  Geometries are otherwise minimal
+# to keep ONNX shape-inference fast and the model files tiny.  Two
+# boundary-ok models confirm the inequality is `≤` (limit value passes).
+# ---------------------------------------------------------------------------
+def gen_unsupported_in_ch_too_large() -> None:
+    """in_ch=1025 violates kMaxInCh=1024."""
+    w_data = np.zeros((4, 1025, 1, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_unsupported_in_ch",
+        inputs=[_vi("X", [1, 1025, 2, 2])],
+        outputs=[_vi("Y", [1, 4, 2, 2])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_unsupported_in_ch.onnx")
+
+
+def gen_unsupported_out_ch_too_large() -> None:
+    """out_ch=1025 violates kMaxOutCh=1024."""
+    w_data = np.zeros((1025, 4, 1, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_unsupported_out_ch",
+        inputs=[_vi("X", [1, 4, 2, 2])],
+        outputs=[_vi("Y", [1, 1025, 2, 2])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_unsupported_out_ch.onnx")
+
+
+def gen_unsupported_dil_h_overflows_line_buf() -> None:
+    """kh=4 dilation_h=6 → vertical span = 3*6 + 1 = 19 > kMaxLineBufRows=16.
+
+    kh stays within max_kh=7 so the violation isolates the line-buffer-row
+    constraint, not a (non-existent) kh constraint.
+    """
+    w_data = np.zeros((4, 4, 4, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[4, 1], dilations=[6, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_unsupported_dil_h",
+        inputs=[_vi("X", [1, 4, 24, 8])],
+        outputs=[_vi("Y", [1, 4, 6, 8])],   # out_h = 24 - 19 + 1 = 6
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_unsupported_dil_h.onnx")
+
+
+def gen_unsupported_dil_w_overflows_line_buf() -> None:
+    """kw=4 dilation_w=22 → horizontal span = 3*22 + 1 = 67 > kMaxLineBufCols=64."""
+    w_data = np.zeros((4, 4, 1, 4), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 4], dilations=[1, 22],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_unsupported_dil_w",
+        inputs=[_vi("X", [1, 4, 8, 80])],
+        outputs=[_vi("Y", [1, 4, 8, 14])],   # out_w = 80 - 67 + 1 = 14
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_unsupported_dil_w.onnx")
+
+
+def gen_unsupported_acc_persist() -> None:
+    """out_w*out_ch = 256*257 = 65792 violates kMaxAccPersistEntries=65536.
+
+    Uses a 1x1 conv with in_ch=1 so the weight tensor stays tiny
+    (257 floats); ONNX shape inference handles the large output shape
+    without needing to materialise the data tensor.
+    """
+    w_data = np.zeros((257, 1, 1, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_unsupported_acc_persist",
+        inputs=[_vi("X", [1, 1, 256, 256])],
+        outputs=[_vi("Y", [1, 257, 256, 256])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_unsupported_acc_persist.onnx")
+
+
+def gen_in_ch_at_limit() -> None:
+    """Boundary-case: in_ch=1024 exactly equals kMaxInCh; must parse OK."""
+    w_data = np.zeros((4, 1024, 1, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_in_ch_at_limit",
+        inputs=[_vi("X", [1, 1024, 2, 2])],
+        outputs=[_vi("Y", [1, 4, 2, 2])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_in_ch_at_limit.onnx")
+
+
+def gen_dil_h_at_line_buf_limit() -> None:
+    """Boundary-case: kh=4 dilation_h=5 → span=16 = kMaxLineBufRows; must parse OK."""
+    w_data = np.zeros((4, 4, 4, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[4, 1], dilations=[5, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_dil_h_at_limit",
+        inputs=[_vi("X", [1, 4, 20, 8])],
+        outputs=[_vi("Y", [1, 4, 5, 8])],   # out_h = 20 - 16 + 1 = 5
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_dil_h_at_limit.onnx")
+
+
+def gen_acc_persist_at_limit() -> None:
+    """Boundary-case: out_w*out_ch = 256*256 = 65536; must parse OK."""
+    w_data = np.zeros((256, 1, 1, 1), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    conv = helper.make_node(
+        "Conv", inputs=["X", "W"], outputs=["Y"],
+        kernel_shape=[1, 1],
+    )
+    graph = helper.make_graph(
+        [conv], "conv_acc_persist_at_limit",
+        inputs=[_vi("X", [1, 1, 256, 256])],
+        outputs=[_vi("Y", [1, 256, 256, 256])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          "conv_acc_persist_at_limit.onnx")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -470,4 +634,12 @@ if __name__ == "__main__":
     gen_conv_dilation()
     gen_conv_auto_pad_valid()
     gen_conv_two_layer_vgg()
+    gen_unsupported_in_ch_too_large()
+    gen_unsupported_out_ch_too_large()
+    gen_unsupported_dil_h_overflows_line_buf()
+    gen_unsupported_dil_w_overflows_line_buf()
+    gen_unsupported_acc_persist()
+    gen_in_ch_at_limit()
+    gen_dil_h_at_line_buf_limit()
+    gen_acc_persist_at_limit()
     print("Done.")
