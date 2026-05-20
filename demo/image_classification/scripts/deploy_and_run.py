@@ -62,14 +62,23 @@ def preflight_local(cfg: dict, projects: List[dict],
     print(_bold("\nPreflight (local)"))
     ok = True
 
-    # Preprocessed inputs and labels
-    for sub in ("preprocessed/images.bin",
-                "preprocessed/manifest.txt",
-                "labels/imagenet_1001_labels.txt"):
-        p = assets_dir / sub
-        ok &= _check_label(f"assets/{sub}",
-                           p.exists(),
-                           f"{p.stat().st_size:,} B" if p.exists() else str(p))
+    # Labels are always shared.
+    lp = assets_dir / "labels/imagenet_1001_labels.txt"
+    ok &= _check_label("assets/labels/imagenet_1001_labels.txt", lp.exists(),
+                       f"{lp.stat().st_size:,} B" if lp.exists() else str(lp))
+
+    # Preprocessed bins are per-model now; fall back to the shared dir for
+    # configs still on the legacy single-bin layout.
+    for proj in projects:
+        name = proj["model_name"]
+        prep = _local_preprocessed_dir(assets_dir, name)
+        rel  = prep.relative_to(assets_dir)
+        for fname in ("images.bin", "manifest.txt"):
+            p = prep / fname
+            ok &= _check_label(f"assets/{rel}/{fname}",
+                               p.exists(),
+                               f"{p.stat().st_size:,} B"
+                               if p.exists() else str(p))
 
     # SSH config minimally populated?
     ssh = cfg.get("ssh", {})
@@ -145,22 +154,70 @@ class ModelResult:
 
 def upload_assets(session: RemoteSession, local_assets: Path,
                   remote_assets: str) -> StepLog:
-    """Upload labels/ and preprocessed/ subtrees once, shared across models."""
+    """Upload labels/ once.  The preprocessed bin is per-model (see
+    ``upload_model_preprocessed``); each model gets its own encoding from
+    ``download_assets.py`` and uploads it just before its run, so we
+    deliberately skip the shared preprocessed/ tree here."""
     t0 = time.monotonic()
     out_msg = ""
     try:
-        n_total = 0
-        for sub in ("labels", "preprocessed"):
-            local = local_assets / sub
-            remote = f"{remote_assets}/{sub}"
-            session.exec(f"mkdir -p {shlex.quote(remote)}", timeout=15)
-            n_total += session.upload_dir(local, remote)
-        out_msg = f"{n_total} files"
+        local = local_assets / "labels"
+        remote = f"{remote_assets}/labels"
+        session.exec(f"mkdir -p {shlex.quote(remote)}", timeout=15)
+        n_total = session.upload_dir(local, remote)
+        out_msg = f"{n_total} files (labels)"
         ok = True
     except Exception as exc:
         ok = False
         out_msg = str(exc)
     return StepLog("assets", ok, time.monotonic() - t0, out_msg)
+
+
+def _local_preprocessed_dir(assets_dir: Path, model_name: str) -> Path:
+    """Pick a model's local preprocessed dir.  Prefers the per-model
+    subdirectory written by the updated download_assets.py; falls back
+    to the legacy shared assets/preprocessed/ for repos that still emit
+    a single bin from a flat top-level preprocess block."""
+    per_model = assets_dir / "preprocessed" / model_name
+    if (per_model / "images.bin").exists() and (per_model / "manifest.txt").exists():
+        return per_model
+    return assets_dir / "preprocessed"
+
+
+def upload_model_preprocessed(session: RemoteSession, assets_dir: Path,
+                              remote_assets: str,
+                              model_name: str) -> StepLog:
+    """Upload one model's preprocessed bin into the canonical
+    ``{remote_assets}/preprocessed/`` directory just before its run.
+
+    Each model's bin overwrites the previous model's at this path, so
+    ``classify_images`` (which reads ``BENCH_DATA_DIR/preprocessed/images.bin``)
+    keeps working unchanged.
+    """
+    t0 = time.monotonic()
+    try:
+        local_dir = _local_preprocessed_dir(assets_dir, model_name)
+        remote_dir = f"{remote_assets}/preprocessed"
+        session.exec(f"mkdir -p {shlex.quote(remote_dir)}", timeout=15)
+        n = 0
+        # Upload only the two files the C side reads; the spec.json side-car
+        # is a host-side cache key and doesn't need to ship.
+        for fname in ("images.bin", "manifest.txt"):
+            src = local_dir / fname
+            if not src.exists():
+                raise FileNotFoundError(f"{src} not found "
+                                        f"(run download_assets.py first)")
+            sftp = session._client.open_sftp()
+            try:
+                sftp.put(str(src), f"{remote_dir}/{fname}")
+            finally:
+                sftp.close()
+            n += 1
+        rel = local_dir.relative_to(assets_dir)
+        return StepLog("assets", True, time.monotonic() - t0,
+                       f"{n} files ({rel})")
+    except Exception as exc:
+        return StepLog("assets", False, time.monotonic() - t0, str(exc))
 
 
 def upload_project(session: RemoteSession, local_proj: Path,
@@ -557,6 +614,14 @@ def deploy_models(cfg: dict, projects: List[dict],
             print(f"\n{_bold(name)}")
             res = ModelResult(name=name)
 
+            # Swap this model's preprocessed bin into the canonical path
+            # before the run so classify_images picks the right encoding.
+            prep_step = upload_model_preprocessed(session, assets_dir,
+                                                  remote_assets, name)
+            _record(res, prep_step)
+            if not prep_step.ok:
+                results.append(res); continue
+
             up = upload_project(session, local_proj, remote_proj)
             _record(res, up)
             if not up.ok:
@@ -630,13 +695,20 @@ def main(argv=None) -> int:
     projects = json.loads(projects_summary.read_text())
 
     assets_dir = Path(args.assets_dir)
-    for required in ("preprocessed/images.bin",
-                     "preprocessed/manifest.txt",
-                     "labels/imagenet_1001_labels.txt"):
-        if not (assets_dir / required).exists():
-            print(f"error: {assets_dir / required} missing — "
-                  f"run scripts/download_assets.py first", file=sys.stderr)
-            return 1
+    if not (assets_dir / "labels/imagenet_1001_labels.txt").exists():
+        print(f"error: {assets_dir / 'labels/imagenet_1001_labels.txt'} "
+              f"missing — run scripts/download_assets.py first",
+              file=sys.stderr)
+        return 1
+    # Per-model preprocessed bins (or the legacy shared one for back-compat).
+    for proj in projects:
+        prep = _local_preprocessed_dir(assets_dir, proj["model_name"])
+        for fname in ("images.bin", "manifest.txt"):
+            if not (prep / fname).exists():
+                print(f"error: {prep / fname} missing — "
+                      f"run scripts/download_assets.py first",
+                      file=sys.stderr)
+                return 1
 
     log_dir = Path(args.results).parent / "logs"
     results = deploy_models(cfg, projects, assets_dir,

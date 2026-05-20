@@ -12,7 +12,7 @@ the static-image demo bit for bit:
   1. resize to input_size x input_size,
   2. BGR -> RGB  (OpenCV frames are BGR; the model was trained on RGB —
      skipping this swap silently corrupts every prediction),
-  3. normalize  (tf | unit | none),
+  3. normalize  (tf | unit | imagenet | none),
   4. HWC -> CHW,
   5. scale by 256 and pack as little-endian int16 (the ap_fixed<16,8>
      bit pattern; 1.0 -> 0x0100).
@@ -23,6 +23,12 @@ image may not ship it.
 
 import cv2
 import numpy as np
+
+
+# Standard torchvision ImageNet normalisation constants (RGB order) — used
+# by the ONNX Model Zoo MobileNetV2 / ResNet / etc. trained in PyTorch.
+_IMAGENET_MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32)
+_IMAGENET_STD  = np.array((0.229, 0.224, 0.225), dtype=np.float32)
 
 
 def preprocess_frame(bgr_frame: np.ndarray, input_size: int,
@@ -42,9 +48,12 @@ def preprocess_frame(bgr_frame: np.ndarray, input_size: int,
         a = a / 255.0                               # [0, 1]   (Keras-style)
     elif normalize == "none":
         a = a / 256.0                               # ~ raw byte / 256
+    elif normalize == "imagenet":
+        # PyTorch / torchvision recipe: pixel/255 then per-channel (x - μ)/σ.
+        a = (a / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
     else:
         raise ValueError(f"unknown normalize mode: {normalize!r} "
-                         f"(expected 'tf', 'unit', 'none')")
+                         f"(expected 'tf', 'unit', 'imagenet', 'none')")
 
     a = np.transpose(a, (2, 0, 1))                  # HWC -> CHW
     bits = np.rint(a * 256.0)                       # ap_fixed<16,8>

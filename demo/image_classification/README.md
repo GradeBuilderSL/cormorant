@@ -139,9 +139,20 @@ The full per-image top-K table is also written to `build/results.json`.
 
 Edit `image_classification_config.json`:
 
-* **`preprocess.normalize`** — `tf` for TF-style MobileNet inputs (`(p/127.5)-1`),
-  `unit` for Keras-style (`p/255`), `none` for raw bytes (`p/256`).  TF is the
-  default and matches the published MobileNetV1 weights.
+* **`preprocess.normalize`** — default input encoding for every model:
+  `tf` for TF-style MobileNet inputs (`(p/127.5)-1`),
+  `unit` for Keras-style (`p/255`),
+  `imagenet` for the torchvision recipe (`p/255` then per-channel
+  `(x − μ)/σ` with `mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]` —
+  required by the ONNX Model Zoo MobileNetV2),
+  `none` for raw bytes (`p/256`).
+* **Per-model override** — each entry under `models` may carry its own
+  `preprocess: { "normalize": ... }` block that overrides specific fields
+  (currently `input_size`, `normalize`, `resize`).  The defaults above
+  apply to any field a model leaves unset.  `download_assets.py` writes
+  one bin per model under `assets/preprocessed/<model>/images.bin`, and
+  `deploy_and_run.py` swaps the right one into the canonical
+  `preprocessed/images.bin` path before each model runs on the board.
 * **`run.top_k`** — how many predictions to print per image.
 * **`run.warmup`** — inferences run before timing starts.
 
@@ -155,6 +166,9 @@ Edit `image_classification_config.json`:
 * **`Driver file not found: driver/xconvkernel.h`** during cmake — the HLS
   driver sources weren't on this host.  Run `make synthesize_kv260` from
   the repo root, or point `local.driver_dirs` at an existing build output.
-* **All images classified as "background"** — the input encoding is wrong.
-  Set `preprocess.normalize` to `tf` (most likely) and re-run the download
-  stage with `--force` to rebuild `images.bin`.
+* **All images classified as "background", or wildly off top-K** — the input
+  encoding is wrong for that model.  TF MobileNetV1 wants
+  `normalize: "tf"`; the ONNX Model Zoo MobileNetV2 wants
+  `normalize: "imagenet"`.  Set the right value (globally or per-model)
+  and re-run the download stage with `--force` to rebuild
+  `assets/preprocessed/<model>/images.bin`.

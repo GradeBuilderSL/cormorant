@@ -32,7 +32,7 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 DEMO_DIR     = Path(__file__).resolve().parent.parent
 ASSETS_DIR   = DEMO_DIR / "assets"
@@ -210,6 +210,12 @@ def _sniff_kind(path: Path) -> str:
     return "unknown"
 
 
+# Standard torchvision ImageNet normalisation constants (RGB order) — used
+# by the ONNX Model Zoo MobileNetV2 / ResNet / etc. trained in PyTorch.
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
 def _encode_pixels(arr, normalize: str):
     """
     Convert a float32 HxWx3 RGB array (values in [0, 255]) into the int16
@@ -221,9 +227,14 @@ def _encode_pixels(arr, normalize: str):
     if   normalize == "tf":   a = (a - 127.5) / 127.5    # [-1, 1]
     elif normalize == "unit": a = a / 255.0              # [0, 1]
     elif normalize == "none": a = a / 256.0              # ≈ raw byte / 256
+    elif normalize == "imagenet":
+        # PyTorch / torchvision recipe: pixel/255 then per-channel (x - μ)/σ.
+        a = a / 255.0
+        a = (a - np.array(_IMAGENET_MEAN, dtype=np.float32)) \
+            / np.array(_IMAGENET_STD, dtype=np.float32)
     else:
         raise ValueError(f"unknown normalize mode: {normalize!r} "
-                         f"(expected 'tf', 'unit', 'none')")
+                         f"(expected 'tf', 'unit', 'imagenet', 'none')")
     a = np.transpose(a, (2, 0, 1))                       # HWC → CHW
     bits = np.rint(a * 256.0)                            # ap_fixed<16,8>
     bits = np.clip(bits, -32768, 32767).astype(np.int16)
@@ -231,10 +242,17 @@ def _encode_pixels(arr, normalize: str):
 
 
 def preprocess_images(input_size: int, normalize: str,
-                      resize_mode: str) -> Tuple[List[str], int]:
+                      resize_mode: str,
+                      out_dir: Optional[Path] = None,
+                      ) -> Tuple[List[str], int]:
     """
     Walk assets/images/, encode each image into images.bin in order, and
     write manifest.txt with `<name><TAB><offset_bytes>` lines.
+
+    ``out_dir`` defaults to ``PREP_DIR`` (assets/preprocessed/) — the
+    legacy shared layout.  Per-model callers pass a subdirectory
+    (typically ``PREP_DIR / model_name``) so each model gets its own
+    bin without overwriting siblings.
 
     Returns (image_names, bytes_per_image).
     """
@@ -257,16 +275,20 @@ def preprocess_images(input_size: int, normalize: str,
             f"files into that directory and re-run."
         )
 
-    PREP_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = out_dir if out_dir is not None else PREP_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    images_bin = out_dir / "images.bin"
+    manifest   = out_dir / "manifest.txt"
+
     bytes_per_image = 3 * input_size * input_size * 2   # int16, NCHW
-    _log(f"preprocess → {IMAGES_BIN}  "
+    _log(f"preprocess → {images_bin}  "
          f"({len(files)} candidate images, {bytes_per_image:,} B each, "
          f"mode={normalize})")
 
     written: List[Tuple[Path, int]] = []   # (path, offset)
     skipped: List[Tuple[Path, str]] = []   # (path, reason)
 
-    with open(IMAGES_BIN, "wb") as out:
+    with open(images_bin, "wb") as out:
         for path in files:
             try:
                 with Image.open(path) as im:
@@ -299,7 +321,7 @@ def preprocess_images(input_size: int, normalize: str,
     if not written:
         # Wipe the empty bin so a stale 0-byte file isn't left behind.
         try:
-            IMAGES_BIN.unlink()
+            images_bin.unlink()
         except OSError:
             pass
         details = "\n".join(f"  - {p.name}: {r}" for p, r in skipped)
@@ -307,7 +329,7 @@ def preprocess_images(input_size: int, normalize: str,
             f"no usable images in {IMAGES_DIR} — every candidate failed:\n"
             f"{details}\nDrop at least one valid JPG/PNG and re-run.")
 
-    with open(MANIFEST, "w") as f:
+    with open(manifest, "w") as f:
         for path, off in written:
             f.write(f"{path.name}\t{off}\n")
 
@@ -316,6 +338,61 @@ def preprocess_images(input_size: int, normalize: str,
     if skipped:
         _log(f"  {len(skipped)} file(s) skipped — see warnings above")
     return [p.name for p, _ in written], bytes_per_image
+
+
+def _resolve_preprocess_targets(cfg: dict, models: List[dict]) -> List[dict]:
+    """Build one preprocessing target per model.
+
+    Top-level ``preprocess`` provides defaults; each model's optional
+    ``preprocess`` block shallow-overrides specific fields.  Each target
+    is a dict with ``out_dir`` (per-model assets/preprocessed/<name>/),
+    ``input_size``, ``normalize``, ``resize``, a short ``label`` for log
+    output, and a ``spec`` dict used as the cache key.
+    """
+    base = cfg.get("preprocess", {})
+    if not models:
+        # Backwards-compat fallback: no models listed → emit one bin from
+        # the top-level preprocess block into the shared PREP_DIR.  Lets
+        # users who just want to preprocess images skip the models array.
+        spec = _preprocess_spec(base, {})
+        return [{
+            "out_dir":    PREP_DIR,
+            "input_size": spec["input_size"],
+            "normalize":  spec["normalize"],
+            "resize":     spec["resize"],
+            "label":      f"shared, {spec['normalize']}",
+            "spec":       spec,
+        }]
+    targets: List[dict] = []
+    for model in models:
+        name = model.get("name")
+        if not name:
+            raise RuntimeError("model entry missing 'name' field")
+        override = model.get("preprocess", {}) or {}
+        spec = _preprocess_spec(base, override)
+        targets.append({
+            "out_dir":    PREP_DIR / name,
+            "input_size": spec["input_size"],
+            "normalize":  spec["normalize"],
+            "resize":     spec["resize"],
+            "label":      f"{name}, {spec['normalize']}",
+            "spec":       spec,
+        })
+    return targets
+
+
+def _preprocess_spec(base: dict, override: dict) -> dict:
+    """Resolve a final {input_size, normalize, resize} spec from a top-level
+    base and a per-model override.  Reads only the encoding-affecting
+    fields, so a spec object is safe to compare for cache invalidation."""
+    return {
+        "input_size": int(override.get("input_size",
+                                       base.get("input_size", 224))),
+        "normalize":  override.get("normalize",
+                                   base.get("normalize", "tf")),
+        "resize":     override.get("resize",
+                                   base.get("resize", "bilinear")),
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,24 +466,32 @@ def main(argv=None) -> int:
             download_labels(url, force=args.force)
 
     if not args.skip_preprocess:
-        prep   = cfg.get("preprocess", {})
-        size   = int(prep.get("input_size", 224))
-        norm   = prep.get("normalize", "tf")
-        resize = prep.get("resize", "bilinear")
-        # Force re-encode whenever the user asked for --force or the
-        # bin/manifest are missing.  Cheap enough to always re-run, since
-        # users rarely have hundreds of images locally.
-        if args.force or not IMAGES_BIN.exists() or not MANIFEST.exists():
-            preprocess_images(size, norm, resize)
-        else:
-            # Skip re-encode if the manifest still matches the on-disk image set.
-            cached = MANIFEST.read_text().splitlines()
-            cached_names = [ln.split("\t", 1)[0] for ln in cached if ln.strip()]
-            current = [p.name for p in _list_input_images()]
-            if cached_names == current:
-                _log(f"  cached {IMAGES_BIN.name} ({len(current)} images)")
+        models = cfg.get("models", [])
+        targets = _resolve_preprocess_targets(cfg, models)
+        current = [p.name for p in _list_input_images()]
+        for tgt in targets:
+            out_dir    = tgt["out_dir"]
+            images_bin = out_dir / "images.bin"
+            manifest   = out_dir / "manifest.txt"
+            spec_path  = out_dir / "spec.json"
+            label      = tgt["label"]
+            need_build = (
+                args.force
+                or not images_bin.exists()
+                or not manifest.exists()
+                or not spec_path.exists()
+                or json.loads(spec_path.read_text()) != tgt["spec"]
+                or [ln.split("\t", 1)[0]
+                    for ln in manifest.read_text().splitlines() if ln.strip()
+                   ] != current
+            )
+            if need_build:
+                preprocess_images(tgt["input_size"], tgt["normalize"],
+                                  tgt["resize"], out_dir=out_dir)
+                spec_path.write_text(json.dumps(tgt["spec"], sort_keys=True))
             else:
-                preprocess_images(size, norm, resize)
+                _log(f"  cached {images_bin}  ({len(current)} images, "
+                     f"{label})")
 
     _log("done")
     return 0
