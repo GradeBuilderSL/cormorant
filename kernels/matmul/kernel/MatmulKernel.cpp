@@ -1,66 +1,69 @@
 // ---------------------------------------------------------------------------
-// MatmulKernel.cpp — tiled matrix multiplication with persistent-A reuse.
+// MatmulKernel.cpp — tiled matrix multiplication with persistent-A reuse
+//                    and grouped K processing (cache-style A reload).
 //
-// Architecture (post-loop-swap, persistent-A):
+// Architecture:
 //
-//   batch loop                          — pointer offset only; no buffer reset
-//     n_block loop      (kMaxN rows)    — outer; A loaded ONCE per block
-//       LOAD a_buf      (n_block_valid burst reads on gmem0)
+//   batch loop                            — pointer offset only
+//     n_block loop      (kBlockN rows)      — outer; cache-miss boundary on N
 //       m_tile loop     (kTileM cols)
-//         CLEAR acc[kMaxN][kTileM]
-//         k_tile loop   (kTileK rows)
-//           LOAD b_tile (k_valid burst reads on gmem1) — ONCE, reused across N
-//           n_grp loop  (kTileN rows per group, n_grps = ceil(n_block/kTileN))
-//             K-REDUCE  (II=1, lane-rotated ki sweep)
-//         WRITE C       (n_block_valid burst writes on gmem2)
+//         CLEAR acc[kBlockN][kTileM]
+//         k_chunk loop  (kChunkK columns of A per chunk) — cache-miss on K
+//           (re)LOAD a_buf if this chunk isn't already cached
+//           k_tile loop (kTileK rows within the chunk)
+//             LOAD b_tile (DDR; global K offset)
+//             n_grp loop — II=1 lane-rotated K-reduce, a_buf indexed
+//                          by chunk-local k offset
+//         WRITE C        (after every k_chunk for this m_tile has accumulated)
 //
-// Why this is faster than the previous shipped version (single sequential
-// nest with n_tile OUTSIDE the m_tile loop):
+// Caching model:
 //
-//   Prior layout reloaded B[k_tile_size × m_tile_size] from DDR once per
-//   (n_tile, m_tile, k_tile) — n_tile_count × duplicate reads.  This version
-//   issues the B-tile DDR read once per (m_tile, k_tile) and broadcasts the
-//   tile across all rows in the n-block via the n_grp wrapper around the
-//   II=1 K-reduction.  Compute cycles are identical (same total MAC count,
-//   same kTileN-cycle lane rotation), the saving is purely DDR traffic on
-//   tests whose N spans more than one kTileN block (N > kTileN).
+//   The on-chip a_buf[kBlockN][kChunkK] is treated as a cache for A.  Each
+//   (n_block, k_chunk) pair names one cacheable working set.  The kernel
+//   tracks the currently-resident chunk in `last_loaded_k_chunk`:
 //
-//   For tests with N ≤ kTileN the kernel issues exactly the same DDR
-//   accesses as before (n_grps = 1; outer n_block iterates once) — no
-//   regression on small-N geometries.
+//     - Cache hit:  same chunk as last iteration → skip the DDR load.
+//                   This is the common path: when K ≤ kChunkK the kernel
+//                   has k_chunks = 1, so after m_tile 0 every later m_tile
+//                   hits the cache and A is loaded exactly once per n_block
+//                   (identical traffic to the previous persistent-A code).
 //
-// II=1 strategy (unchanged from the prior version, just wrapped):
+//     - Cache miss: different chunk needed → reload from DDR.  Happens
+//                   on every k_chunk boundary when K > kChunkK, and on
+//                   every n_block boundary (cache is invalidated then
+//                   since the resident rows belong to the previous block).
 //
-//   Inside each n_grp iteration, the ki counter runs k_valid·kTileN times.
+//   This is the same grouped-tile / duplicate-readings pattern already in
+//   use on the N axis (the outer n_block loop has always reloaded A when
+//   N > kBlockN).  Adding the K-axis chunk loop generalises the same model
+//   in both directions, lifts the previous *hard* `K ≤ kChunkK` runtime
+//   limit (which previously corrupted memory silently on overflow), and
+//   leaves kBlockN / kChunkK as on-chip cache *sizes* rather than scheduler-
+//   enforced workload bounds.  The price is m_tiles × k_chunks DDR loads
+//   of A when k_chunks > 1, instead of one — accepted in exchange for
+//   handling arbitrary K.
+//
+// II=1 strategy (unchanged):
+//
+//   Inside each n_grp the ki counter runs k_tile_valid·kTileN times.
 //   n1 = ki % kTileN rotates the row lane; kk = ki / kTileN advances the
-//   K index.  The same acc[n_idx][m1] register is therefore written every
-//   kTileN cycles — distance enough to cover the ap_fixed multiply latency
-//   (≈3) so HLS schedules the inner pipeline at II=1.  Crossing n_grp
-//   boundaries forces a small pipeline drain (≈ pipeline depth) per group;
-//   negligible vs the k_valid·kTileN body.
+//   K index within the chunk.  The same acc[n_idx][m1] register is
+//   written every kTileN cycles — distance enough for the ap_fixed MAC
+//   latency (≈3) so the inner pipeline schedules at II=1.  Crossing
+//   k_tile, k_chunk, and n_grp boundaries forces a short pipeline drain;
+//   negligible vs the inner-loop body.
 //
-// On-chip buffers (declared `static` so HLS infers BRAM):
+// On-chip buffers:
 //
-//   a_buf [kMaxN ][kMaxK ]  cyclic factor=kTileN on dim 1
-//                            → kTileN banks, each (kMaxN/kTileN)·kMaxK deep.
-//                              Bank = n_idx % kTileN = n1 (compile-time in
-//                              the inner ki sweep); within-bank address =
-//                              (n_idx / kTileN, k_off+kk) = (n_grp, k_off+kk).
-//                              Single-port BRAM is sufficient: each cycle
-//                              touches one bank at a runtime-but-constant
-//                              within-bank position.
-//   b_tile[kTileK][kTileM]  complete on dim 2
-//                            → kTileM column banks for the unrolled m1 loop.
-//   acc   [kMaxN ][kTileM]  complete on dim 0
-//                            → kMaxN·kTileM individual registers.  Runtime
-//                              n_idx becomes a kMaxN-way read MUX + decoder
-//                              per (n_grp, n1) write.  The cyclic partition
-//                              tried first synthesised as depth-(kMaxN/kTileN)
-//                              register-array banks whose R-M-W port arbitration
-//                              forced II=2 (HLS 200-885 at line 227); complete
-//                              partitioning leaves the lane-rotation WAW
-//                              distance at kTileN cycles per register — enough
-//                              for the ap_fixed MAC pipeline, so II=1 schedules.
+//   a_buf [kBlockN ][kChunkK ]  cyclic factor=kTileN on dim 1
+//                            → kTileN banks, each (kBlockN/kTileN)·kChunkK deep.
+//                              Holds the currently-cached chunk of A.
+//   b_tile[kTileK][kTileM]  complete on dim 2 → kTileM column banks
+//                            for the unrolled m1 inner loop.
+//   acc   [kBlockN ][kTileM]  complete on dim 0 → kBlockN·kTileM registers.
+//                            Cleared per m_tile, accumulates across every
+//                            k_chunk and k_tile, written to C once all
+//                            K contributions have been folded in.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -80,16 +83,6 @@ void MatmulKernel(
 ) {
     // -----------------------------------------------------------------------
     // HLS AXI interface pragmas.
-    //
-    // Three m_axi ports keep A, B, and C reads/writes on separate AXI buses
-    // so the tool can issue them concurrently.  All scalar arguments go into
-    // the s_axilite ctrl register file accessed by the PS driver.
-    //
-    // depth=<N> is a C/RTL co-simulation hint only — it sizes the cosim
-    // verification adapter FIFO per m_axi port and does NOT constrain the
-    // synthesised AXI master or the exported IP.  The MATMUL_COSIM_DEPTH_*
-    // macros (MatmulKernel.h) are the single source of truth; cosim of an
-    // m_axi kernel aborts without a depth specification.
     // -----------------------------------------------------------------------
     #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0 depth=MATMUL_COSIM_DEPTH_A
     #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1 depth=MATMUL_COSIM_DEPTH_B
@@ -107,18 +100,27 @@ void MatmulKernel(
     #pragma HLS INTERFACE s_axilite port=return         bundle=ctrl
 
     // -----------------------------------------------------------------------
-    // On-chip buffers (see header comment for the partitioning rationale).
+    // On-chip buffers (see header comment for partitioning rationale).
     // -----------------------------------------------------------------------
-    static Data_t    a_buf [kMaxN][kMaxK];
+    static Data_t    a_buf [kBlockN][kChunkK];
     static Data_t    b_tile[kTileK][kTileM];
-    static AccData_t acc   [kMaxN][kTileM];
+    static AccData_t acc   [kBlockN][kTileM];
 
     #pragma HLS ARRAY_PARTITION variable=a_buf  cyclic factor=kTileN dim=1
     #pragma HLS ARRAY_PARTITION variable=b_tile complete            dim=2
-    #pragma HLS ARRAY_PARTITION variable=acc    complete            dim=0
+    // acc storage: partition only on the m1 lane dim (dim 2) — each m1 lane
+    // becomes its own dual-port BRAM bank of depth kBlockN.  The runtime
+    // n_idx index becomes an address into that bank instead of a kBlockN-way
+    // register MUX (which previously dominated the LUT cost, ≈5.7 k MUX LUTs
+    // out of the kernel's 23 k total).  With ram_t2p (true dual port) HLS
+    // schedules the R-M-W per cycle using one port for the read and the
+    // other for the write, leaving each acc element's WAW distance at
+    // kTileN cycles — the lane-rotation guarantee — so II=1 still holds.
+    #pragma HLS ARRAY_PARTITION variable=acc    complete            dim=2
+    #pragma HLS BIND_STORAGE variable=acc type=ram_t2p impl=bram
 
     // -----------------------------------------------------------------------
-    // Batch loop — stride=0 on a or b means that pointer stays fixed (broadcasts).
+    // Batch loop — stride=0 on a or b means that pointer stays fixed.
     // -----------------------------------------------------------------------
     for (unsigned bi = 0; bi < batch; bi++) {
         const Data_t* a_ptr = a + bi * a_batch_stride;
@@ -126,51 +128,46 @@ void MatmulKernel(
         Data_t*       c_ptr = c + bi * c_batch_stride;
 
         // -------------------------------------------------------------------
-        // N-block loop — process up to kMaxN rows per outer iteration.
-        //
-        // For all current behavior-test geometries (N ≤ 12) this loop runs
-        // exactly once: A is loaded into BRAM once per kernel invocation and
-        // the whole (m_tile × k_tile × n_grp) inner nest reuses it.  When
-        // N > kMaxN the outer loop reloads A for each block — equivalent to
-        // the prior code's n_tile reload, just at coarser granularity.
+        // N-block loop (outer cache axis on N).  Cache is invalidated at
+        // every block boundary because the resident rows of a_buf belong
+        // to the previous block.
         // -------------------------------------------------------------------
-        const unsigned n_blocks = (n + kMaxN - 1) / kMaxN;
+        const unsigned n_blocks = (n + kBlockN - 1) / kBlockN;
         for (unsigned nb = 0; nb < n_blocks; nb++) {
-            const unsigned n_block_off   = nb * kMaxN;
+            const unsigned n_block_off   = nb * kBlockN;
             const unsigned n_block_valid =
-                std::min(unsigned(kMaxN), n - n_block_off);
+                std::min(unsigned(kBlockN), n - n_block_off);
             const unsigned n_grps =
                 (n_block_valid + kTileN - 1) / kTileN;
 
-            // ---------------------------------------------------------------
-            // Load a_buf: n_block_valid rows × k columns from A.
-            // One burst per row; the inner ki loop pipelines at II=1 for
-            // back-to-back AXI beats.  Rows ≥ n_block_valid retain stale
-            // data — they accumulate into acc lanes that the C-write loop
-            // skips, so the staleness is invisible.
-            // ---------------------------------------------------------------
-            for (unsigned n1 = 0; n1 < n_block_valid; n1++) {
-                for (unsigned ki = 0; ki < k; ki++) {
-                    #pragma HLS PIPELINE II=1
-                    a_buf[n1][ki] = a_ptr[(n_block_off + n1) * k + ki];
-                }
-            }
+            // K-axis chunking is enumerated by the inner k_chunk loop.
+            const unsigned m_tiles  = (m + kTileM - 1) / kTileM;
+            const unsigned k_chunks = (k + kChunkK - 1) / kChunkK;
+
+            // last_loaded_k_chunk tracks which chunk of A is currently
+            // resident in a_buf.  Initialised to UINT_MAX so the first
+            // (m_tile=0, k_chunk=0) always misses.  Resets at every
+            // n_block boundary (declared inside the n_block loop so the
+            // value is re-initialised on entry).
+            unsigned last_loaded_k_chunk = (unsigned)-1;
 
             // ---------------------------------------------------------------
-            // M-tile loop — process kTileM output columns per iteration.
+            // M-tile loop.
             // ---------------------------------------------------------------
-            const unsigned m_tiles = (m + kTileM - 1) / kTileM;
             for (unsigned m_tile = 0; m_tile < m_tiles; m_tile++) {
                 const unsigned m_off   = m_tile * kTileM;
                 const unsigned m_valid = std::min(unsigned(kTileM), m - m_off);
 
-                // Clear acc[*][*] unconditionally — kMaxN × kTileM registers
-                // wiped in one cycle by the fully-unrolled loop.  Clearing
-                // the full kMaxN range (not just n_block_valid) costs the
-                // same and immunises against stale data from a previous
-                // invocation in case kMaxN shrinks between calls.
-                for (unsigned n1c = 0; n1c < kMaxN; n1c++) {
-                    #pragma HLS UNROLL
+                // Clear acc — kBlockN rows × kTileM cols.  Now that acc is
+                // a per-m1-bank BRAM (1 W port each), the unrolled clear of
+                // kBlockN positions per bank in one cycle is no longer
+                // possible.  Serialise across n1c (one row per cycle) and
+                // unroll only the m1c dim, so each cycle issues exactly one
+                // write per bank.  Cost: kBlockN cycles per m_tile vs the
+                // prior 1 cycle — negligible (kBlockN=16, m_tiles ≤ 3 in
+                // shipping tests, so ≤ 48 extra cycles total).
+                for (unsigned n1c = 0; n1c < kBlockN; n1c++) {
+                    #pragma HLS PIPELINE II=1
                     for (unsigned m1c = 0; m1c < kTileM; m1c++) {
                         #pragma HLS UNROLL
                         acc[n1c][m1c] = AccData_t(0);
@@ -178,71 +175,100 @@ void MatmulKernel(
                 }
 
                 // -----------------------------------------------------------
-                // K-tile loop — accumulate one TILE_K slice of K per pass.
+                // K-chunk loop (outer cache axis on K).
                 // -----------------------------------------------------------
-                const unsigned k_tiles = (k + kTileK - 1) / kTileK;
-                for (unsigned k_tile = 0; k_tile < k_tiles; k_tile++) {
-                    const unsigned k_off   = k_tile * kTileK;
-                    const unsigned k_valid = std::min(unsigned(kTileK), k - k_off);
+                for (unsigned k_chunk = 0; k_chunk < k_chunks; k_chunk++) {
+                    #pragma HLS LOOP_TRIPCOUNT min=1 max=16
+                    const unsigned k_chunk_off   = k_chunk * kChunkK;
+                    const unsigned k_chunk_valid =
+                        std::min(unsigned(kChunkK), k - k_chunk_off);
 
                     // -------------------------------------------------------
-                    // Load b_tile: k_valid rows × m_valid columns from B.
-                    // Issued ONCE per (m_tile, k_tile); the broadcast across
-                    // n_grps below is purely on-chip.  This is the central
-                    // change from the prior code, which reissued the same
-                    // burst once per n_tile (n_grps ≡ n_tiles).
+                    // Cache check.  Reload A only if the resident chunk
+                    // differs from the one we need.
+                    //
+                    //   k_chunks = 1  (K ≤ kChunkK): m_tile 0 loads, every
+                    //                              later m_tile hits — one
+                    //                              load per n_block, same
+                    //                              traffic as the previous
+                    //                              persistent-A code.
+                    //   k_chunks > 1 (K > kChunkK):  each m_tile reloads
+                    //                              every chunk in turn —
+                    //                              m_tiles × k_chunks
+                    //                              loads per n_block.
                     // -------------------------------------------------------
-                    for (unsigned k1 = 0; k1 < k_valid; k1++) {
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            #pragma HLS PIPELINE II=1
-                            b_tile[k1][m1] =
-                                b_ptr[(k_off + k1) * m + (m_off + m1)];
+                    if (last_loaded_k_chunk != k_chunk) {
+                        for (unsigned n1 = 0; n1 < n_block_valid; n1++) {
+                            for (unsigned ki = 0; ki < k_chunk_valid; ki++) {
+                                #pragma HLS PIPELINE II=1
+                                a_buf[n1][ki] =
+                                    a_ptr[(n_block_off + n1) * k +
+                                          (k_chunk_off + ki)];
+                            }
                         }
+                        last_loaded_k_chunk = k_chunk;
                     }
 
                     // -------------------------------------------------------
-                    // K-reduction, n_grp-wrapped.
-                    //
-                    // Each n_grp processes kTileN rows (n_idx = n_grp·kTileN
-                    // .. n_grp·kTileN + kTileN - 1).  The ki sweep iterates
-                    // k_valid·kTileN times and rotates n1 = ki%kTileN so the
-                    // same acc[n_idx][m1] register is written every kTileN
-                    // cycles — distance covers the ap_fixed MAC latency, so
-                    // the inner pipeline schedules at II=1.
-                    //
-                    // For the partial last n_grp (n_block_valid not a
-                    // multiple of kTileN), trailing lanes n_idx ≥
-                    // n_block_valid still execute; they update acc lanes
-                    // that the C-write loop skips, costing some MAC cycles
-                    // but no correctness hazard.
-                    //
-                    // Power-of-two kTileN: ki%kTileN is a bitwise AND and
-                    // ki/kTileN a right shift — no dividers in RTL.
+                    // K-tile loop within this chunk.  k_tile_off is chunk-
+                    // local (used to index a_buf); k_off_global combines
+                    // chunk and tile to address B in DDR.
                     // -------------------------------------------------------
-                    for (unsigned n_grp = 0; n_grp < n_grps; n_grp++) {
-                        #pragma HLS LOOP_TRIPCOUNT min=1 max=(kMaxN/kTileN)
-                        const unsigned ki_bound = k_valid * kTileN;
-                        for (unsigned ki = 0; ki < ki_bound; ki++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned n1    = ki % kTileN;
-                            const unsigned kk    = ki / kTileN;
-                            const unsigned n_idx = n_grp * kTileN + n1;
-                            const Data_t   a_val = a_buf[n_idx][k_off + kk];
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                #pragma HLS UNROLL
-                                acc[n_idx][m1] +=
-                                    AccData_t(a_val) *
-                                    AccData_t(b_tile[kk][m1]);
+                    const unsigned k_tiles_in_chunk =
+                        (k_chunk_valid + kTileK - 1) / kTileK;
+                    for (unsigned k_tile = 0;
+                         k_tile < k_tiles_in_chunk; k_tile++) {
+                        #pragma HLS LOOP_TRIPCOUNT min=1 max=(kChunkK/kTileK)
+                        const unsigned k_tile_off   = k_tile * kTileK;
+                        const unsigned k_tile_valid =
+                            std::min(unsigned(kTileK),
+                                     k_chunk_valid - k_tile_off);
+                        const unsigned k_off_global =
+                            k_chunk_off + k_tile_off;
+
+                        // ---------------------------------------------------
+                        // Load b_tile (DDR, global K offset).
+                        // ---------------------------------------------------
+                        for (unsigned k1 = 0; k1 < k_tile_valid; k1++) {
+                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                                #pragma HLS PIPELINE II=1
+                                b_tile[k1][m1] =
+                                    b_ptr[(k_off_global + k1) * m +
+                                          (m_off + m1)];
+                            }
+                        }
+
+                        // ---------------------------------------------------
+                        // K-reduce, n_grp-wrapped.  a_buf is indexed by
+                        // (n_idx, k_tile_off + kk) — k_tile_off is the
+                        // chunk-local tile offset, kk is the within-tile
+                        // K index.  acc[n_idx][m1] persists across every
+                        // k_tile, k_chunk and n_grp within this m_tile.
+                        // ---------------------------------------------------
+                        for (unsigned n_grp = 0; n_grp < n_grps; n_grp++) {
+                            #pragma HLS LOOP_TRIPCOUNT min=1 max=(kBlockN/kTileN)
+                            const unsigned ki_bound = k_tile_valid * kTileN;
+                            for (unsigned ki = 0; ki < ki_bound; ki++) {
+                                #pragma HLS PIPELINE II=1
+                                const unsigned n1    = ki % kTileN;
+                                const unsigned kk    = ki / kTileN;
+                                const unsigned n_idx = n_grp * kTileN + n1;
+                                const Data_t   a_val =
+                                    a_buf[n_idx][k_tile_off + kk];
+                                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                    #pragma HLS UNROLL
+                                    acc[n_idx][m1] +=
+                                        AccData_t(a_val) *
+                                        AccData_t(b_tile[kk][m1]);
+                                }
                             }
                         }
                     }
                 }
 
                 // -----------------------------------------------------------
-                // Write output block: saturate_cast acc → C.
-                // n_block_valid sequential burst writes of m_valid elements
-                // each; the inner m1 loop pipelines at II=1 for burst AXI
-                // writes.
+                // Write C — acc has now folded in every (k_chunk, k_tile)
+                // contribution for this m_tile.
                 // -----------------------------------------------------------
                 for (unsigned n1 = 0; n1 < n_block_valid; n1++) {
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {

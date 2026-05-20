@@ -438,8 +438,8 @@ int main(int argc, char** argv) {
     printf("MatmulKernel reference tests\n");
     printf("  Data_t    = %s\n", typeid(Data_t).name());
     printf("  AccData_t = %s\n", typeid(AccData_t).name());
-    printf("  kTileN=%u  kTileM=%u  kTileK=%u  kMaxK=%u\n\n",
-           kTileN, kTileM, kTileK, kMaxK);
+    printf("  kTileN=%u  kTileM=%u  kTileK=%u  kBlockN=%u  kChunkK=%u\n\n",
+           kTileN, kTileM, kTileK, kBlockN, kChunkK);
 
     auto run = [&](bool ok) { total++; if (ok) passed++; else all_ok = false; };
 

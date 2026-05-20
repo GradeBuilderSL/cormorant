@@ -66,7 +66,9 @@ inline T saturate_cast(From v) {
 //   a, b, c         Pointers to row-major matrices in DDR.
 //   n               Rows of A (rows of C).
 //   k               Inner dimension (cols of A = rows of B).
-//                   Must be ≤ kMaxK (compile-time limit, enforced by caller).
+//                   No hard limit; K > kChunkK paginates over outer k_chunk
+//                   iterations (kChunkK is the on-chip cache depth, not a
+//                   workload bound).
 //   m               Cols of B (cols of C).
 //   batch           Total number of 2-D products to compute.
 //   a_batch_stride  Elements to advance 'a' per batch step (0 = broadcasts).

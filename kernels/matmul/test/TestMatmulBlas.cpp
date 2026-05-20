@@ -174,8 +174,8 @@ int main()
 
     printf("MatmulKernel BLAS comparison tests (float)\n");
     printf("  Data_t=float  AccData_t=float\n");
-    printf("  kTileN=%u  kTileM=%u  kTileK=%u  kMaxK=%u\n\n",
-           kTileN, kTileM, kTileK, kMaxK);
+    printf("  kTileN=%u  kTileM=%u  kTileK=%u  kBlockN=%u  kChunkK=%u\n\n",
+           kTileN, kTileM, kTileK, kBlockN, kChunkK);
 
     auto run = [&](bool ok) { total++; if (ok) passed++; else all_ok = false; };
 
@@ -214,7 +214,8 @@ int main()
     printf("\n--- Large K (precision stress) ---\n");
 
     run(RunTest2D("8 x 512 x 32  [large K]",    8,  512, 32));
-    run(RunTest2D("16 x 1024 x 16  [K=kMaxK/2]", 16, kMaxK / 2, 16));
+    run(RunTest2D("16 x 4·kChunkK x 16  [multi-chunk K reload]",
+                  16, kChunkK * 4, 16));
 
     // -----------------------------------------------------------------------
     // Batch tests

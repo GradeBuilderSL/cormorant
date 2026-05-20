@@ -29,35 +29,48 @@ using AccData_t = @MM_ACC_DATA_TYPE@;
 // ---------------------------------------------------------------------------
 // Tile-size constants — compile-time parameters for the HLS kernel.
 //
+// Two families of constants:
+//
+//   * kTile<dim>   — inner-loop tile sizes.  Inside a single ki sweep these
+//                    bound how many rows / cols of A and B are touched per
+//                    iteration.  Hard requirement on II=1.
+//   * kBlockN, kChunkK — outer-loop / on-chip A-cache sizes.  They bound
+//                        how much of A is resident in BRAM at once.  When
+//                        N or K exceeds these, the kernel paginates via
+//                        outer n_block / k_chunk loops and reloads A on
+//                        each miss.  *Not* workload limits — arbitrary
+//                        N, K, M, batch are supported.
+//
 // kTileN  Row-lane interleave depth.  Must be ≥ MAC latency (≈3 for
 //         ap_fixed<16,8>) to achieve II=1 in the inner pipeline.  Must be a
 //         power of two so that ki % kTileN compiles to a bitwise AND.
 //         kTileN rows are processed per inner ki sweep; larger N is handled
-//         by the outer n_grp loop (see kMaxN).
+//         by the outer n_grp loop (see kBlockN).
 //
 // kTileM  Parallel output columns per pipeline cycle.  Each column maps to
 //         one DSP accumulator lane.  Must be a power of two (AXI burst
 //         alignment, and ki % kTileM analogues if ever used).
 //
 // kTileK  On-chip B-buffer row count (BRAM K-slice).
-//         Must be a power of two (Q6 in design doc: avoids divider in HLS).
+//         Must be a power of two so that the chunk-local k_tile_off /
+//         a_buf[*][k_tile_off+kk] indexing has no divider.
 //
-// kMaxK   Compile-time upper bound on the inner dimension K.
-//         Determines a_buf row length: a_buf[kMaxN][kMaxK].
-//         Models with K > kMaxK are rejected by the inference scheduler.
+// kChunkK On-chip A-cache depth (cols of A held per outer k_chunk).
+//         Determines a_buf depth: a_buf[kBlockN][kChunkK].  When K is
+//         larger, the kernel runs ceil(K/kChunkK) outer k_chunk iterations,
+//         reloading A on each cache miss.  Must be a multiple of kTileK
+//         so the inner k_tile loop covers every chunk-local element.
 //
-// kMaxN   Compile-time upper bound on the rows held in the on-chip A buffer
-//         in one pass.  The kernel processes N in blocks of kMaxN rows;
-//         within a block, B is loaded once per (m_tile, k_tile) and reused
-//         across ALL block rows (the persistent-A loop-swap optimisation).
-//         For N ≤ kMaxN the outer n_block loop runs exactly once and A is
-//         loaded into BRAM only once per kernel invocation.  Must be a
-//         multiple of kTileN so the n_grp partitioning is exact.
+// kBlockN On-chip A-cache height (rows of A held per outer n_block).
+//         Determines a_buf row count: a_buf[kBlockN][kChunkK].  When N is
+//         larger, the kernel runs ceil(N/kBlockN) outer n_block iterations,
+//         reloading A on each.  Must be a multiple of kTileN so the n_grp
+//         partitioning is exact.
 // ---------------------------------------------------------------------------
-static constexpr unsigned kTileN = @MM_TILE_N@;
-static constexpr unsigned kTileM = @MM_TILE_M@;
-static constexpr unsigned kTileK = @MM_TILE_K@;
-static constexpr unsigned kMaxK  = @MM_MAX_K@;
-static constexpr unsigned kMaxN  = @MM_MAX_N@;
+static constexpr unsigned kTileN  = @MM_TILE_N@;
+static constexpr unsigned kTileM  = @MM_TILE_M@;
+static constexpr unsigned kTileK  = @MM_TILE_K@;
+static constexpr unsigned kBlockN = @MM_BLOCK_N@;
+static constexpr unsigned kChunkK = @MM_CHUNK_K@;
 
 static constexpr unsigned kSeed  = 42;

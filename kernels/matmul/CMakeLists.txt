@@ -54,8 +54,12 @@ endif()
 #   tile_n   row interleave depth (power of 2; >= MAC latency for II=1)
 #   tile_m   parallel output columns per cycle (power of 2)
 #   tile_k   on-chip B-buffer row count (power of 2)
-#   max_k    compile-time a_buf row-length limit; K > max_k is rejected at
-#            scheduling
+#   block_n  on-chip A-cache height (rows of A held per outer n_block).
+#            Not a workload limit — N > block_n paginates over multiple
+#            n_blocks, reloading A on each.  Must be a multiple of tile_n.
+#   chunk_k  on-chip A-cache depth  (cols of A held per outer k_chunk).
+#            Not a workload limit — K > chunk_k paginates over multiple
+#            k_chunks, reloading A on each.  Must be a multiple of tile_k.
 # ---------------------------------------------------------------------------
 function(matmul_load_constants platform_json out_var_prefix)
     if(NOT EXISTS "${platform_json}")
@@ -63,8 +67,8 @@ function(matmul_load_constants platform_json out_var_prefix)
             "MatmulKernel: platform file not found: ${platform_json}")
     endif()
     file(READ "${platform_json}" _pjson)
-    set(_keys "tile_n;tile_m;tile_k;max_k;max_n")
-    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K;MAX_N")
+    set(_keys "tile_n;tile_m;tile_k;block_n;chunk_k")
+    set(_var_names "TILE_N;TILE_M;TILE_K;BLOCK_N;CHUNK_K")
     foreach(_k _vn IN ZIP_LISTS _keys _var_names)
         string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels matmul "${_k}")
         if(_err)
@@ -78,8 +82,8 @@ endfunction()
 matmul_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" MM)
 message(STATUS "MatmulKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
                "TILE_N=${MM_TILE_N} TILE_M=${MM_TILE_M} "
-               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K} "
-               "MAX_N=${MM_MAX_N}")
+               "TILE_K=${MM_TILE_K} BLOCK_N=${MM_BLOCK_N} "
+               "CHUNK_K=${MM_CHUNK_K}")
 
 # Re-run cmake configure automatically if a platform JSON changes, so the
 # generated Config.h tracks JSON edits without a manual cmake re-run.
@@ -234,8 +238,8 @@ message(STATUS "MatmulKernel: targets — matmul_kernel, matmul_kernel_float, Te
 message(STATUS "MatmulKernel: Data_t=${MM_DATA_TYPE}  "
                "AccData_t=${MM_ACC_DATA_TYPE}  "
                "TILE_N=${MM_TILE_N}  TILE_M=${MM_TILE_M}  "
-               "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}  "
-               "MAX_N=${MM_MAX_N}")
+               "TILE_K=${MM_TILE_K}  BLOCK_N=${MM_BLOCK_N}  "
+               "CHUNK_K=${MM_CHUNK_K}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
@@ -303,8 +307,8 @@ if(MM_VITIS_HLS)
         set(_save_TILE_N "${MM_TILE_N}")
         set(_save_TILE_M "${MM_TILE_M}")
         set(_save_TILE_K "${MM_TILE_K}")
-        set(_save_MAX_K  "${MM_MAX_K}")
-        set(_save_MAX_N  "${MM_MAX_N}")
+        set(_save_BLOCK_N "${MM_BLOCK_N}")
+        set(_save_CHUNK_K "${MM_CHUNK_K}")
 
         matmul_load_constants("${_MM_PLATFORM_FILE}" MM)
 
@@ -317,8 +321,8 @@ if(MM_VITIS_HLS)
         set(MM_TILE_N "${_save_TILE_N}")
         set(MM_TILE_M "${_save_TILE_M}")
         set(MM_TILE_K "${_save_TILE_K}")
-        set(MM_MAX_K  "${_save_MAX_K}")
-        set(MM_MAX_N  "${_save_MAX_N}")
+        set(MM_BLOCK_N "${_save_BLOCK_N}")
+        set(MM_CHUNK_K "${_save_CHUNK_K}")
 
         # set_part TCL command (with optional -board)
         if(_p_board)

@@ -3,7 +3,8 @@
 gen_matmul_models.py — create ONNX models consisting exclusively of MatMul nodes.
 
 These models target the MatmulKernel IP core (ap_fixed<16,8>, tiled N×K×M
-matrix multiply with kTileN=4, kTileM=16, kTileK=256, kMaxK=2048).
+matrix multiply with kTileN=4, kTileM=16, kTileK=256, kChunkK=256,
+kBlockN=16).
 
 Models produced
 ---------------

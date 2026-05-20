@@ -8,13 +8,18 @@ experiment, the rationale, and the measured HW behavior-simulation
 For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 
 > **Status (2026-05-20).** §1 is the prior performance baseline (the shipped
-> single-sequential-loop-nest kernel, also reproduced on 2026-05-20 before
-> the change at 7,713,375 ns).  §2 records a DATAFLOW restructuring that was
-> **tried and rejected** (measured regression).  §3 documents the
-> **landed** optimization: a persistent-A loop swap inspired by the spatial-
-> unroll matmul in arXiv:2503.16731 — **sim_time_ns 4,734,145 ns (-38.6 %)**
-> with 20/20 tests passing, no regression on any single-n_tile test, and
-> -43 % to -59 % on every multi-n_tile geometry.
+> single-sequential-loop-nest kernel, reproduced on 2026-05-20 at
+> 7,713,375 ns).  §2 records the first DATAFLOW restructuring attempt
+> (4-stage, 2026-05-19) that was **tried and rejected**.  §3 documents the
+> **landed** persistent-A loop swap inspired by arXiv:2503.16731 —
+> -38.6 % vs §1.  §4 records a second DATAFLOW attempt (stream-based, on
+> top of persistent-A) that was also **tried and rejected** (+46.5 % vs
+> §3).  §5 is the current **landed** state: K-axis grouped processing
+> with cache-style A reload — lifts the silent `K ≤ kChunkK` corruption
+> bug, makes kBlockN / kChunkK on-chip cache sizes rather than runtime
+> bounds, and drops a_buf BRAM from 18 % → 8 % at the cost of +4.1 % vs
+> §3 on the chunk-path tests.  **Current sim_time: 4,926,105 ns
+> (-36.1 % vs §1).**
 
 ---
 
@@ -128,10 +133,10 @@ the persistent A, not the systolic shift.
 **Change.**  Swap the matmul loop nest so the n_tile dimension is no longer
 the outermost reload axis.  Concretely:
 
-- Introduce `kMaxN = 16` (new compile-time constant, populated from
-  `kernels.matmul.max_n` in `platforms/kv260.json`).
-- Replace the prior `a_buf[kTileN][kMaxK]` with `a_buf[kMaxN][kMaxK]` and
-  add an outer `n_block` loop that processes up to `kMaxN` rows per pass —
+- Introduce `kBlockN = 16` (new compile-time constant, populated from
+  `kernels.matmul.block_n` in `platforms/kv260.json`).
+- Replace the prior `a_buf[kTileN][kChunkK]` with `a_buf[kBlockN][kChunkK]` and
+  add an outer `n_block` loop that processes up to `kBlockN` rows per pass —
   for every test geometry shipping today (`N ≤ 12`) this outer loop runs
   exactly once, so A is loaded into BRAM **once per kernel invocation**.
 - B-tile loading moves inside the (m_tile, k_tile) nest with an **n_grp
@@ -139,7 +144,7 @@ the outermost reload axis.  Concretely:
 
   ```
   for m_tile:
-    clear acc[kMaxN][kTileM]
+    clear acc[kBlockN][kTileM]
     for k_tile:
       LOAD b_tile[k_valid][m_valid]   # ONCE, not per n_tile
       for n_grp in [0, ceil(n_block_valid / kTileN)):
@@ -154,14 +159,14 @@ the outermost reload axis.  Concretely:
   any geometry with N > kTileN.
 
 **Partitioning that mattered.**  The first attempt used cyclic factor=kTileN
-partitioning on `acc` dim 1 — each (n1, m1) bank then held `kMaxN/kTileN = 4`
+partitioning on `acc` dim 1 — each (n1, m1) bank then held `kBlockN/kTileN = 4`
 registers indexed by the runtime n_grp value.  HLS treated that as a
 constrained-port memory and forced II=2 (`HLS 200-885`, "Unable to schedule
 store ... due to limited memory ports").  Replacing with
 `#pragma HLS ARRAY_PARTITION variable=acc complete dim=0` (all 256 registers
 individually) restored II=1.  The lane-rotation WAW distance is still kTileN
 cycles per register, enough for the ap_fixed MAC pipeline; the runtime
-`n_idx` synthesises as a kMaxN-way read MUX + write decoder, which costs
+`n_idx` synthesises as a kBlockN-way read MUX + write decoder, which costs
 multiplexer LUTs (~3.4 k extra) but no extra cycles.
 
 **Result.** **sim_time_ns 4,734,145 (-38.6 %).**
@@ -205,7 +210,7 @@ The pattern is exactly what the change predicts: every test with
 Resource utilisation moves from { BRAM 28 (10 %), DSP 53 (4 %), FF 9 246
 (3 %), LUT 13 552 (11 %) } to { BRAM 52 (18 %), DSP 53 (4 %), FF 23 684
 (10 %), LUT 20 329 (17 %) } — the BRAM increase is the 4× larger
-`a_buf[kMaxN][kMaxK]`, the FF/LUT increase is the larger `acc` register
+`a_buf[kBlockN][kChunkK]`, the FF/LUT increase is the larger `acc` register
 file and the n_idx MUX.  Comfortably under budget for kv260.
 
 **Note on the `Widen Fail` finding from §2.**  The `M_AXI Burst Information`
@@ -220,17 +225,238 @@ the gains come from doing fewer DDR transactions per output element.
 
 ---
 
-## 4. Verification matrix
+## 4. Tried and rejected: DATAFLOW on top of persistent-A (2026-05-20)
+
+After §3 landed, the compute-vs-memory ratio per (m_tile, k_tile) shifted in a
+way that suggested overlap might finally be worthwhile.  On a full tile
+(k_valid = kTileK, m_valid = kTileM):
+
+|  | sequential per (m_tile, k_tile) |
+|---|---:|
+| B-load (DDR)         | k_valid · m_valid                       =  4096 |
+| K-reduce, n_grps = 1 | n_grps · k_valid · kTileN               =  1024 |
+| K-reduce, n_grps = 3 | n_grps · k_valid · kTileN               =  3072 |
+
+DATAFLOW could in principle drive that to `max(producer, consumer)` per
+k_tile, hiding the entire K-reduce behind the B-load.
+
+**Attempt.**  Restructure the per-m_tile accumulate phase as a canonical
+DATAFLOW region with two processes connected by a stream:
+
+```
+accumulate_m_tile_dataflow:
+  #pragma HLS DATAFLOW
+  hls::stream<BPack> b_stream                # one B row (kTileM elements) per pack
+  load_b_tiles_all  (b_ptr,  b_stream, …)    # PRODUCER (DDR → stream)
+  kreduce_all_ktiles(a_buf,  b_stream, acc, …)  # CONSUMER (stream → MAC)
+```
+
+`BPack` carries a full B row, so consumer-side stream traffic stays at one
+pop per row — matching the producer's row-granular push rate.  The consumer
+drains each k_tile's packs into a local `b_tile_local` (1 pack/cycle, II=1)
+then runs the n_grp lane-rotated K-reduce.  Inside the DATAFLOW region the
+producer's k_tile T+1 fill is meant to overlap the consumer's k_tile T
+reduce.
+
+A shared-array variant (b_tile_buf passed between processes, relying on
+auto-ping-pong) was tried first and rejected purely on **C-simulation
+correctness**: csim runs DATAFLOW stages sequentially, so the producer
+overwrote the buffer with the last k_tile's data before the consumer ever
+read k_tile 0; multi-k_tile geometries in `TestMatmulRef` returned wrong
+results in 64 / 64 elements.  The stream-based version is correct in both
+csim and HLS sim.
+
+**Result — REJECTED.** Functionally correct (20/20 RTL tests pass, II=1 on
+every loop, Fmax unchanged at 205.47 MHz), but a **+46.5 % regression vs
+the §3 persistent-A baseline**:
+
+| Metric | §3 persistent-A | §4 +DATAFLOW | Δ |
+|---|---:|---:|---:|
+| total sim_time_ns | 4,734,145 | 6,937,535 | **+46.5 %** |
+| Σ duration_ns     | 4,734,145 | 6,937,535 | +46.5 % |
+
+Every single test regressed — including ones where DATAFLOW could not
+possibly have helped (k_tiles = 1 geometries with nothing to pipeline):
+
+| Test | geom | §3 pers-A | §4 +DATAFLOW | Δ |
+|--:|---|--:|--:|--:|
+| 12 |  4×256×1×1   |    45,850 |   208,640 | **+355 %** |
+|  7 |  4×256×19×1  |   259,790 |   447,100 |  +72 % |
+|  8 |  6×261×19×1  |   293,660 |   476,230 |  +62 % |
+| 17 |  5×64×19×6   |   456,960 |   735,730 |  +61 % |
+| 15 |  5×64×19×4   |   306,010 |   491,860 |  +61 % |
+| 16 |  5×64×19×4   |   306,030 |   491,850 |  +61 % |
+| 14 |  5×64×19×3   |   230,410 |   369,760 |  +60 % |
+| 13 | 12×519×33×1  |   997,460 | 1,424,900 |  +43 % |
+| 11 |  1×256×16×1  |   186,500 |   237,640 |  +27 % |
+|  4 |  4×256×32×1  |   379,000 |   481,270 |  +27 % |
+|  1 |  4×256×16×1  |   197,580 |   248,680 |  +26 % |
+|  3 |  4×512×16×1  |   386,630 |   478,590 |  +24 % |
+|  6 |  4×261×16×1  |   201,530 |   249,270 |  +24 % |
+|  5 |  6×256×16×1  |   214,580 |   265,750 |  +24 % |
+|  2 |  8×256×16×1  |   222,140 |   273,300 |  +23 % |
+|  9 |  7×13×5×1    |    16,530 |    22,060 |  +34 % |
+|  0 |  1×1×1×1     |     5,855 |     5,955 |  +2 % |
+| 10 |  5×1×17×1    |     8,660 |     8,930  |  +3 % |
+| 18 |  4×3×16×1    |     9,380 |     9,880 |  +5 % |
+| 19 |  4×3×16×1    |     9,590 |    10,140 |  +6 % |
+
+**Root cause.** Three additive overheads, each individually small but
+collectively > the overlap saving:
+
+1. **HLS 200-1449 — a_buf cross-process read.** Synthesis emitted:
+   `Process kreduce_all_ktiles has both a predecessor and reads an input
+   from its caller (…).  This may lead to lower throughput.  Consider
+   copying this input via a predecessor process.`  HLS could not fully
+   pipeline the consumer because a_buf is read directly from the
+   MatmulKernel-scope BRAM rather than streamed through a producer.
+   Copying it into the dataflow region (which would be its own process)
+   adds BRAM and per-block setup latency that is itself substantial for
+   the small kv260 geometries.
+
+2. **DATAFLOW process fill / drain per m_tile.**  The two-process
+   pipeline pays its setup latency on every call to
+   `accumulate_m_tile_dataflow`, i.e. once per m_tile.  For tests with
+   exactly one k_tile per m_tile (the common case), there is no
+   cross-iteration overlap to amortise it against and the setup latency
+   is pure overhead.  This is the same failure mode as the 2026-05-19
+   four-stage DATAFLOW (§2) — confirmed by the same `4×256×1×1`
+   pathology (+355 %, identical sign to §2's +313 %).
+
+3. **Consumer fill phase is not free.**  Even with the BPack-wide stream
+   (one pop per row), the consumer still spends k_valid cycles draining
+   into `b_tile_local` before it can K-reduce — so the consumer's wall
+   time per k_tile is `k_valid + n_grps · k_valid · kTileN`, not the
+   `n_grps · k_valid · kTileN` the back-of-envelope calculation assumed.
+   On n_grps = 1 geometries that fill *equals* the K-reduce time, so the
+   consumer total roughly doubles vs the sequential code's "K-reduce
+   only" stage, and the producer alone is not slow enough to fully hide
+   the doubled consumer.
+
+**Synthesis cost** (also a net loss): BRAM 52 → 67 (+15), FF 23 684 →
+48 948 (more than doubled), LUT 20 329 → 46 172 (more than doubled) —
+DATAFLOW process control logic, FIFO depths, and the per-process
+register replication for stable inputs.
+
+**Disposition.**  Reverted at HEAD.  The kernel ships the §3 persistent-A
+single-sequential-nest version; **§4 stays a tried-and-rejected note** so
+future iterations don't repeat the same pattern.
+
+Where a successful DATAFLOW could still come from, if it is pursued
+later: it would need to (a) move a_buf into a producer process so the
+consumer is "fed" by both A and B streams (eliminating the
+HLS 200-1449 warning's serialisation), (b) collapse the consumer's
+fill-then-reduce into a single fused pipeline that reads B directly out
+of the stream during the K-reduce (rather than the current two-phase
+fill + reduce), and (c) keep the K-reduce process small enough that the
+fill / drain latency per (m_tile, k_tile) is dominated by the actual
+overlap saving.  None of those changes are scheduled.
+
+---
+
+## 5. Landed: K-axis grouped processing with cache-style reload (2026-05-20)
+
+**Motivation.**  §3 (persistent-A) introduced a hard runtime limit `K ≤ kChunkK`.
+The kernel did *not* check this at the AXI-Lite registers; instead the
+inner load loop wrote past `a_buf[*][kChunkK]` for any K > kChunkK, silently
+corrupting on-chip memory.  The inference scheduler had no validator
+for this either, so a model with a large MatMul would have produced
+incorrect output with no diagnostic.  kBlockN had the same shape but was
+already handled correctly via the outer `n_block` loop (each block
+reloads A — duplicated reads in exchange for unbounded N).
+
+**Change.**  Apply the same cache-style pattern to the K axis: enumerate
+chunks of size kChunkK in an outer `k_chunk` loop, and reload `a_buf` on a
+cache miss.  Both axes are now uniformly grouped-tile:
+
+```
+n_block loop   (cache miss boundary on N)
+  m_tile loop
+    clear acc
+    k_chunk loop                       (cache miss boundary on K)
+      if k_chunk != last_loaded_k_chunk:
+        LOAD a_buf [n_block_valid × k_chunk_valid]    # cache miss
+        last_loaded_k_chunk = k_chunk
+      k_tile loop inside chunk
+        LOAD b_tile
+        n_grp K-reduce → acc           (a_buf indexed by chunk-local k offset)
+    WRITE C                            (acc has accumulated across all chunks)
+```
+
+A `last_loaded_k_chunk` counter (reset at each `n_block` boundary)
+makes the cache check sound:
+
+- **K ≤ kChunkK ⇒ k_chunks = 1.** The first m_tile loads; every later
+  m_tile sees `last_loaded_k_chunk == 0` and skips the reload.  A is
+  loaded *exactly once per n_block*, identical traffic to §3.
+- **K > kChunkK ⇒ k_chunks > 1.**  Each m_tile must reload every chunk
+  in turn — `m_tiles × k_chunks` DDR loads of A.  This is the
+  "duplicated readings on cache miss" cost accepted in exchange for
+  arbitrary K.
+
+`kBlockN` and `kChunkK` are now *cache sizes* rather than runtime workload
+bounds.  The scheduler can pass any (N, K, M); the kernel handles them
+correctly, paying extra DDR traffic when the working set exceeds the
+on-chip cache.
+
+**Platform-JSON change.**  `kernels.matmul.chunk_k` reduced from `2048`
+to `256` in `platforms/kv260.json`.  Two reasons: (a) the previous
+2048 was sized to fit every shipping test's K in a single chunk so
+the chunk path had no on-hardware coverage; reducing it to 256 forces
+tests with K ∈ {261, 512, 519} onto the multi-chunk path so the kv260
+behaviour testbench exercises the new code; (b) the smaller a_buf
+([16][256] vs [16][2048]) saves BRAM that is otherwise unused under
+the current workloads.
+
+**Result.** **sim_time_ns 4,926,105 (-36.1 % vs original baseline,
++4.1 % vs §3 persistent-A)** — 20/20 RTL tests pass, II=1 on every
+loop, Fmax 205.47 MHz unchanged.
+
+| Metric | original | §3 persistent-A | §5 +chunk | Δ §5 vs §3 |
+|---|---:|---:|---:|---:|
+| total sim_time_ns | 7,713,375 | 4,734,145 | 4,926,105 | +4.05 % |
+
+Per-test (sorted by k_chunks × m_tiles, the chunk-path multiplier):
+
+| # | geom | k_chunks×m_tiles | pers-A | +chunk | Δns | Δ% |
+|--:|---|--:|--:|--:|--:|--:|
+| 13 | 12×519×33×1 | 3 × 3 | 997,460 | 1,162,450 | +164,990 | **+16.5 %** |
+|  8 |  6×261×19×1 | 2 × 2 | 293,660 |   315,920 |  +22,260 |   +7.6 % |
+|  3 |  4×512×16×1 | 2 × 1 | 386,630 |   388,850 |   +2,220 |   +0.6 % |
+|  6 |  4×261×16×1 | 2 × 1 | 201,530 |   202,680 |   +1,150 |   +0.6 % |
+| — others (15 tests, k_chunks = 1) | | | | within ±0.2 % testbench jitter |
+
+The cost on tests 3, 6, 8, 13 scales exactly as predicted by the cache
+model — `(k_chunks × m_tiles - 1)` extra A reloads of (n_block_valid ×
+kChunkK) elements each.  All k_chunks = 1 tests are unaffected.
+
+**Synthesis cost** (net win on resources): the 8× smaller a_buf drops
+BRAM from { 52 (18 %) } to { 24 (8 %) }; DSP unchanged at 53 (4 %);
+FF and LUT roughly unchanged (24 k / 21 k → 30 k / 22 k — small bump
+from the extra outer loop's control logic).  More headroom for future
+upper-bound increases on either axis.
+
+**Why this isn't an "optimisation" in the sim_time sense.**  §5 is a
+*correctness + flexibility* change that gives back 4 % vs §3.  The win
+is that the kernel now handles arbitrary K (previously a silent
+corruption) and BRAM is freed up for other uses; the sim_time hit on
+four tests is the cost of validating the chunk reload path on the kv260
+behaviour testbench rather than only in C-sim.  Net vs original
+baseline is still **-36.1 %**.
+
+---
+
+## 6. Verification matrix
 
 | Gate | Command | Current result |
 |---|---|---|
 | C-simulation | `ctest -R Matmul` | `TestMatmulRef`, `TestMatmulBlas` pass |
 | HLS synthesis | `make synthesize_matmul_kv260` | II=1 all loops; Fmax 205.47 MHz |
-| RTL behavior test | `make behavior_test_matmul` | 20/20 pass; sim_time 4,734,145 ns |
+| RTL behavior test | `make behavior_test_matmul` | 20/20 pass; sim_time 4,926,105 ns |
 
 ---
 
-## 5. Related files
+## 7. Related files
 
 | File | Purpose |
 |---|---|
