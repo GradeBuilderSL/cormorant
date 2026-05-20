@@ -457,17 +457,21 @@ def gen_conv_two_layer_vgg() -> None:
 # boundary-ok models confirm the inequality is `≤` (limit value passes).
 # ---------------------------------------------------------------------------
 def gen_unsupported_in_ch_too_large() -> None:
-    """in_ch=1025 violates kMaxInCh=1024."""
-    w_data = np.zeros((4, 1025, 1, 1), dtype=np.float32)
+    """in_ch=1025 violates kMaxInCh=1024.
+
+    Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
+    transform won't intercept this fixture before constraint validation.
+    """
+    w_data = np.zeros((4, 1025, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3],
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_in_ch",
-        inputs=[_vi("X", [1, 1025, 2, 2])],
-        outputs=[_vi("Y", [1, 4, 2, 2])],
+        inputs=[_vi("X", [1, 1025, 3, 3])],
+        outputs=[_vi("Y", [1, 4, 1, 1])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -475,17 +479,21 @@ def gen_unsupported_in_ch_too_large() -> None:
 
 
 def gen_unsupported_out_ch_too_large() -> None:
-    """out_ch=1025 violates kMaxOutCh=1024."""
-    w_data = np.zeros((1025, 4, 1, 1), dtype=np.float32)
+    """out_ch=1025 violates kMaxOutCh=1024.
+
+    Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
+    transform won't intercept this fixture before constraint validation.
+    """
+    w_data = np.zeros((1025, 4, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3],
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_out_ch",
-        inputs=[_vi("X", [1, 4, 2, 2])],
-        outputs=[_vi("Y", [1, 1025, 2, 2])],
+        inputs=[_vi("X", [1, 4, 3, 3])],
+        outputs=[_vi("Y", [1, 1025, 1, 1])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -535,15 +543,15 @@ def gen_unsupported_dil_w_overflows_line_buf() -> None:
 def gen_unsupported_acc_persist() -> None:
     """out_w*out_ch = 256*257 = 65792 violates kMaxAccPersistEntries=65536.
 
-    Uses a 1x1 conv with in_ch=1 so the weight tensor stays tiny
-    (257 floats); ONNX shape inference handles the large output shape
-    without needing to materialise the data tensor.
+    Uses a 3x3 conv with pads=1 (output size preserved) and in_ch=1
+    so the weight tensor stays small (2313 floats).  Non-pointwise so
+    the planned 1x1→MatMul transform won't intercept this fixture.
     """
-    w_data = np.zeros((257, 1, 1, 1), dtype=np.float32)
+    w_data = np.zeros((257, 1, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3], pads=[1, 1, 1, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_acc_persist",
@@ -556,17 +564,21 @@ def gen_unsupported_acc_persist() -> None:
 
 
 def gen_in_ch_at_limit() -> None:
-    """Boundary-case: in_ch=1024 exactly equals kMaxInCh; must parse OK."""
-    w_data = np.zeros((4, 1024, 1, 1), dtype=np.float32)
+    """Boundary-case: in_ch=1024 exactly equals kMaxInCh; must parse OK.
+
+    Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
+    transform won't intercept this fixture before constraint validation.
+    """
+    w_data = np.zeros((4, 1024, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3],
     )
     graph = helper.make_graph(
         [conv], "conv_in_ch_at_limit",
-        inputs=[_vi("X", [1, 1024, 2, 2])],
-        outputs=[_vi("Y", [1, 4, 2, 2])],
+        inputs=[_vi("X", [1, 1024, 3, 3])],
+        outputs=[_vi("Y", [1, 4, 1, 1])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -592,12 +604,16 @@ def gen_dil_h_at_line_buf_limit() -> None:
 
 
 def gen_acc_persist_at_limit() -> None:
-    """Boundary-case: out_w*out_ch = 256*256 = 65536; must parse OK."""
-    w_data = np.zeros((256, 1, 1, 1), dtype=np.float32)
+    """Boundary-case: out_w*out_ch = 256*256 = 65536; must parse OK.
+
+    Uses a 3x3 kernel with pads=1 (preserves spatial size) so the
+    planned 1x1→MatMul transform won't intercept this fixture.
+    """
+    w_data = np.zeros((256, 1, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 1],
+        kernel_shape=[3, 3], pads=[1, 1, 1, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_acc_persist_at_limit",
