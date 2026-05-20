@@ -463,6 +463,16 @@ class ScheduledNode:
 # MatmulNode                                                           #
 # ------------------------------------------------------------------ #
 
+# ---------------------------------------------------------------------------
+# Hardware-side bound — single source of truth is the platform JSON
+# (platforms/<AXI_PLATFORM>.json, ``kernels.matmul`` object — see
+# doc/MATMUL_KERNEL.md §3 for the field reference).  The resolver in
+# ``_matmul_hw_config`` reads the same file the C++ CMake build consumes
+# via ``matmul_load_constants()`` in kernels/matmul/CMakeLists.txt.
+# ---------------------------------------------------------------------------
+from ._matmul_hw_config import MATMUL_MAX_K  # noqa: E402
+
+
 @dataclass
 class MatmulNode:
     """One ONNX MatMul operator mapped to one or more XMatmulkernel invocations.
@@ -588,6 +598,24 @@ class MatmulNode:
                 f"MatMul shape mismatch in node '{node.name}': "
                 f"A K={k_val} != B K={b_shape[-2]} "
                 f"in A{list(a_shape)} @ B{list(b_shape)}."
+            )
+
+        # ------------------------------------------------------------------
+        # Hardware-bound validation — see _matmul_hw_config for where this
+        # constant comes from (platforms/<AXI_PLATFORM>.json `kernels.matmul`).
+        # MatmulKernel sizes its row-staging buffer ``a_buf[kTileN][kMaxK]``
+        # at compile time, so a matmul with inner-dim k > kMaxK has no
+        # runtime fallback — reject at parse time rather than emit code the
+        # kernel can't service.  n / m / batch stay unbounded — the kernel
+        # tiles them naturally.  Reference: doc/MATMUL_KERNEL.md §3.
+        # ------------------------------------------------------------------
+        if k_val > MATMUL_MAX_K:
+            raise SchedulerError(
+                f"MatMul node '{node.name or 'MatMul'}': inner-dim k="
+                f"{k_val} exceeds MatmulKernel's compile-time limit "
+                f"kMaxK={MATMUL_MAX_K}.  Raise 'kernels.matmul.max_k' in "
+                f"the platform JSON (platforms/<AXI_PLATFORM>.json) and "
+                f"rebuild."
             )
 
         a_batch = a_shape[:-2]   # leading batch dims of A; () when A is 2-D

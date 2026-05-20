@@ -709,6 +709,45 @@ def make_mm_sat_neg(out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Hardware-bound violation / boundary models                           #
+#                                                                      #
+# kMaxK comes from platforms/kv260.json (kernels.matmul.max_k = 2048). #
+# The over-limit model violates kMaxK by exactly one unit; the         #
+# boundary model exercises the inclusive `≤` boundary.  Geometries     #
+# are otherwise minimal (N=1, M=1) to keep weight tensors tiny.        #
+# ------------------------------------------------------------------ #
+
+def make_mm_unsupported_k_too_large(out_dir: str) -> None:
+    """X[1,2049] @ W[2049,1] -> Y[1,1]: K=2049 violates kMaxK=2048."""
+    K = 2049
+    W = np.zeros((K, 1), dtype=np.float32)
+    graph = oh.make_graph(
+        [oh.make_node("MatMul", ["X", "W"], ["Y"])],
+        "mm_unsupported_k",
+        [_float32("X", [1, K])],
+        [_float32("Y", [1, 1])],
+        initializer=[_initializer("W", W)],
+    )
+    _save(_make_model(graph),
+          os.path.join(out_dir, "mm_unsupported_k.onnx"))
+
+
+def make_mm_k_at_limit(out_dir: str) -> None:
+    """Boundary: K=2048 == kMaxK; must parse OK (bound is `≤`, not `<`)."""
+    K = 2048
+    W = np.zeros((K, 1), dtype=np.float32)
+    graph = oh.make_graph(
+        [oh.make_node("MatMul", ["X", "W"], ["Y"])],
+        "mm_k_at_limit",
+        [_float32("X", [1, K])],
+        [_float32("Y", [1, 1])],
+        initializer=[_initializer("W", W)],
+    )
+    _save(_make_model(graph),
+          os.path.join(out_dir, "mm_k_at_limit.onnx"))
+
+
+# ------------------------------------------------------------------ #
 # Entry point                                                          #
 # ------------------------------------------------------------------ #
 
@@ -736,6 +775,8 @@ _ALL_MAKERS = [
     make_mm_2d_5d,
     make_mm_sat_pos,
     make_mm_sat_neg,
+    make_mm_unsupported_k_too_large,
+    make_mm_k_at_limit,
 ]
 
 
