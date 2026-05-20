@@ -27,8 +27,10 @@ import numpy as np
 
 # Standard torchvision ImageNet normalisation constants (RGB order) — used
 # by the ONNX Model Zoo MobileNetV2 / ResNet / etc. trained in PyTorch.
-_IMAGENET_MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32)
-_IMAGENET_STD  = np.array((0.229, 0.224, 0.225), dtype=np.float32)
+# Pre-scaled by 255 so the encoder can operate directly on the input
+# [0, 255] range: out = (pixel - mean) / std (matches the ResNet18 spec).
+_IMAGENET_MEAN_255 = np.array((123.675, 116.28, 103.53), dtype=np.float32)
+_IMAGENET_STD_255  = np.array(( 58.395,  57.12,  57.375), dtype=np.float32)
 
 
 def preprocess_frame(bgr_frame: np.ndarray, input_size: int,
@@ -49,8 +51,10 @@ def preprocess_frame(bgr_frame: np.ndarray, input_size: int,
     elif normalize == "none":
         a = a / 256.0                               # ~ raw byte / 256
     elif normalize == "imagenet":
-        # PyTorch / torchvision recipe: pixel/255 then per-channel (x - μ)/σ.
-        a = (a / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+        # ONNX Model Zoo ResNet18 spec, equivalent to the torchvision recipe:
+        # (pixel - 255*mean) / (255*std).  Constants pre-scaled into the
+        # 0..255 input range so we skip the intermediate /255 step.
+        a = (a - _IMAGENET_MEAN_255) / _IMAGENET_STD_255
     else:
         raise ValueError(f"unknown normalize mode: {normalize!r} "
                          f"(expected 'tf', 'unit', 'imagenet', 'none')")

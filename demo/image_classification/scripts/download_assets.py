@@ -212,8 +212,11 @@ def _sniff_kind(path: Path) -> str:
 
 # Standard torchvision ImageNet normalisation constants (RGB order) — used
 # by the ONNX Model Zoo MobileNetV2 / ResNet / etc. trained in PyTorch.
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD  = (0.229, 0.224, 0.225)
+# Pre-scaled by 255 so the encoder can operate directly on the input
+# [0, 255] range: out = (pixel - mean) / std (matches the ResNet18 spec).
+import numpy as _np
+_IMAGENET_MEAN_255 = _np.array((123.675, 116.28, 103.53), dtype=_np.float32)
+_IMAGENET_STD_255  = _np.array(( 58.395,  57.12,  57.375), dtype=_np.float32)
 
 
 def _encode_pixels(arr, normalize: str):
@@ -228,10 +231,11 @@ def _encode_pixels(arr, normalize: str):
     elif normalize == "unit": a = a / 255.0              # [0, 1]
     elif normalize == "none": a = a / 256.0              # ≈ raw byte / 256
     elif normalize == "imagenet":
-        # PyTorch / torchvision recipe: pixel/255 then per-channel (x - μ)/σ.
-        a = a / 255.0
-        a = (a - np.array(_IMAGENET_MEAN, dtype=np.float32)) \
-            / np.array(_IMAGENET_STD, dtype=np.float32)
+        # ONNX Model Zoo ResNet18 spec, equivalent to the torchvision recipe:
+        # (pixel - 255*mean) / (255*std) with mean=[0.485,0.456,0.406],
+        # std=[0.229,0.224,0.225].  Constants are pre-scaled into the
+        # 0..255 input range so we avoid the intermediate /255 step.
+        a = (a - _IMAGENET_MEAN_255) / _IMAGENET_STD_255
     else:
         raise ValueError(f"unknown normalize mode: {normalize!r} "
                          f"(expected 'tf', 'unit', 'imagenet', 'none')")
