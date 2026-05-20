@@ -123,69 +123,87 @@ class TestConvNodeValidation(unittest.TestCase):
 @unittest.skipUnless(_conv_models_exist(),
                      "Run test/gen_conv_models.py first")
 class TestConvNodeHardwareBounds(unittest.TestCase):
-    """ConvNode rejects layer geometries the kernel cannot service."""
+    """ConvNode rejects layer geometries the kernel cannot service.
+
+    All assertions read the active bounds from ``_conv_hw_config`` so the
+    suite stays green when the platform JSON is bumped (and
+    ``gen_conv_models.py`` re-runs against the new values)."""
 
     def test_in_ch_too_large_raises(self):
+        from src._conv_hw_config import CONV_MAX_IN_CH
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_conv_model("conv_unsupported_in_ch.onnx"))
         msg = str(cm.exception)
-        self.assertIn("in_ch=1025", msg)
+        self.assertIn(f"in_ch={CONV_MAX_IN_CH + 1}", msg)
         self.assertIn("kMaxInCh", msg)
 
     def test_out_ch_too_large_raises(self):
+        from src._conv_hw_config import CONV_MAX_OUT_CH
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_conv_model("conv_unsupported_out_ch.onnx"))
         msg = str(cm.exception)
-        self.assertIn("out_ch=1025", msg)
+        self.assertIn(f"out_ch={CONV_MAX_OUT_CH + 1}", msg)
         self.assertIn("kMaxOutCh", msg)
 
     def test_dil_h_overflows_line_buf_rows_raises(self):
-        """kh=4 dilation_h=6 → vertical span 19 > kMaxLineBufRows=16."""
+        """Vertical span = kMaxLineBufRows + 1; must raise."""
+        from src._conv_hw_config import CONV_MAX_LINE_BUF_ROWS
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_conv_model("conv_unsupported_dil_h.onnx"))
         msg = str(cm.exception)
         self.assertIn("vertical span", msg)
         self.assertIn("kMaxLineBufRows", msg)
-        self.assertIn("19", msg)   # the computed span
+        self.assertIn(str(CONV_MAX_LINE_BUF_ROWS + 1), msg)
 
     def test_dil_w_overflows_line_buf_cols_raises(self):
-        """kw=4 dilation_w=22 → horizontal span 67 > kMaxLineBufCols=64."""
+        """Horizontal span = kMaxLineBufCols + 1; must raise."""
+        from src._conv_hw_config import CONV_MAX_LINE_BUF_COLS
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_conv_model("conv_unsupported_dil_w.onnx"))
         msg = str(cm.exception)
         self.assertIn("horizontal span", msg)
         self.assertIn("kMaxLineBufCols", msg)
-        self.assertIn("67", msg)
+        self.assertIn(str(CONV_MAX_LINE_BUF_COLS + 1), msg)
 
     def test_acc_persist_overflow_raises(self):
-        """out_w*out_ch = 256*257 = 65792 > kMaxAccPersistEntries=65536."""
+        """out_w * out_ch > kMaxAccPersistEntries; must raise."""
+        from src._conv_hw_config import CONV_MAX_ACC_PERSIST_ENTRIES
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_conv_model("conv_unsupported_acc_persist.onnx"))
         msg = str(cm.exception)
         self.assertIn("out_w*out_ch", msg)
         self.assertIn("kMaxAccPersistEntries", msg)
-        self.assertIn("65792", msg)
+        # The generator uses out_w=256 and picks the smallest out_ch that
+        # overflows the limit, so the product printed in the error is
+        # MAX // 256 * 256 + 256 = MAX rounded down to a 256-multiple + 256.
+        out_w = 256
+        expected_product = (CONV_MAX_ACC_PERSIST_ENTRIES // out_w + 1) * out_w
+        self.assertIn(str(expected_product), msg)
 
     def test_in_ch_at_limit_parses(self):
-        """in_ch=1024 == kMaxInCh must parse — bound is `≤`, not `<`."""
+        """in_ch == kMaxInCh must parse — bound is `≤`, not `<`."""
+        from src._conv_hw_config import CONV_MAX_IN_CH
         g = OnnxGraph(_conv_model("conv_in_ch_at_limit.onnx"))
         sn = g.nodes[0]
         self.assertIsInstance(sn, ConvNode)
-        self.assertEqual(sn.in_ch, 1024)
+        self.assertEqual(sn.in_ch, CONV_MAX_IN_CH)
 
     def test_dil_h_span_at_limit_parses(self):
-        """span=16 == kMaxLineBufRows must parse — boundary inclusive."""
+        """span == kMaxLineBufRows must parse — boundary inclusive."""
+        from src._conv_hw_config import CONV_MAX_LINE_BUF_ROWS
         g = OnnxGraph(_conv_model("conv_dil_h_at_limit.onnx"))
         sn = g.nodes[0]
         self.assertIsInstance(sn, ConvNode)
-        self.assertEqual((sn.kh - 1) * sn.dilation_h + 1, 16)
+        span = (sn.kh - 1) * sn.dilation_h + 1
+        self.assertEqual(span, CONV_MAX_LINE_BUF_ROWS)
 
     def test_acc_persist_at_limit_parses(self):
-        """out_w*out_ch = 256*256 = 65536 must parse — boundary inclusive."""
+        """out_w * out_ch == kMaxAccPersistEntries must parse — boundary inclusive."""
+        from src._conv_hw_config import CONV_MAX_ACC_PERSIST_ENTRIES
         g = OnnxGraph(_conv_model("conv_acc_persist_at_limit.onnx"))
         sn = g.nodes[0]
         self.assertIsInstance(sn, ConvNode)
-        self.assertEqual(sn.out_w * sn.out_ch, 65536)
+        self.assertEqual(sn.out_w * sn.out_ch, CONV_MAX_ACC_PERSIST_ENTRIES)
 
 
 class TestConvHwConfigResolver(unittest.TestCase):

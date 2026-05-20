@@ -1,11 +1,27 @@
 """Generate ONNX test models that use ConvKernel nodes."""
 
 import os
+import sys
+
 import numpy as np
 import onnx
 from onnx import helper, TensorProto, numpy_helper
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "models")
+
+# Pull bounds from the platform JSON so violator/at-limit models always
+# size against the active ConvKernel configuration.  Avoids the trap of a
+# hard-coded out_ch=1025 silently becoming a legal value the moment the
+# JSON max_out_ch is bumped (which would make the corresponding "must
+# raise" test pass even though the validator never fired).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src._conv_hw_config import (   # noqa: E402
+    CONV_MAX_IN_CH,
+    CONV_MAX_OUT_CH,
+    CONV_MAX_LINE_BUF_ROWS,
+    CONV_MAX_LINE_BUF_COLS,
+    CONV_MAX_ACC_PERSIST_ENTRIES,
+)
 
 
 def _save(model, name: str) -> None:
@@ -457,12 +473,13 @@ def gen_conv_two_layer_vgg() -> None:
 # boundary-ok models confirm the inequality is `≤` (limit value passes).
 # ---------------------------------------------------------------------------
 def gen_unsupported_in_ch_too_large() -> None:
-    """in_ch=1025 violates kMaxInCh=1024.
+    """in_ch one above kMaxInCh — must raise.
 
     Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
     transform won't intercept this fixture before constraint validation.
     """
-    w_data = np.zeros((4, 1025, 3, 3), dtype=np.float32)
+    in_ch = CONV_MAX_IN_CH + 1
+    w_data = np.zeros((4, in_ch, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
@@ -470,7 +487,7 @@ def gen_unsupported_in_ch_too_large() -> None:
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_in_ch",
-        inputs=[_vi("X", [1, 1025, 3, 3])],
+        inputs=[_vi("X", [1, in_ch, 3, 3])],
         outputs=[_vi("Y", [1, 4, 1, 1])],
         initializer=[w_init],
     )
@@ -479,12 +496,13 @@ def gen_unsupported_in_ch_too_large() -> None:
 
 
 def gen_unsupported_out_ch_too_large() -> None:
-    """out_ch=1025 violates kMaxOutCh=1024.
+    """out_ch one above kMaxOutCh — must raise.
 
     Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
     transform won't intercept this fixture before constraint validation.
     """
-    w_data = np.zeros((1025, 4, 3, 3), dtype=np.float32)
+    out_ch = CONV_MAX_OUT_CH + 1
+    w_data = np.zeros((out_ch, 4, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
@@ -493,7 +511,7 @@ def gen_unsupported_out_ch_too_large() -> None:
     graph = helper.make_graph(
         [conv], "conv_unsupported_out_ch",
         inputs=[_vi("X", [1, 4, 3, 3])],
-        outputs=[_vi("Y", [1, 1025, 1, 1])],
+        outputs=[_vi("Y", [1, out_ch, 1, 1])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -501,21 +519,26 @@ def gen_unsupported_out_ch_too_large() -> None:
 
 
 def gen_unsupported_dil_h_overflows_line_buf() -> None:
-    """kh=4 dilation_h=6 → vertical span = 3*6 + 1 = 19 > kMaxLineBufRows=16.
+    """Vertical kernel span one above kMaxLineBufRows — must raise.
 
+    Uses kh=2 with dilation_h = MAX_ROWS, so span = (kh-1)*dh + 1
+    = MAX_ROWS + 1, exactly one element over the line-buffer-row capacity.
     kh stays within max_kh=7 so the violation isolates the line-buffer-row
     constraint, not a (non-existent) kh constraint.
     """
-    w_data = np.zeros((4, 4, 4, 1), dtype=np.float32)
+    dh = CONV_MAX_LINE_BUF_ROWS
+    span = dh + 1                       # (2-1)*dh + 1
+    in_h = span                         # out_h = in_h - span + 1 = 1
+    w_data = np.zeros((4, 4, 2, 1), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[4, 1], dilations=[6, 1],
+        kernel_shape=[2, 1], dilations=[dh, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_dil_h",
-        inputs=[_vi("X", [1, 4, 24, 8])],
-        outputs=[_vi("Y", [1, 4, 6, 8])],   # out_h = 24 - 19 + 1 = 6
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, 1, 8])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -523,17 +546,23 @@ def gen_unsupported_dil_h_overflows_line_buf() -> None:
 
 
 def gen_unsupported_dil_w_overflows_line_buf() -> None:
-    """kw=4 dilation_w=22 → horizontal span = 3*22 + 1 = 67 > kMaxLineBufCols=64."""
-    w_data = np.zeros((4, 4, 1, 4), dtype=np.float32)
+    """Horizontal kernel span one above kMaxLineBufCols — must raise.
+
+    kw=2 with dilation_w = MAX_COLS so span = MAX_COLS + 1.
+    """
+    dw = CONV_MAX_LINE_BUF_COLS
+    span = dw + 1
+    in_w = span                         # out_w = 1
+    w_data = np.zeros((4, 4, 1, 2), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[1, 4], dilations=[1, 22],
+        kernel_shape=[1, 2], dilations=[1, dw],
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_dil_w",
-        inputs=[_vi("X", [1, 4, 8, 80])],
-        outputs=[_vi("Y", [1, 4, 8, 14])],   # out_w = 80 - 67 + 1 = 14
+        inputs=[_vi("X", [1, 4, 8, in_w])],
+        outputs=[_vi("Y", [1, 4, 8, 1])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -541,13 +570,17 @@ def gen_unsupported_dil_w_overflows_line_buf() -> None:
 
 
 def gen_unsupported_acc_persist() -> None:
-    """out_w*out_ch = 256*257 = 65792 violates kMaxAccPersistEntries=65536.
+    """out_w * out_ch one above kMaxAccPersistEntries — must raise.
 
-    Uses a 3x3 conv with pads=1 (output size preserved) and in_ch=1
-    so the weight tensor stays small (2313 floats).  Non-pointwise so
-    the planned 1x1→MatMul transform won't intercept this fixture.
+    Pads=1 with a 3x3 kernel preserves the spatial size, so picking
+    out_w=256 and out_ch = floor(MAX/256) + 1 lands at exactly MAX+stride
+    above the limit while keeping the weight tensor small.  Non-pointwise
+    so the planned 1x1→MatMul transform won't intercept it.
     """
-    w_data = np.zeros((257, 1, 3, 3), dtype=np.float32)
+    out_w = 256
+    # Smallest out_ch such that out_w * out_ch > MAX.
+    out_ch = CONV_MAX_ACC_PERSIST_ENTRIES // out_w + 1
+    w_data = np.zeros((out_ch, 1, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
@@ -555,8 +588,8 @@ def gen_unsupported_acc_persist() -> None:
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_acc_persist",
-        inputs=[_vi("X", [1, 1, 256, 256])],
-        outputs=[_vi("Y", [1, 257, 256, 256])],
+        inputs=[_vi("X", [1, 1, out_w, out_w])],
+        outputs=[_vi("Y", [1, out_ch, out_w, out_w])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -564,12 +597,13 @@ def gen_unsupported_acc_persist() -> None:
 
 
 def gen_in_ch_at_limit() -> None:
-    """Boundary-case: in_ch=1024 exactly equals kMaxInCh; must parse OK.
+    """Boundary-case: in_ch == kMaxInCh; must parse OK.
 
     Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
     transform won't intercept this fixture before constraint validation.
     """
-    w_data = np.zeros((4, 1024, 3, 3), dtype=np.float32)
+    in_ch = CONV_MAX_IN_CH
+    w_data = np.zeros((4, in_ch, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
@@ -577,7 +611,7 @@ def gen_in_ch_at_limit() -> None:
     )
     graph = helper.make_graph(
         [conv], "conv_in_ch_at_limit",
-        inputs=[_vi("X", [1, 1024, 3, 3])],
+        inputs=[_vi("X", [1, in_ch, 3, 3])],
         outputs=[_vi("Y", [1, 4, 1, 1])],
         initializer=[w_init],
     )
@@ -586,17 +620,24 @@ def gen_in_ch_at_limit() -> None:
 
 
 def gen_dil_h_at_line_buf_limit() -> None:
-    """Boundary-case: kh=4 dilation_h=5 → span=16 = kMaxLineBufRows; must parse OK."""
-    w_data = np.zeros((4, 4, 4, 1), dtype=np.float32)
+    """Boundary-case: vertical kernel span == kMaxLineBufRows; must parse OK.
+
+    kh=2 with dilation_h = MAX_ROWS - 1 gives span = MAX_ROWS exactly.
+    """
+    dh = CONV_MAX_LINE_BUF_ROWS - 1
+    span = dh + 1                       # exactly MAX_ROWS
+    in_h = span + 4                     # gives out_h = 5, mild non-degenerate
+    out_h = in_h - span + 1
+    w_data = np.zeros((4, 4, 2, 1), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
-        kernel_shape=[4, 1], dilations=[5, 1],
+        kernel_shape=[2, 1], dilations=[dh, 1],
     )
     graph = helper.make_graph(
         [conv], "conv_dil_h_at_limit",
-        inputs=[_vi("X", [1, 4, 20, 8])],
-        outputs=[_vi("Y", [1, 4, 5, 8])],   # out_h = 20 - 16 + 1 = 5
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, out_h, 8])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -604,12 +645,19 @@ def gen_dil_h_at_line_buf_limit() -> None:
 
 
 def gen_acc_persist_at_limit() -> None:
-    """Boundary-case: out_w*out_ch = 256*256 = 65536; must parse OK.
+    """Boundary-case: out_w * out_ch == kMaxAccPersistEntries; must parse OK.
 
     Uses a 3x3 kernel with pads=1 (preserves spatial size) so the
-    planned 1x1→MatMul transform won't intercept this fixture.
+    planned 1x1→MatMul transform won't intercept this fixture.  out_w
+    is chosen as the largest divisor of MAX ≤ 256 so the spatial extent
+    stays small while the equality lands on the boundary exactly.
     """
-    w_data = np.zeros((256, 1, 3, 3), dtype=np.float32)
+    # Pick out_w as the largest divisor of MAX that is ≤ 256 — this
+    # keeps the input tensor compact while letting out_ch = MAX / out_w
+    # be an integer that hits the boundary exactly.
+    out_w = max(d for d in range(1, 257) if CONV_MAX_ACC_PERSIST_ENTRIES % d == 0)
+    out_ch = CONV_MAX_ACC_PERSIST_ENTRIES // out_w
+    w_data = np.zeros((out_ch, 1, 3, 3), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
     conv = helper.make_node(
         "Conv", inputs=["X", "W"], outputs=["Y"],
@@ -617,8 +665,8 @@ def gen_acc_persist_at_limit() -> None:
     )
     graph = helper.make_graph(
         [conv], "conv_acc_persist_at_limit",
-        inputs=[_vi("X", [1, 1, 256, 256])],
-        outputs=[_vi("Y", [1, 256, 256, 256])],
+        inputs=[_vi("X", [1, 1, out_w, out_w])],
+        outputs=[_vi("Y", [1, out_ch, out_w, out_w])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
