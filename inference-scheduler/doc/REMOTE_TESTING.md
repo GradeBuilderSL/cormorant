@@ -544,7 +544,7 @@ An optional `"warmup"` field overrides the per-kernel warmup for that case.
 | Field | Description |
 |-------|-------------|
 | `label` | Display name in the report |
-| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6 |
+| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6. Any other value is rejected by `run_remote_perf.py` at config load (before upload/build) with `config error: VectorOPKernel case '<label>': unsupported op=…`. |
 | `size` | Elements per inner kernel call |
 | `outer` | Outer loop count; `outer=1` is the non-broadcast case |
 | `a_inc` | Stride for A between outer iterations (`size` to advance, `0` to repeat) |

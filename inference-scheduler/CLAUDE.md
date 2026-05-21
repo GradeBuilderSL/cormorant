@@ -383,6 +383,17 @@ Tests live in `test/`. Run with `pytest`:
 Most test classes are decorated `@unittest.skipUnless(_models_exist(), ...)` —
 run all `gen_*.py` scripts first if tests are skipped (see Quick Start).
 
+**Hardware-bound fixtures.** The `gen_conv_models.py`, `gen_matmul_models.py`
+and `gen_pool_models.py` "must raise" / "at_limit" generators read their
+geometry constants from the platform JSON via the same `_<kernel>_hw_config`
+resolvers the scheduler uses (`MATMUL_MAX_K`, `POOL_MAX_KH/KW/LINE_BUF_*`,
+`CONV_MAX_IN_CH/OUT_CH/LINE_BUF_*/ACC_PERSIST_ENTRIES`). The matching
+`test_*.py` assertions read the same constants. Don't hard-code a bound
+literal in a fixture or its assertion — a JSON bump (e.g. `max_k: 2048 →
+4096`) would otherwise silently turn a "must raise" model into a legal
+one, masking validator regressions. Re-run the generator after any
+`platforms/<name>.json` change.
+
 ## On-Device Testing and Benchmarking
 
 Two scripts drive KV260 hardware over SSH:
@@ -395,6 +406,12 @@ Two scripts drive KV260 hardware over SSH:
 Both share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
 the full reference including the `benchmarks` config section and per-kernel
 case field definitions.
+
+`run_remote_perf.py` validates each `VectorOPKernel` case's `op` against the
+kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) at config-load time and exits
+with `config error: VectorOPKernel case '<label>': unsupported op=…` before
+any SSH upload or remote build — same fail-fast contract as the scheduler's
+hardware-bound check, but for the perf benchmark cases.
 
 ## Driver Sources
 
