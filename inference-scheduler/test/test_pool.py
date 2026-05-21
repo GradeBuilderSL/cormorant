@@ -96,49 +96,55 @@ class TestPoolNodeHardwareBounds(unittest.TestCase):
     """PoolNode rejects pool windows the kernel cannot service."""
 
     def test_pool_h_too_large_raises(self):
+        from src._pool_hw_config import POOL_MAX_KH
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_pool_model("pool_unsupported_pool_h.onnx"))
         msg = str(cm.exception)
-        self.assertIn("pool_h=8", msg)
+        self.assertIn(f"pool_h={POOL_MAX_KH + 1}", msg)
         self.assertIn("kMaxPoolH", msg)
 
     def test_pool_w_too_large_raises(self):
+        from src._pool_hw_config import POOL_MAX_KW
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_pool_model("pool_unsupported_pool_w.onnx"))
         msg = str(cm.exception)
-        self.assertIn("pool_w=8", msg)
+        self.assertIn(f"pool_w={POOL_MAX_KW + 1}", msg)
         self.assertIn("kMaxPoolW", msg)
 
     def test_dil_h_overflows_line_buf_rows_raises(self):
-        """pool_h=4 dil_h=6 → vertical span 19 > kMaxLineBufRows=16."""
+        """Vertical span = kMaxLineBufRows + 1; must raise."""
+        from src._pool_hw_config import POOL_MAX_LINE_BUF_ROWS
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_pool_model("pool_unsupported_dil_h.onnx"))
         msg = str(cm.exception)
         self.assertIn("vertical span", msg)
         self.assertIn("kMaxLineBufRows", msg)
-        self.assertIn("19", msg)   # the computed span
+        self.assertIn(str(POOL_MAX_LINE_BUF_ROWS + 1), msg)
 
     def test_dil_w_overflows_line_buf_cols_raises(self):
-        """pool_w=4 dil_w=22 → horizontal span 67 > kMaxLineBufCols=64."""
+        """Horizontal span = kMaxLineBufCols + 1; must raise."""
+        from src._pool_hw_config import POOL_MAX_LINE_BUF_COLS
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_pool_model("pool_unsupported_dil_w.onnx"))
         msg = str(cm.exception)
         self.assertIn("horizontal span", msg)
         self.assertIn("kMaxLineBufCols", msg)
-        self.assertIn("67", msg)
+        self.assertIn(str(POOL_MAX_LINE_BUF_COLS + 1), msg)
 
     def test_pool_h_at_limit_parses(self):
-        """pool_h=7 == kMaxPoolH must parse — bound is `≤`, not `<`."""
+        """pool_h == kMaxPoolH must parse — bound is `≤`, not `<`."""
+        from src._pool_hw_config import POOL_MAX_KH
         g = OnnxGraph(_pool_model("pool_pool_h_at_limit.onnx"))
         self.assertIsInstance(g.nodes[0], PoolNode)
-        self.assertEqual(g.nodes[0].pool_h, 7)
+        self.assertEqual(g.nodes[0].pool_h, POOL_MAX_KH)
 
     def test_dil_h_span_at_limit_parses(self):
-        """span=16 == kMaxLineBufRows must parse — boundary inclusive."""
+        """span == kMaxLineBufRows must parse — boundary inclusive."""
+        from src._pool_hw_config import POOL_MAX_LINE_BUF_ROWS
         g = OnnxGraph(_pool_model("pool_dil_h_at_limit.onnx"))
         self.assertIsInstance(g.nodes[0], PoolNode)
         sn = g.nodes[0]
-        self.assertEqual((sn.pool_h - 1) * sn.dil_h + 1, 16)
+        self.assertEqual((sn.pool_h - 1) * sn.dil_h + 1, POOL_MAX_LINE_BUF_ROWS)
 
 
 class TestPoolHwConfigResolver(unittest.TestCase):

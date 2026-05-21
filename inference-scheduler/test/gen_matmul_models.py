@@ -3,7 +3,8 @@
 gen_matmul_models.py — create ONNX models consisting exclusively of MatMul nodes.
 
 These models target the MatmulKernel IP core (ap_fixed<16,8>, tiled N×K×M
-matrix multiply with kTileN=4, kTileM=16, kTileK=256, kMaxK=2048).
+matrix multiply with kTileN=4, kTileM=16, kTileK=256; kMaxK is read from
+platforms/<AXI_PLATFORM>.json (kernels.matmul.max_k)).
 
 Models produced
 ---------------
@@ -63,12 +64,21 @@ Run from the inference-scheduler directory:
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as nph
 from onnx import TensorProto
+
+# Pull kMaxK from the platform JSON so the violator and at-limit models
+# always size against the active MatmulKernel configuration.  Avoids the
+# trap of a hard-coded K=2049 silently becoming a legal value the moment
+# the JSON max_k is bumped (which would make the "must raise" test pass
+# without the validator ever firing).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src._matmul_hw_config import MATMUL_MAX_K  # noqa: E402
 
 
 DEFAULT_OUT = os.path.join(os.path.dirname(__file__), "models")
@@ -711,15 +721,16 @@ def make_mm_sat_neg(out_dir: str) -> None:
 # ------------------------------------------------------------------ #
 # Hardware-bound violation / boundary models                           #
 #                                                                      #
-# kMaxK comes from platforms/kv260.json (kernels.matmul.max_k = 2048). #
-# The over-limit model violates kMaxK by exactly one unit; the         #
-# boundary model exercises the inclusive `≤` boundary.  Geometries     #
-# are otherwise minimal (N=1, M=1) to keep weight tensors tiny.        #
+# kMaxK comes from platforms/<AXI_PLATFORM>.json (kernels.matmul.max_k) #
+# via ``_matmul_hw_config``.  The over-limit model violates kMaxK by   #
+# exactly one unit; the boundary model exercises the inclusive `≤`     #
+# boundary.  Geometries are otherwise minimal (N=1, M=1) to keep       #
+# weight tensors tiny.                                                 #
 # ------------------------------------------------------------------ #
 
 def make_mm_unsupported_k_too_large(out_dir: str) -> None:
-    """X[1,2049] @ W[2049,1] -> Y[1,1]: K=2049 violates kMaxK=2048."""
-    K = 2049
+    """X[1,kMaxK+1] @ W[kMaxK+1,1] -> Y[1,1]: K violates kMaxK by one."""
+    K = MATMUL_MAX_K + 1
     W = np.zeros((K, 1), dtype=np.float32)
     graph = oh.make_graph(
         [oh.make_node("MatMul", ["X", "W"], ["Y"])],
@@ -733,8 +744,8 @@ def make_mm_unsupported_k_too_large(out_dir: str) -> None:
 
 
 def make_mm_k_at_limit(out_dir: str) -> None:
-    """Boundary: K=2048 == kMaxK; must parse OK (bound is `≤`, not `<`)."""
-    K = 2048
+    """Boundary: K == kMaxK; must parse OK (bound is `≤`, not `<`)."""
+    K = MATMUL_MAX_K
     W = np.zeros((K, 1), dtype=np.float32)
     graph = oh.make_graph(
         [oh.make_node("MatMul", ["X", "W"], ["Y"])],

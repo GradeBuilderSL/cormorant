@@ -81,12 +81,7 @@
         {"label": "ADD-bcast-8x16K", "op": 0, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
         {"label": "MUL-bcast-8x16K", "op": 2, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
         {"label": "RELU-bcast-8x16K", "op": 4, "size": 16384, "outer": 8, "a_inc": 16384, "b_inc": 0, "iters": 100},
-        {"label": "MUL-bcast-dw-12544x16", "op": 2, "size": 16, "outer": 12544, "a_inc": 16, "b_inc": 0, "iters": 100},
-        {"label": "SOFTMAX-1K-1row", "op": 6, "size": 1024, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 200},
-        {"label": "SOFTMAX-4K-1row", "op": 6, "size": 4096, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 100},
-        {"label": "SOFTMAX-16K-1row", "op": 6, "size": 16384, "outer": 1, "a_inc": 0, "b_inc": 0, "iters": 50},
-        {"label": "SOFTMAX-1K-8rows", "op": 6, "size": 1024, "outer": 8, "a_inc": 1024, "b_inc": 0, "iters": 100},
-        {"label": "SOFTMAX-4K-4rows", "op": 6, "size": 4096, "outer": 4, "a_inc": 4096, "b_inc": 0, "iters": 50}
+        {"label": "MUL-bcast-dw-12544x16", "op": 2, "size": 16, "outer": 12544, "a_inc": 16, "b_inc": 0, "iters": 100}
       ]
     },
 

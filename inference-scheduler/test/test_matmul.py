@@ -48,19 +48,21 @@ class TestMatmulNodeHardwareBounds(unittest.TestCase):
     """MatmulNode rejects matmuls the kernel cannot service."""
 
     def test_k_too_large_raises(self):
-        """k=2049 violates kMaxK=2048."""
+        """k == kMaxK + 1 violates the bound by one unit."""
+        from src._matmul_hw_config import MATMUL_MAX_K
         with self.assertRaises(SchedulerError) as cm:
             OnnxGraph(_matmul_model("mm_unsupported_k.onnx"))
         msg = str(cm.exception)
-        self.assertIn("k=2049", msg)
+        self.assertIn(f"k={MATMUL_MAX_K + 1}", msg)
         self.assertIn("kMaxK", msg)
 
     def test_k_at_limit_parses(self):
-        """k=2048 == kMaxK must parse — bound is `≤`, not `<`."""
+        """k == kMaxK must parse — bound is `≤`, not `<`."""
+        from src._matmul_hw_config import MATMUL_MAX_K
         g = OnnxGraph(_matmul_model("mm_k_at_limit.onnx"))
         sn = g.nodes[0]
         self.assertIsInstance(sn, MatmulNode)
-        self.assertEqual(sn.k, 2048)
+        self.assertEqual(sn.k, MATMUL_MAX_K)
 
 
 class TestMatmulHwConfigResolver(unittest.TestCase):

@@ -98,7 +98,7 @@
   ],
 
   "drive": {
-    "folder_url": "https://drive.google.com/drive/u/0/folders/10B29ZArpvtMsGm0McBC0enFPrkq0Z1vD",
+    "folder_url": "https://drive.google.com/drive/folders/1JBdhqHFw4Jh224maq0qNOZzKXrRgorJt",
     "_folder_url_note": "Google Drive folder containing the ONNX models. Downloaded with `gdown --folder`."
   },
 

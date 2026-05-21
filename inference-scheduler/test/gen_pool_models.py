@@ -1,8 +1,22 @@
 """Generate ONNX test models that use PoolingKernel nodes."""
 
 import os
+import sys
 import onnx
 from onnx import helper, TensorProto
+
+# Pull bounds from the platform JSON so violator/at-limit models always
+# size against the active PoolingKernel configuration.  Avoids the trap of
+# a hard-coded pool_h=8 silently becoming a legal value the moment the
+# JSON max_kh is bumped (which would make the "must raise" test pass
+# without the validator ever firing).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src._pool_hw_config import (   # noqa: E402
+    POOL_MAX_KH,
+    POOL_MAX_KW,
+    POOL_MAX_LINE_BUF_ROWS,
+    POOL_MAX_LINE_BUF_COLS,
+)
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "models")
 
@@ -208,8 +222,10 @@ ALL_GENERATORS = [
 
 # ---------------------------------------------------------------------------
 # Hardware-bound violation models — must each raise SchedulerError when
-# loaded by OnnxGraph.  The bounds come from kernels/pool/CMakeLists.txt
-# (defaults: kMaxPoolH/W=7, kMaxLineBufRows=16, kMaxLineBufCols=64).
+# loaded by OnnxGraph.  The bounds come from platforms/<AXI_PLATFORM>.json
+# (kernels.pool) via ``_pool_hw_config`` — the same JSON the C++ CMake
+# build reads, so the violator/at-limit fixtures track whatever the
+# active platform configures the kernel for.
 #
 # Each model violates exactly one bound by exactly one unit so the test
 # can identify which constraint fired.  Geometries are otherwise minimal
@@ -217,94 +233,121 @@ ALL_GENERATORS = [
 # ---------------------------------------------------------------------------
 
 def gen_unsupported_pool_h_too_large() -> None:
-    """pool_h = 8 violates kMaxPoolH=7 (window taller than the adder tree)."""
+    """pool_h = kMaxPoolH + 1 (window taller than the adder tree)."""
+    pool_h = POOL_MAX_KH + 1
+    in_h   = pool_h + 4
+    out_h  = in_h - pool_h + 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[8, 3], strides=[1, 1],
+        kernel_shape=[pool_h, 3], strides=[1, 1],
     )
     graph = helper.make_graph(
         [node], "pool_unsupported_pool_h",
-        inputs=[_vi("X", [1, 4, 12, 8])],
-        outputs=[_vi("Y", [1, 4, 5, 6])],   # out_h = 12-8+1 = 5
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, out_h, 6])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_unsupported_pool_h.onnx")
 
 
 def gen_unsupported_pool_w_too_large() -> None:
-    """pool_w = 8 violates kMaxPoolW=7."""
+    """pool_w = kMaxPoolW + 1."""
+    pool_w = POOL_MAX_KW + 1
+    in_w   = pool_w + 4
+    out_w  = in_w - pool_w + 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[3, 8], strides=[1, 1],
+        kernel_shape=[3, pool_w], strides=[1, 1],
     )
     graph = helper.make_graph(
         [node], "pool_unsupported_pool_w",
-        inputs=[_vi("X", [1, 4, 8, 12])],
-        outputs=[_vi("Y", [1, 4, 6, 5])],
+        inputs=[_vi("X", [1, 4, 8, in_w])],
+        outputs=[_vi("Y", [1, 4, 6, out_w])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_unsupported_pool_w.onnx")
 
 
 def gen_unsupported_dil_h_overflows_line_buf() -> None:
-    """pool_h=4 with dil_h=6 → vertical span = 3*6 + 1 = 19 > kMaxLineBufRows=16.
+    """Vertical pool span one above kMaxLineBufRows — must raise.
 
-    Uses pool_h within the kMaxPoolH=7 limit so the violation isolates the
+    Uses pool_h=2 with dil_h = MAX_ROWS so span = (pool_h-1)*dil_h + 1
+    = MAX_ROWS + 1, exactly one element over the line-buffer-row capacity.
+    pool_h stays within kMaxPoolH so the violation isolates the
     line-buffer-row constraint, not the pool-height constraint.
     """
+    dh   = POOL_MAX_LINE_BUF_ROWS
+    span = dh + 1                       # (2-1)*dh + 1
+    in_h = span                         # out_h = in_h - span + 1 = 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[4, 3], strides=[1, 1], dilations=[6, 1],
+        kernel_shape=[2, 3], strides=[1, 1], dilations=[dh, 1],
     )
     graph = helper.make_graph(
         [node], "pool_unsupported_dil_h",
-        inputs=[_vi("X", [1, 4, 24, 8])],
-        outputs=[_vi("Y", [1, 4, 6, 6])],   # out_h = 24 - 19 + 1 = 6
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, 1, 6])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_unsupported_dil_h.onnx")
 
 
 def gen_unsupported_dil_w_overflows_line_buf() -> None:
-    """pool_w=4 with dil_w=22 → horizontal span = 3*22 + 1 = 67 > kMaxLineBufCols=64."""
+    """Horizontal pool span one above kMaxLineBufCols — must raise.
+
+    pool_w=2 with dil_w = MAX_COLS so span = MAX_COLS + 1.
+    """
+    dw   = POOL_MAX_LINE_BUF_COLS
+    span = dw + 1
+    in_w = span                         # out_w = 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[3, 4], strides=[1, 1], dilations=[1, 22],
+        kernel_shape=[3, 2], strides=[1, 1], dilations=[1, dw],
     )
     graph = helper.make_graph(
         [node], "pool_unsupported_dil_w",
-        inputs=[_vi("X", [1, 4, 8, 80])],
-        outputs=[_vi("Y", [1, 4, 6, 14])],   # out_w = 80 - 67 + 1 = 14
+        inputs=[_vi("X", [1, 4, 8, in_w])],
+        outputs=[_vi("Y", [1, 4, 6, 1])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_unsupported_dil_w.onnx")
 
 
 def gen_pool_h_at_limit() -> None:
-    """Boundary-case: pool_h=7 exactly equals kMaxPoolH; must parse OK."""
+    """Boundary-case: pool_h == kMaxPoolH; must parse OK."""
+    pool_h = POOL_MAX_KH
+    in_h   = pool_h + 5
+    out_h  = in_h - pool_h + 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[7, 3], strides=[1, 1],
+        kernel_shape=[pool_h, 3], strides=[1, 1],
     )
     graph = helper.make_graph(
         [node], "pool_pool_h_at_limit",
-        inputs=[_vi("X", [1, 4, 12, 8])],
-        outputs=[_vi("Y", [1, 4, 6, 6])],
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, out_h, 6])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_pool_h_at_limit.onnx")
 
 
 def gen_dil_h_at_line_buf_limit() -> None:
-    """Boundary-case: pool_h=4 dil_h=5 → span=16 = kMaxLineBufRows; must parse OK."""
+    """Boundary-case: vertical span == kMaxLineBufRows; must parse OK.
+
+    pool_h=2 with dil_h = MAX_ROWS - 1 gives span = MAX_ROWS exactly.
+    """
+    dh    = POOL_MAX_LINE_BUF_ROWS - 1
+    span  = dh + 1                      # exactly MAX_ROWS
+    in_h  = span + 4                    # gives out_h = 5, mild non-degenerate
+    out_h = in_h - span + 1
     node = helper.make_node(
         "MaxPool", inputs=["X"], outputs=["Y"],
-        kernel_shape=[4, 3], strides=[1, 1], dilations=[5, 1],
+        kernel_shape=[2, 3], strides=[1, 1], dilations=[dh, 1],
     )
     graph = helper.make_graph(
         [node], "pool_dil_h_at_limit",
-        inputs=[_vi("X", [1, 4, 20, 8])],
-        outputs=[_vi("Y", [1, 4, 5, 6])],   # out_h = 20 - 16 + 1 = 5
+        inputs=[_vi("X", [1, 4, in_h, 8])],
+        outputs=[_vi("Y", [1, 4, out_h, 6])],
     )
     _save(helper.make_model(graph, opset_imports=_opset()),
           "pool_dil_h_at_limit.onnx")

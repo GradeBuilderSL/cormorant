@@ -124,6 +124,14 @@ _CASE_FIELDS: Dict[str, List[str]] = {
 def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCase":
     """Build a BenchCase from a named-param dict using _CASE_FIELDS ordering."""
     fields = _CASE_FIELDS[kernel]
+    if kernel == "VectorOPKernel":
+        op = int(d["op"])
+        if op < 0 or op >= len(_OP_NAMES):
+            valid = ", ".join(f"{i}={n}" for i, n in enumerate(_OP_NAMES))
+            raise ValueError(
+                f"VectorOPKernel case {d.get('label', '?')!r}: "
+                f"unsupported op={op} (valid: {valid})"
+            )
     args = [str(d[f]) for f in fields]
     warmup = int(d.get("warmup", default_warmup))
     return BenchCase(kernel=kernel, label=d["label"], args=args, warmup=warmup)
@@ -537,7 +545,11 @@ def main(argv=None) -> int:
             return 1
 
         # Select test cases
-        cases = _load_cases(cfg, cli_kernels)
+        try:
+            cases = _load_cases(cfg, cli_kernels)
+        except (KeyError, ValueError) as exc:
+            print(f"\n{_red('config error')}: {exc}", file=sys.stderr)
+            return 1
         kernels = {c.kernel for c in cases}
         print(f"\n{_bold('Running benchmarks')} "
               f"({len(cases)} cases across {len(kernels)} kernel(s))\n")
