@@ -52,7 +52,6 @@ counts highlighted in yellow). Examples observed on the bundled models:
 | `resnet18-v1-7.onnx` | 69 → 49 | 20 → 0 |
 | `mobilenet_v1_1.0_224.onnx` | 78 → 59 | 13 → 0 |
 | `mobilenetv2-12.onnx` | 105 → 100 | 0 (already folded by exporter) |
-| `bertsquad-12.onnx` | 1167 → 753 | 0 |
 | `lenet.onnx` | 18 → 9 | 0 |
 
 ---
@@ -72,18 +71,55 @@ python simplify_onnx.py resnet50-v1-12.onnx --batch 1
 # Single-input model with non-batch dynamic dims
 python simplify_onnx.py super-resolution-10.onnx \
     --input-shape input=1,1,224,224
-
-# Multi-input model — repeat --input-shape per input
-python simplify_onnx.py bertsquad-12.onnx \
-    --input-shape unique_ids_raw_output___9:0=1 \
-    --input-shape segment_ids:0=1,256 \
-    --input-shape input_mask:0=1,256 \
-    --input-shape input_ids:0=1,256
 ```
 
-`--input-shape` always wins over `--batch` for the named input, so you
-can mix the two: `--batch 1 --input-shape segment_ids:0=1,512` to keep
-batch=1 everywhere but use a non-default sequence length.
+### Multi-input models
+
+`--input-shape NAME=D1,D2,...` is **repeatable** — pass it once per input
+that needs explicit sizing. Order doesn't matter. Inputs not named on
+the command line fall back to `--batch` (if given) or stay as authored.
+
+```bash
+# Pin every input's shape explicitly
+python simplify_onnx.py multi_input_model.onnx \
+    --input-shape input_a=1,3,224,224 \
+    --input-shape input_b=1,16
+
+# Same model, fully equivalent — order is independent
+python simplify_onnx.py multi_input_model.onnx \
+    --input-shape input_b=1,16 \
+    --input-shape input_a=1,3,224,224
+```
+
+`--input-shape` always wins over `--batch` for the named input, so the
+two flags compose: `--batch` covers the "vanilla" dynamic-batch inputs
+and `--input-shape` overrides the awkward ones.
+
+```bash
+# batch=1 everywhere except aux_input, which needs a fixed 64-elem vector
+python simplify_onnx.py model.onnx \
+    --batch 1 \
+    --input-shape aux_input=1,64
+```
+
+To discover the input names and current shapes before writing the
+command line, dump them with a few lines of `onnx`:
+
+```bash
+python - <<'PY'
+import onnx
+m = onnx.load("model.onnx", load_external_data=False)
+for vi in m.graph.input:
+    dims = [d.dim_value if d.dim_value > 0 else (d.dim_param or '?')
+            for d in vi.type.tensor_type.shape.dim]
+    print(f"  {vi.name}: {dims}")
+PY
+```
+
+Dynamic dims appear as their `dim_param` string (typically `'N'`,
+`'batch_size'`, `'sequence'`, …) or `'?'` when no symbol was set.
+Anything non-numeric in that listing has to be pinned via `--batch` or
+`--input-shape` before the scheduler can consume the model.
 
 ---
 
