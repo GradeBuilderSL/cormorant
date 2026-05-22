@@ -46,6 +46,44 @@ Options:
   --embed-large-expected     Inline all GT arrays in test_inference.c
 ```
 
+## Preprocessing ONNX models — `simplify_onnx.py`
+
+Most pre-trained ONNX models ship with a dynamic batch dim (`'N'`) and
+trailing BatchNormalization layers that the scheduler can't consume
+directly.  `simplify_onnx.py` is the one-shot fix:
+
+```bash
+# Pin batch=1, run onnxsim, fuse BN→Conv, write <stem>-simplified.onnx
+python simplify_onnx.py model.onnx --batch 1
+
+# Multi-input or non-batch dynamic dims need explicit shape(s) (repeatable)
+python simplify_onnx.py bertsquad-12.onnx \
+    --input-shape input_ids:0=1,256 --input-shape input_mask:0=1,256 \
+    --input-shape segment_ids:0=1,256 --input-shape unique_ids_raw_output___9:0=1
+
+# Custom output + post-save onnxruntime smoke test (random input)
+python simplify_onnx.py model.onnx -o out.onnx --check
+
+# Keep BN nodes for inspection (skips fuse_bn_into_conv; onnxsim may still fold them)
+python simplify_onnx.py model.onnx --no-fuse-bn
+```
+
+Pipeline: `onnxsim.simplify(overwrite_input_shapes=…)` → optional
+`onnxoptimizer.fuse_bn_into_conv` → `onnx.checker.check_model` → save.
+Default output path is `<stem>-simplified.onnx` next to the input.  The
+script prints a node-count delta with per-op-type changes highlighted —
+e.g. resnet50-v1-12 collapses from 175 to 122 nodes with all 53 BNs
+absorbed into the preceding Convs.
+
+`--batch N` errors out on non-batch dynamic dims rather than guessing —
+use `--input-shape NAME=D1,D2,…` for those.  All `*-simplified.onnx` and
+`*_simplified.onnx` files in this directory were produced by (or can be
+regenerated with) this script.
+
+See `doc/MODEL_PREPARATION.md` for the full workflow, including handling
+of unsupported ops that survive simplification (e.g. tail `Softmax` /
+`Cast`, grouped Conv) and a worked example on `resnet50-v1-12.onnx`.
+
 ## Generated Project Layout
 
 ```
@@ -65,7 +103,8 @@ Options:
 ## Source Layout
 
 ```
-inference_scheduler.py   CLI entry point
+inference_scheduler.py   CLI entry point — ONNX → C project
+simplify_onnx.py         CLI entry point — ONNX → ONNX (onnxsim + BN-fusion)
 requirements.txt
 src/
   dtype.py               DataType abstraction (ap_fixed<W,I>, float32)

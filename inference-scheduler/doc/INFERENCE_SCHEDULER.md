@@ -22,7 +22,8 @@ per-layer execution loop — all without any Python or ONNX runtime on the targe
 10. [Running Tests](#10-running-tests)
 11. [Generated Report (`report.md`)](#11-generated-report-reportmd)
 
-**Related:** [Buffer Reuse — Live-Interval Optimisation](BUFFER_REUSE.md) ·
+**Related:** [Model Preparation — Pre-Scheduler ONNX Normalisation](MODEL_PREPARATION.md) ·
+[Buffer Reuse — Live-Interval Optimisation](BUFFER_REUSE.md) ·
 [Scheduler DAG — Algorithm Reference](SCHEDULER_DAG.md)
 
 ---
@@ -139,6 +140,9 @@ All pool variants support configurable stride, padding, and dilation.
 | `Gemm` | Decomposed at load time | `Gemm(A, B, C)` → `MatMul(A, B) → tmp` + `Add(tmp, C) → Y`; `Gemm(A, B)` → `MatMul(A, B) → Y`. Requires `alpha=1, beta=1, transA=0, transB=0`. |
 
 Any other ONNX op causes the scheduler to exit with a `SchedulerError`.
+See [MODEL_PREPARATION.md](MODEL_PREPARATION.md) for the standard pipeline
+(`simplify_onnx.py` + BN fusion + tail trimming) that converts stock ONNX
+Model Zoo / torchvision exports into a form the scheduler accepts.
 
 **Data types**: The ONNX model's weights and activations may be any numeric type
 (float32, int8, etc.); the scheduler quantizes all values to the target element
