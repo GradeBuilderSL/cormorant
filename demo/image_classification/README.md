@@ -1,23 +1,26 @@
 # Image classification KV260 demo
 
-End-to-end ImageNet classification demo for the KV260 FPGA platform using
-**MobileNetV1 1.0/224**.  Drop a few JPG/PNG files into `assets/images/`,
-run the orchestrator, and the demo will
+End-to-end ImageNet classification demo for the KV260 FPGA platform.  The
+default `image_classification_config.json` runs three pre-trained models —
+**MobileNetV1 1.0/224**, **MobileNetV2**, and **ResNet-18** — each with its
+own preprocessing recipe and label-offset convention.  Drop a few JPG/PNG
+files into `assets/images/`, run the orchestrator, and the demo will
 
-  1. download the ONNX model from a shared Google Drive folder,
+  1. download the ONNX models from a shared Google Drive folder,
   2. fetch the ImageNet 1001-class label list,
-  3. preprocess each image to NCHW `ap_fixed<16,8>` on the host,
-  4. generate a self-contained KV260 inference project with
+  3. preprocess each image to NCHW `ap_fixed<16,8>` on the host, once per
+     model's `normalize` recipe (TF / Keras / torchvision),
+  4. generate a self-contained KV260 inference project per model with
      `inference-scheduler`,
-  5. build the project on the board over SSH,
-  6. run `classify_images`, which prints the top-5 predictions per image
-     and reports per-image latency.
+  5. build each project on the board over SSH,
+  6. run `classify_images` per model, which prints the top-5 predictions
+     per image and reports per-image latency.
 
 ```mermaid
 flowchart LR
-    A["download_assets.py<br/>ONNX + labels<br/>+ preprocess images"]
-      --> B["generate_project.py<br/>schedule MobileNetV1<br/>+ bench_glue.h"]
-      --> C["deploy_and_run.py<br/>SSH upload, build,<br/>run classify_images"]
+    A["download_assets.py<br/>ONNX + labels<br/>+ preprocess per model"]
+      --> B["generate_project.py<br/>schedule each model<br/>+ bench_glue.h"]
+      --> C["deploy_and_run.py<br/>per-model SSH upload,<br/>build, run classify_images"]
 ```
 
 ## Layout
@@ -104,22 +107,170 @@ Or step-by-step (lets you iterate without re-downloading):
 .venv/bin/python scripts/deploy_and_run.py --verbose
 ```
 
-Sample output:
+Sample output (host `~/projects/axi_demo/demo/image_classification`, board
+at `192.168.100.8`, one image: `greyfox-672194.JPEG`):
 
 ```
-  ── IMAGE CLASSIFICATION KV260 ──
+$ ./run_demo.py
 
-  image: greyfox-672194.JPEG  latency=2463.174 ms
-    1) [ 281] grey_fox                          prob= 69.06%  logit=  3034
-    2) [ 278] red_fox                           prob=  4.96%  logit=  2360
-    3) [ 264] Pembroke                          prob=  2.83%  logit=  2216
-    4) [ 272] red_wolf                          prob=  2.32%  logit=  2165
-    5) [ 279] kit_fox                           prob=  2.15%  logit=  2146
+=== download_assets ===
+ONNX models → demo/image_classification/assets/models
+  ✓ mobilenet_v1_1.0_224_no_softmax.onnx  (16,908,384 B)
+  ✓ mobilenetv2-12_simplified.onnx        (13,965,766 B)
+  ✓ resnet18-simplified-fused.onnx        (46,749,495 B)
+  cached imagenet_1001_labels.txt (1001 lines)
+  cached assets/preprocessed/mobilenet_v1/images.bin  (1 images, mobilenet_v1, tf)
+  cached assets/preprocessed/mobilenet_v2/images.bin  (1 images, mobilenet_v2, imagenet)
+  cached assets/preprocessed/resnet18/images.bin      (1 images, resnet18,     imagenet)
+done
+
+=== generate_project ===
+[mobilenet_v1] scheduling mobilenet_v1_1.0_224_no_softmax.onnx
+Model      : assets/models/mobilenet_v1_1.0_224_no_softmax.onnx
+Inputs     : ['input:0[1, 3, 224, 224]']
+Outputs    : ['MobilenetV1/Logits/SpatialSqueeze:0[1, 1001]']
+Nodes      : 58
+  [  0] Conv         [1, 3, 224, 224] x [32, 3, 3, 3] x [32] -> [1, 32, 112, 112]
+  [  1] Clip         [1, 32, 112, 112] -> [1, 32, 112, 112]
+  [  2] Conv         [1, 32, 112, 112] x [32, 1, 3, 3] x [32] -> [1, 32, 112, 112]
+  …  (depthwise-separable Conv / Clip blocks repeating to 14×14, 7×7) …
+  [ 54] AveragePool  [1, 1024, 7, 7]   -> [1, 1024, 1, 1]
+  [ 55] Conv         [1, 1024, 1, 1]   x [1001, 1024, 1, 1] x [1001] -> [1, 1001, 1, 1]
+  [ 56] Reshape      [1, 1001, 1, 1]   -> [1, 1, 1, 1001]
+  [ 57] Squeeze      [1, 1, 1, 1001]   -> [1, 1001]
+Weights    : 20 large weight(s) written to build/projects/mobilenet_v1/weights/
+[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel
+
+[mobilenet_v2] scheduling mobilenetv2-12_simplified.onnx
+Inputs     : ['input[1, 3, 224, 224]']
+Outputs    : ['output[1, 1000]']
+Nodes      : 101
+  [  0] Conv         [1, 3, 224, 224] x [32, 3, 3, 3] x [32] -> [1, 32, 112, 112]
+  …  (inverted-residual blocks; expansion + depthwise + projection + Add) …
+  [ 97] GlobalAveragePool [1, 1280, 7, 7] -> [1, 1280, 1, 1]
+  [ 98] Reshape      [1, 1280, 1, 1]   -> [1, 1280]
+  [ 99] MatMul       [1, 1280] x [1280, 1000] -> [1, 1000]
+  [100] Add          [1, 1000] x [1000] -> [1, 1000]
+Weights    : 35 large weight(s) written to build/projects/mobilenet_v2/weights/
+[mobilenet_v2] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
+
+[resnet18] scheduling resnet18-simplified-fused.onnx
+Inputs     : ['data[1, 3, 224, 224]']
+Outputs    : ['resnetv15_dense0_fwd[1, 1000]']
+Nodes      : 50
+  [  0] Conv         [1, 3, 224, 224] x [64, 3, 7, 7] x [64] -> [1, 64, 112, 112]
+  [  1] Relu
+  [  2] MaxPool      [1, 64, 112, 112] -> [1, 64, 56, 56]
+  …  (basic-block residuals; Conv→Conv→Add→Relu, two per stage, four stages) …
+  [ 46] GlobalAveragePool [1, 512, 7, 7] -> [1, 512, 1, 1]
+  [ 47] Flatten      [1, 512, 1, 1]   -> [1, 512]
+  [ 48] MatMul       [1, 512] x [512, 1000] -> [1, 1000]
+  [ 49] Add          [1, 1000] x [1000] -> [1, 1000]
+Weights    : 21 large weight(s) written to build/projects/resnet18/weights/
+[resnet18] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
+wrote 3 project(s) under demo/image_classification/build/projects
+
+=== deploy_and_run ===
+
+Preflight (local)
+    OK   assets/labels/imagenet_1001_labels.txt       10,484 B
+    OK   assets/preprocessed/mobilenet_v1/images.bin  301,056 B
+    OK   assets/preprocessed/mobilenet_v2/images.bin  301,056 B
+    OK   assets/preprocessed/resnet18/images.bin      301,056 B
+    OK   project 'mobilenet_v1' on disk   (3 kernels: VectorOP, Conv, Pool)
+    OK   project 'mobilenet_v2' on disk   (4 kernels: VectorOP, Matmul, Conv, Pool)
+    OK   project 'resnet18'     on disk   (4 kernels: VectorOP, Matmul, Conv, Pool)
+
+Connecting to root@192.168.100.8:22 …
+  connected
+
+Preflight (remote)
+    OK   cmake                              cmake version 3.22.1
+    OK   gcc                                gcc 11.4.0
+    OK   xrt headers                        xrt via pkg-config
+    OK   uio (VectorOPKernel: fabric)       /dev/uio4
+    OK   uio (MatmulKernel:   fabric_matmul) /dev/uio5
+    OK   uio (ConvKernel:     fabric_conv)   /dev/uio6
+    OK   uio (PoolKernel:     fabric_pool)   /dev/uio7
+
+Uploading assets → /tmp/image_classification_demo/assets
+  assets   → OK       0.2s
+
+mobilenet_v1
+  upload   → OK       2.2s
+  cmake    → OK       1.0s
+  make     → OK       5.2s
+    classify_images: model=mobilenet_v1 images=1 classes=1001 warmup=1 top_k=5
+    image: greyfox-672194.JPEG  latency=2463.143 ms
+      1) [ 281] grey_fox                          prob= 69.06%  logit=  3034
+      2) [ 278] red_fox                           prob=  4.96%  logit=  2360
+      3) [ 264] Pembroke                          prob=  2.83%  logit=  2216
+      4) [ 272] red_wolf                          prob=  2.32%  logit=  2165
+      5) [ 279] kit_fox                           prob=  2.15%  logit=  2146
+  run      → OK       5.3s
+    mean = 2463.144 ms   throughput = 0.4 img/s
+
+mobilenet_v2
+  upload   → OK       2.1s
+  cmake    → OK       0.9s
+  make     → OK       6.3s
+    classify_images: model=mobilenet_v2 images=1 classes=1000 warmup=1 top_k=5
+    image: greyfox-672194.JPEG  latency=1876.401 ms
+      1) [ 280] grey_fox                          prob= 56.47%  logit=  3550
+      2) [ 277] red_fox                           prob= 22.73%  logit=  3317
+      3) [ 278] kit_fox                           prob= 16.82%  logit=  3240
+      4) [ 272] coyote                            prob=  1.23%  logit=  2571
+      5) [ 274] dhole                             prob=  0.71%  logit=  2431
+  run      → OK       4.0s
+    mean = 1876.401 ms   throughput = 0.5 img/s
+
+resnet18
+  upload   → OK       5.7s
+  cmake    → OK       0.9s
+  make     → OK       4.0s
+    classify_images: model=resnet18 images=1 classes=1000 warmup=1 top_k=5
+    image: greyfox-672194.JPEG  latency=2459.372 ms
+      1) [ 368] gibbon                            prob= 29.62%  logit=  2328
+      2) [ 381] spider_monkey                     prob=  7.97%  logit=  1992
+      3) [  77] wolf_spider                       prob=  3.54%  logit=  1784
+      4) [ 616] knot                              prob=  3.05%  logit=  1746
+      5) [ 374] langur                            prob=  2.94%  logit=  1737
+  run      → OK       5.2s
+    mean = 2459.372 ms   throughput = 0.4 img/s
+
+  ── IMAGE CLASSIFICATION KV260 ──
 
   Model         Status   Images   mean(ms)    p50(ms)    p99(ms)        IPS
   ─────────────────────────────────────────────────────────────────────────
-  mobilenet_v1  OK           1   2463.174   2463.174   2463.174        0.4
+  mobilenet_v1  OK           1   2463.144   2463.144   2463.144        0.4
+  mobilenet_v2  OK           1   1876.401   1876.401   1876.401        0.5
+  resnet18      OK           1   2459.372   2459.372   2459.372        0.4
 ```
+
+Notable behaviour visible in the run:
+
+- **Per-model preprocessing.**  `download_assets.py` writes one
+  `images.bin` per model under `assets/preprocessed/<model>/`, each
+  encoded with the model's own `normalize` recipe: `tf` for
+  MobileNetV1 (`(p/127.5)-1`), `imagenet` for MobileNetV2 and ResNet-18
+  (`p/255` then per-channel `(x-μ)/σ`).  `deploy_and_run.py` swaps the
+  right bin onto the board before each model runs.
+- **Active-kernel set differs per model.**  `mobilenet_v1` uses only
+  three kernels (VectorOP / Conv / Pool) because its `_no_softmax`
+  variant ends in a 1×1 `Conv` classifier; `mobilenet_v2` and
+  `resnet18` use all four because they end in a `MatMul` (Gemm) +
+  `Add` classifier head.  `generate_project.py` emits a per-model
+  `bench_glue.h` so `inference_init()` gets the right number of UIO
+  arguments.
+- **All three models externalise weights to `weights/*.dat`.**  The
+  large FC / final-Conv weight tensors exceed the inline-array
+  threshold and are loaded at runtime via `fread()`.
+- **`resnet18` mispredicts.**  The bundled `resnet18-simplified-fused.onnx`
+  was produced by a fusion pipeline whose BN-folding doesn't reproduce
+  cleanly under the current `ap_fixed<16,8>` quantisation, so the
+  top-K is garbage.  This is a known caveat — see
+  [`MODEL_PREPARATION.md`](../../inference-scheduler/doc/MODEL_PREPARATION.md)
+  for the ResNet-18 BN-fusion notes.
 
 The full per-image top-K table is also written to `build/results.json`.
 
