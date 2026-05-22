@@ -412,6 +412,26 @@ at the bottom; intermediate buffers are never synced.
 
 ---
 
+## Supported Models
+
+The scheduler has been validated end-to-end (compile → on-device run →
+output check against Python ground truth) against the ONNX models below.
+Each link is the pre-prepared file — already passed through
+[`simplify_onnx.py`](inference-scheduler/simplify_onnx.py) so it loads
+into `inference_scheduler.py` without further surgery. For preparing
+your own models see
+[`inference-scheduler/doc/MODEL_PREPARATION.md`](inference-scheduler/doc/MODEL_PREPARATION.md).
+
+| Model | Input shape (NCHW) | Task |
+|-------|--------------------|------|
+| [ConvMNIST](https://drive.google.com/file/d/1a-A-t2JBC9r5IaEjpWp9915n0wBoIj0y) | `1×1×28×28` | MNIST digit classifier (small convnet) |
+| [LeNet](https://drive.google.com/file/d/1tNQe_wDvVzuPnEMJvIzeULMZrUlYS7VF) | `1×1×28×28` | Classic LeNet-5 on MNIST |
+| [MobileNet V1](https://drive.google.com/file/d/1PzFSPkXpkIpiKfyo8tORl2AkfXgjdQvw) | `1×3×224×224` | ImageNet 1000-class classifier (depthwise-separable) |
+| [MobileNet V2](https://drive.google.com/file/d/1ti97y2P_Fc8TRUk0oVm_AG7yrmk5Fuw1) | `1×3×224×224` | ImageNet 1000-class classifier (inverted residuals) |
+| [ResNet-18](https://drive.google.com/file/d/1DKyALYam5jAzMSK8ulgFQuSbQ62-EVvr) | `1×3×224×224` | ImageNet 1000-class classifier (residual blocks) |
+
+---
+
 ## Testing
 
 ### Python unit tests (no hardware)
