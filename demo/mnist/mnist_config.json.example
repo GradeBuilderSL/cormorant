@@ -65,6 +65,10 @@
       "name": "mnist_convnet",
       "drive_filename": "mnist-simplified.onnx",
       "_drive_filename_note": "File name inside the Google Drive folder. Downloaded by scripts/download_assets.py."
+    },
+    {
+      "name": "mnist_lenet",
+      "drive_filename": "lenet_simplified.onnx"
     }
   ],
 
