@@ -101,7 +101,7 @@ them as zero-cost CPU-side transformations:
 
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
-[Architecture: Broadcasting Algorithm](ARCHITECTURE.md#broadcasting-algorithm).
+[Architecture: Broadcasting Algorithm](ARCHITECTURE.md#6-broadcasting-algorithm).
 
 ### MatmulKernel (matrix multiply, tiled)
 
