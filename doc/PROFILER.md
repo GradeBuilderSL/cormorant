@@ -16,8 +16,8 @@ independently into any host application that uses the generated
 `inference` library — they are not specific to the MNIST demo.
 
 > Companion docs:
-> [`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md) (codegen),
-> [`REMOTE_TESTING.md`](REMOTE_TESTING.md) (correctness/perf harnesses).
+> [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md) (codegen),
+> [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md) (correctness/perf harnesses).
 
 ---
 
