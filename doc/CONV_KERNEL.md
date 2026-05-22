@@ -66,7 +66,7 @@
 | `kMaxKH` | 7 | Maximum compile-time kernel height |
 | `kMaxKW` | 7 | Maximum compile-time kernel width |
 | `kMaxInCh` | 1024 | Sizes `bias_buf` (line_buf is IC-tiled, doesn't depend on this) |
-| `kMaxOutCh` | 1024 | Sizes `bias_buf` in `bias_producer` |
+| `kMaxOutCh` | 1280 | Sizes `bias_buf` in `bias_producer` |
 | `kMaxLineBufCols` | 64 | Column capacity of `line_buf`; power of 2 (used as bitmask). Caps `ow_per_tile`, NOT `in_w` — wider inputs split into multiple `ow_tile`s |
 | `kMaxLineBufRows` | 16 | Row capacity of `line_buf`; power of 2 (used as bitmask) |
 | `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one output row (`out_w·out_ch`) must fit. Buffer is bound to **URAM** — each 4096 entries spends one URAM block, so this trades URAM, not BRAM |

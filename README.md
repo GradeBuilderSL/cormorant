@@ -57,7 +57,7 @@ ctest                 # run all four
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Generate all test models and run the Python test suite (1006 tests)
+# Generate all test models and run the Python test suite (1301 tests)
 .venv/bin/python test/gen_all_models.py
 .venv/bin/python -m pytest test/ -q
 
@@ -337,7 +337,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Generate all test ONNX models with a single command
 .venv/bin/python test/gen_all_models.py
 
-# Run the full Python test suite (1006 tests, no hardware needed)
+# Run the full Python test suite (1301 tests, no hardware needed)
 .venv/bin/python -m pytest test/ -q
 
 # Generate a C project from an ONNX model
@@ -438,7 +438,7 @@ Five layers of testing, each independent — full details in
 
 | Layer | Needs | One-liner |
 |-------|-------|-----------|
-| Python unit tests | nothing | `.venv/bin/python -m pytest test/ -q` (1006 tests) |
+| Python unit tests | nothing | `.venv/bin/python -m pytest test/ -q` (1301 tests) |
 | HLS C-sim | gcc, CMake | `make TestSimulation TestConvRef TestMatmulRef TestPoolingSim && ctest` |
 | Vivado behavioural sim | Vitis, Vivado | `make sim_hw_kv260` (needs `synthesize_kv260` first) |
 | On-device correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

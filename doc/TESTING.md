@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation (1006 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation (1301 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **Vivado behavioural sim** | Vitis, Vivado | Block-design behavioural sim against the SystemVerilog testbench (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -29,7 +29,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1006 tests
+# Run all 1301 tests
 .venv/bin/python -m pytest test/ -q
 
 # Run a specific module
@@ -185,8 +185,8 @@ the correctness configs with an additional `benchmarks` section.
 }
 ```
 
-The default `perf_config.json` ships with **53 benchmark cases**
-across the four kernels (20 VectorOPKernel, 12 MatmulKernel,
+The default `perf_config.json` ships with **48 benchmark cases**
+across the four kernels (15 VectorOPKernel, 12 MatmulKernel,
 10 ConvKernel, 11 PoolingKernel).
 
 VectorOPKernel `op` values outside the supported range (0..5) are

@@ -130,7 +130,7 @@ test/
   gen_test_models.py     Build all test ONNX models
   helpers.py             _model(), _models_exist() shared by test modules
   models/                Pre-generated ONNX models (single_add.onnx, etc.)
-  test_*.py              pytest test modules (1086 tests total)
+  test_*.py              pytest test modules (1301 tests total)
                          — includes test_dag.py (DAG correctness),
                            test_parallel_waits.py (split start/wait emission),
                            test_nop_corner_cases.py (NOP-layer corner cases),

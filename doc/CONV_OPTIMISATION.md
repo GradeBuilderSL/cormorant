@@ -1024,38 +1024,65 @@ throughput one — so the inner-loop balance above is unchanged from
 
 ## 4. Knobs
 
-### 4.1. Source of truth — CMake cache vars (migration to JSON pending)
+### 4.1. Source of truth — platform JSON `kernels.conv`
 
-Unlike `kernels/pool`, conv's compile-time bounds currently live as CMake
-`CACHE STRING`s in `kernels/conv/CMakeLists.txt` rather than in
-`platforms/<name>.json`.  Moving them under `kernels.conv` in the
-platform JSON to match pool is **TODO** — see the issue/PR for the
-migration.
+Conv's compile-time bounds live under `kernels.conv` in
+`platforms/<name>.json` — the same single-source-of-truth model
+`kernels/pool` uses.  There are no CMake `CACHE STRING` defaults; the
+JSON is authoritative and a missing field is a hard configure error.
+See [`PLATFORM_CONFIGURATION.md`](PLATFORM_CONFIGURATION.md) for the
+schema and the add-a-new-platform workflow.
 
-| CMake var | C++ name (Config.h) | Default | Hard constraint | Notes |
-|---|---|---:|---|---|
-| `CONV_TILE_M` | `kTileM` | 8 | power of 2; ≥ MAC latency (~3 cyc) | Output channel tile; II=1 lane rotation depth. |
-| `CONV_TILE_IC` | `kTileIC` | 16 | power of 2 | Input channel tile; sets `w_buf` and patch-buffer IC depth. |
-| `CONV_MAX_KH` | `kMaxKH` | 7 | `kh ≤ this` | Compile-time kernel-height bound. |
-| `CONV_MAX_KW` | `kMaxKW` | 7 | `kw ≤ this` | Compile-time kernel-width bound. |
-| `CONV_MAX_IN_CH` | `kMaxInCh` | 1024 | `in_ch ≤ this` | Sizes `bias_buf` only — line_buf is IC-tiled. |
-| `CONV_MAX_OUT_CH` | `kMaxOutCh` | 1024 | `out_ch ≤ this` | Sizes `bias_buf` in `bias_producer`. |
-| `CONV_MAX_LINE_BUF_COLS` | `kMaxLineBufCols` | 64 | power of 2; `(kw-1)*dil_w + 1 ≤ this` *(was `in_w ≤ this` pre-§2.11)* | Column capacity of `line_buf`; bitmask for col-slot wrapping.  Wider inputs auto-split along `ow` — see §2.11 / `compute_ow_tiling()`. |
-| `CONV_MAX_LINE_BUF_ROWS` | `kMaxLineBufRows` | 16 | power of 2; `(kh-1)*dil_h + 1 ≤ this` | Circular row capacity. |
-| `CONV_MAX_ACC_PERSIST_ENTRIES` | `kMaxAccPersistEntries` | 65536 *(was 16384 pre-§2.13)* | `out_w*out_ch ≤ this`  *(was `out_h*out_w*out_ch ≤ this` pre-§2.9)* | Persistent accumulator (Option-A) size; sized to hold one output chunk.  Larger outputs auto-split along `oh` — see §2.9 / `compute_oh_chunking()`.  Bound to **URAM** since §2.13 — each 4096 entries spends one URAM block, so raising this trades URAM (64 on the XCK26), not BRAM. |
-| `CONV_MAX_M_PER_GROUP` | `kMaxMperGroup` | 4 | none (runtime clamped to `m_tiles`) | Max mt-tiles cached together in the standard path's `(ict, M-group)` weight slab.  Sizes `w_cache` in `process_conv_kernel_tile`.  Larger values eliminate weight DDR replay for more layers in one group; smaller saves BRAM/LUT.  See §2.10 / `compute_m_grouping()`. |
+| JSON field | C++ name (Config.h) | Python name | kv260 | Hard constraint | Notes |
+|---|---|---|---:|---|---|
+| `tile_m` | `kTileM` | (not validated) | 8 | power of 2; ≥ MAC latency (~3 cyc) | Output channel tile; II=1 lane rotation depth. |
+| `tile_ic` | `kTileIC` | (not validated) | 16 | power of 2 | Input channel tile; sets `w_buf` and patch-buffer IC depth. |
+| `max_kh` | `kMaxKH` | (not validated; kh checked vs weight rank) | 7 | `kh ≤ this` | Compile-time kernel-height bound. |
+| `max_kw` | `kMaxKW` | (not validated; kw checked vs weight rank) | 7 | `kw ≤ this` | Compile-time kernel-width bound. |
+| `max_in_ch` | `kMaxInCh` | `CONV_MAX_IN_CH` | 1024 | `in_ch ≤ this` | Sizes `bias_buf` only — line_buf is IC-tiled. |
+| `max_out_ch` | `kMaxOutCh` | `CONV_MAX_OUT_CH` | 1280 | `out_ch ≤ this` | Sizes `bias_buf` in `bias_producer`. |
+| `max_line_buf_cols` | `kMaxLineBufCols` | `CONV_MAX_LINE_BUF_COLS` | 64 | power of 2; `(kw-1)*dil_w + 1 ≤ this` *(was `in_w ≤ this` pre-§2.11)* | Column capacity of `line_buf`; bitmask for col-slot wrapping.  Wider inputs auto-split along `ow` — see §2.11 / `compute_ow_tiling()`. |
+| `max_line_buf_rows` | `kMaxLineBufRows` | `CONV_MAX_LINE_BUF_ROWS` | 16 | power of 2; `(kh-1)*dil_h + 1 ≤ this` | Circular row capacity. |
+| `max_acc_persist_entries` | `kMaxAccPersistEntries` | `CONV_MAX_ACC_PERSIST_ENTRIES` | 65536 *(was 16384 pre-§2.13)* | `out_w*out_ch ≤ this`  *(was `out_h*out_w*out_ch ≤ this` pre-§2.9)* | Persistent accumulator (Option-A) size; sized to hold one output chunk.  Larger outputs auto-split along `oh` — see §2.9 / `compute_oh_chunking()`.  Bound to **URAM** since §2.13 — each 4096 entries spends one URAM block, so raising this trades URAM (64 on the XCK26), not BRAM. |
+| `max_m_per_group` | `kMaxMperGroup` | (not validated) | 4 | none (runtime clamped to `m_tiles`) | Max mt-tiles cached together in the standard path's `(ict, M-group)` weight slab.  Sizes `w_cache` in `process_conv_kernel_tile`.  Larger values eliminate weight DDR replay for more layers in one group; smaller saves BRAM/LUT.  See §2.10 / `compute_m_grouping()`. |
 
-### 4.2. How CMake reads the values
+`tile_m`, `tile_ic`, `max_kh`, `max_kw`, `max_m_per_group` are read by
+the C++ build but **not** exported to the Python validator: `kTileM`/
+`kTileIC` are pure unrolling factors (any out_ch/in_ch is
+residual-padded), the kernel-size bounds are already validated against
+weight tensor rank earlier in `ConvNode`, and `kMaxMperGroup` is
+runtime-clamped to the actual `m_tiles`.  The five fields with Python
+names above gate model acceptance: `ConvNode.from_onnx_node` raises
+`SchedulerError` naming the violated bound.
 
-TODO — fill in once the JSON migration lands (mirror §4.2 of
-POOL_OPTIMIZATION.md: `conv_load_constants(...)`,
-`CMAKE_CONFIGURE_DEPENDS`, etc.).
+### 4.2. How CMake reads the JSON
 
-### 4.3. How the Python scheduler reads the values
+`kernels/conv/CMakeLists.txt::conv_load_constants(platform_json prefix)`
+calls `string(JSON … GET … kernels conv <field>)` for each required
+key, sets `${prefix}_<UPPER_FIELD>` in the parent scope, and errors
+out (`FATAL_ERROR`) on any missing field.  The default-platform
+constants drive `Config.h` for the C-sim build; the per-platform
+synthesis loop calls the function again per platform JSON so each
+synthesised IP gets its own bounds.
 
-TODO — `inference-scheduler/src/_conv_hw_config.py` does not exist yet;
-the conv validator currently reads from `<source>` (verify).  Migration
-mirrors `_pool_hw_config.py::resolve(platform_name)`.
+`CMAKE_CONFIGURE_DEPENDS` is set on every platform JSON so subsequent
+`make` invocations auto-rerun configure when the JSON changes.
+
+### 4.3. How the Python scheduler reads the JSON
+
+`inference-scheduler/src/_conv_hw_config.py::resolve(platform_name)`
+reads the same `kernels.conv` block.  `platform_name=None` falls back
+to the `AXI_PLATFORM` env var, then to the built-in default `kv260`,
+mirroring the CMake cache variable of the same name so CLI invocations
+targeting a non-default board stay in sync with `cmake -DAXI_PLATFORM=<name>`.
+Missing file / missing field / wrong field type each raise
+`ConvHwConfigError` — no silent fallback to defaults.
+
+Bumping any `max_*` bound requires re-running
+`inference-scheduler/test/gen_conv_models.py` (with
+`AXI_PLATFORM=<name>` set if non-default) so the hardware-bound
+"must raise" / "at limit" boundary fixtures re-derive their
+geometries from the new JSON.
 
 ### 4.4. Test predictor and cache-extreme verification
 

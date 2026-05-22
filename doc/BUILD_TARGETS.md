@@ -16,7 +16,7 @@ Key configure-time cache variables:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `AXI_BUS_WIDTH` | 64 | m_axi master data width (32/64/128/256/512) |
+| `AXI_BUS_WIDTH` | 32 | m_axi master data width (32/64/128/256/512) |
 | `AXI_PLATFORM` | `kv260` | Platform whose `platforms/<name>.json` bounds drive the C-sim `Config.h` |
 | `<K>_DATA_TYPE` etc. | per kernel | Element / accumulator types and tile sizes (see each kernel's `CMakeLists.txt`) |
 
