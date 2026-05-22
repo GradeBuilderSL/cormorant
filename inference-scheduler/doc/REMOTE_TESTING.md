@@ -679,15 +679,10 @@ After all cases run, the script prints a per-kernel table:
   MUL-bcast-8x16K          MUL    size=16384   outer=8        1.3814     0.569
   RELU-bcast-8x16K         RELU   size=16384   outer=8        1.3483     0.389
   MUL-bcast-dw-12544x16    MUL    size=16      outer=12544     6.0383     0.199
-  SOFTMAX-1K-1row          6      size=1024    outer=1        0.0181     0.226
-  SOFTMAX-4K-1row          6      size=4096    outer=1        0.0494     0.332
-  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
-  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
-  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
   ───────────────────────────────────────────────────────────────────────────────────
                                                  peak GB/s                0.593
                                                min latency     0.0181
-  20/20 OK
+  15/15 OK
 
   MatmulKernel
   ─────────────────────────────────────────────────────────────────────────────
@@ -749,7 +744,7 @@ After all cases run, the script prints a per-kernel table:
                                                 min latency     0.1039
   11/11 OK
 
-  ── OVERALL: All 53 cases passed ──
+  ── OVERALL: All 48 cases passed ──
 ```
 
 | Column | Meaning |

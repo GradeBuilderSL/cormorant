@@ -275,12 +275,15 @@ Generated project:
 │         libxrt_core.so, and /dev/dri/renderD* are accessible before a build.
 │
 ├── driver/
-│   │   Hardware kernel driver sources.  One sub-directory per active kernel
-│   │   (copied from --driver-dir, or stub README when omitted).
-│   ├── vectorop/        XVectoropkernel driver (xvectoropkernel.h / .c)
-│   ├── matmul/          XMatmulkernel driver   (xmatmulkernel.h / .c)
-│   ├── conv/            XConvkernel driver     (xconvkernel.h / .c)
-│   └── pool/            XPoolkernel driver     (xpoolkernel.h / .c)
+│   │   Hardware kernel driver sources for every active kernel, copied
+│   │   verbatim (flat layout, no per-kernel sub-directories) from the
+│   │   --driver-dir argument.  When --driver-dir is omitted the
+│   │   directory contains a stub README listing the files that would
+│   │   be needed for the kernels this model uses.
+│   ├── xvectoropkernel.h / .c / _hw.h / _sinit.c / _linux.c
+│   ├── xmatmulkernel.h   / .c / _hw.h / _sinit.c / _linux.c
+│   ├── xconvkernel.h     / .c / _hw.h / _sinit.c / _linux.c
+│   └── xpoolingkernel.h  / .c / _hw.h / _sinit.c / _linux.c
 │
 ├── weights/                      (only when model has large weight tensors)
 │   └── <name>.dat                Raw little-endian binary weight data; loaded

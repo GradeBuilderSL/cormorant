@@ -49,10 +49,18 @@ counts highlighted in yellow). Examples observed on the bundled models:
 | Source | Nodes (before → after) | BN folded |
 |---|---|---|
 | `resnet50-v1-12.onnx` | 175 → 122 | 53 → 0 |
-| `resnet18-v1-7.onnx` | 69 → 49 | 20 → 0 |
 | `mobilenet_v1_1.0_224.onnx` | 78 → 59 | 13 → 0 |
 | `mobilenetv2-12.onnx` | 105 → 100 | 0 (already folded by exporter) |
 | `lenet.onnx` | 18 → 9 | 0 |
+
+Verified by running `simplify_onnx.py <model>.onnx --batch 1` against
+each source.  ResNet-18 (`resnet18-v1-7.onnx` / `resnet18-v2-7.onnx`)
+is a notable exception: the script leaves it at 69 → 69 with all
+BatchNormalization nodes intact, because the BN scale/bias don't
+collapse cleanly into the preceding Convs in this export.  A working
+49-node ResNet-18 (`resnet18-simplified-fused.onnx`) exists in the
+repo but was produced by a different fusion pipeline; reproducing it
+via `simplify_onnx.py` alone is **not currently supported**.
 
 ---
 

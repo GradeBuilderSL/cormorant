@@ -43,9 +43,9 @@ fixtures; §8–§10 cover edge cases, invariants, and future work.
 ## 1. Why a DAG?
 
 The current scheduler models **one lane per kernel type** —
-VectorOPKernel, MatmulKernel, ConvKernel, PoolingKernel — and assumes
-exactly one driver instance per lane (`KERNEL_REGISTRY` in
-`src/kernels.py`). This is a framework limitation, not a hardware
+VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel (the
+`KERNEL_REGISTRY` key in `src/kernels.py`; the C++ kernel class is
+PoolingKernel) — and assumes exactly one driver instance per lane. This is a framework limitation, not a hardware
 constraint: a bitstream could in principle provide several Conv IPs at
 distinct AXI-Lite base addresses, and reflecting that would require a
 per-instance `pending` map and a node→instance assignment policy (see
