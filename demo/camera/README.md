@@ -2,7 +2,7 @@
 
 Real-time ImageNet classification from a live **Intel RealSense** camera on
 the KV260 FPGA platform, using **MobileNetV1 1.0/224** running on this
-repo's own HLS kernels (Conv / Pool / VectorOP) — no Vitis-AI / DPU.
+repo's own HLS kernels (Conv / Pool / MatMul / VectorOP) — no Vitis-AI / DPU.
 
 Connect a RealSense camera to the board, run the orchestrator, and the demo
 will

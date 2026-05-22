@@ -1,11 +1,13 @@
 # MNIST KV260 demo
 
 End-to-end MNIST inference demo for the KV260 FPGA platform.  Downloads the
-MNIST test split and two pre-trained ONNX models (an MNIST convnet and a
-LeNet variant) from a shared Google Drive folder, generates a self-contained
-KV260 inference project for each model with `inference-scheduler`, copies
-in the HLS driver sources, builds the project on the board over SSH, and
-runs a benchmark that reports top-1 accuracy and per-image latency.
+MNIST test split and the pre-trained ONNX models from a shared Google Drive
+folder (the folder hosts both an MNIST convnet and a LeNet variant; the
+default `mnist_config.json` runs the convnet, and additional `models[]`
+entries can opt the LeNet in), generates a self-contained KV260 inference
+project for each model with `inference-scheduler`, copies in the HLS driver
+sources, builds the project on the board over SSH, and runs a benchmark
+that reports top-1 accuracy and per-image latency.
 
 ```mermaid
 flowchart LR

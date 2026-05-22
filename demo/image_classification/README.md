@@ -53,7 +53,7 @@ demo/image_classification/
 
 ### Host
 
-* Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx).
+* Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx, onnxsim).
 * HLS-generated driver sources for the four kernels:
 
   ```bash
