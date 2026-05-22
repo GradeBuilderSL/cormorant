@@ -4,8 +4,7 @@ Real-time ImageNet classification from a live **Intel RealSense** camera on
 the KV260 FPGA platform, using **MobileNetV1 1.0/224** running on this
 repo's own HLS kernels (Conv / Pool / VectorOP) — no Vitis-AI / DPU.
 The shipped `mobilenet_v1_1.0_224_no_softmax` variant ends in a 1×1 Conv
-classifier, so MatmulKernel is not on the active path; the missing-driver
-warning during project generation is harmless for this model.
+classifier, so MatmulKernel is not on the active path.
 
 Connect a RealSense camera to the board, run the orchestrator, and the demo
 will
@@ -182,8 +181,6 @@ ONNX models → demo/camera/assets/models
 done
 
 === generate_project ===
-warning: driver_dirs.MatmulKernel: ../../build/kernels/matmul/kv260/.../src
-         not found (run `make synthesize_kv260` from the repo root)
 [mobilenet_v1] scheduling mobilenet_v1_1.0_224_no_softmax.onnx
 Model      : demo/camera/assets/models/mobilenet_v1_1.0_224_no_softmax.onnx
 Inputs     : ['input:0[1, 3, 224, 224]']
@@ -257,12 +254,6 @@ Notable behaviour visible in the run:
 - **Only three kernels are active.**  The `no_softmax` MobileNetV1 ends
   in a 1×1 `Conv` (node 55) rather than a fully-connected `MatMul`, so
   `[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel`.
-  The `warning: driver_dirs.MatmulKernel … not found` during generation
-  is harmless for this model — the generator only complains because the
-  config still lists a MatmulKernel driver path so other models could
-  drop in.  If you build only the kernels this demo needs (`make
-  synthesize_vectorop_kv260 synthesize_conv_kv260 synthesize_pool_kv260`)
-  the warning still appears but generation succeeds.
 - **Power source picked automatically.**  `xlnx_platformstats` (the SOM
   INA260 sensor, 3.18 W idle) was selected at startup; see *Power
   measurement* below for the fallback chain.
@@ -270,11 +261,6 @@ Notable behaviour visible in the run:
   image-classification demo's MobileNetV1 column — that's pure HLS
   kernel cost; the pipeline is one-frame-in-flight, so display refresh
   caps at ~0.4 fps.
-- **Qt font warnings on the host display window** are cosmetic and can
-  be ignored; the live window still renders correctly.  They originate
-  in `opencv-python`'s bundled Qt and can be silenced with
-  `apt install fonts-dejavu` on the host (or `--save-only` to skip the
-  window entirely).
 
 ### Power measurement
 
