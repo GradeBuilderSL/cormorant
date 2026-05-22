@@ -169,7 +169,10 @@ python3 -m venv .venv
 .venv/bin/python test/gen_mixed_all_kernels_models.py # All-kernel combination models
 ```
 
-Dependencies (from `requirements.txt`): `onnx`, `numpy`.
+Dependencies (from `requirements.txt`): `onnx`, `numpy`, `paramiko`
+(remote-test runners), plus `onnxsim`, `onnxoptimizer`, `onnxruntime`
+(used by [`simplify_onnx.py`](../simplify_onnx.py) — see
+[MODEL_PREPARATION.md](MODEL_PREPARATION.md)).
 
 ---
 

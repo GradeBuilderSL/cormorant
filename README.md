@@ -162,6 +162,9 @@ Python packages (installed into `.venv` via `pip install -r requirements.txt`):
 | `onnx` | 1.14 | Model parsing and shape inference |
 | `numpy` | 1.24 | Weight encoding, simulation |
 | `paramiko` | 3.0 | SSH/SFTP for remote test runner |
+| `onnxsim` | 0.4 | `simplify_onnx.py` — constant folding, shape pinning |
+| `onnxoptimizer` | 0.3 | `simplify_onnx.py` — `fuse_bn_into_conv` safety-net pass |
+| `onnxruntime` | 1.14 | `simplify_onnx.py --check` smoke test |
 
 ### Target board (KV260)
 
