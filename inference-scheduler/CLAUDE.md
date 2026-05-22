@@ -198,7 +198,10 @@ compile-time bounds (`pool_h ≤ kMaxPoolH`, `pool_w ≤ kMaxPoolW`,
 naming the violated bound + the JSON field to bump.  The bounds come
 from the **same platform JSON the C++ build reads**
 (`platforms/<AXI_PLATFORM>.json`, `kernels.pool` object — see
-`doc/POOL_OPTIMIZATION.md` §4 for the field reference).
+[`../doc/PLATFORM_CONFIGURATION.md`](../doc/PLATFORM_CONFIGURATION.md)
+for the full field reference across all three kernels, and
+`doc/POOL_OPTIMIZATION.md` §4 for the pool-specific architectural
+context).
 `src/_pool_hw_config.py::resolve(platform_name)` is the resolver:
 
 - `platform_name=None` (default) reads `AXI_PLATFORM` env var (defaults

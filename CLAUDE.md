@@ -55,45 +55,14 @@ make synthesize_vectorop_kv260
 
 Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.  The top-level `AXI_PLATFORM` cache var (default `kv260`) also selects which platform's bounds drive the C-sim Config.h for each kernel.
 
-**Required JSON fields:** `part`
-**Optional JSON fields:** `board`, `clock` (default 300 MHz)
+**Schema reference: [`doc/PLATFORM_CONFIGURATION.md`](doc/PLATFORM_CONFIGURATION.md)** — full field-by-field tables for top-level keys and the `kernels.{conv,matmul,pool}` blocks (VectorOPKernel has none), with constraint formulas, the "add a new platform" workflow, and the "edit existing bounds + regenerate hardware-bound fixtures" workflow.
 
-**Per-kernel constants** live under `kernels.<kernel>` in the same JSON.
-`kernels.conv`, `kernels.matmul` and `kernels.pool` are populated
-(`vectorop` has none — it is a runtime-sized element-wise kernel):
+Key facts to keep in mind when editing platform JSON or any code that touches it:
 
-```jsonc
-{
-  "part": "...", "clock": 300,
-  "kernels": {
-    "conv": {
-      "tile_m":                  8,  "tile_ic":           16,
-      "max_kh":                  7,  "max_kw":            7,
-      "max_in_ch":            1024,  "max_out_ch":        1024,
-      "max_line_buf_cols":      64,  "max_line_buf_rows": 16,
-      "max_acc_persist_entries": 65536,
-      "max_m_per_group":         4
-    },
-    "matmul": { "tile_n": 4, "tile_m": 16, "tile_k": 256, "max_k": 2048 },
-    "pool": {
-      "tile_c":            8,
-      "max_kh":            7,   "max_kw":            7,
-      "max_line_buf_rows": 16,  "max_line_buf_cols": 64,
-      "ow_parallel":       2
-    }
-  }
-}
-```
-
-The C++ build reads these via `string(JSON …)` (see
-`kernels/<k>/CMakeLists.txt::<k>_load_constants` for `conv` / `matmul` /
-`pool`) — single source of truth, no `set(<K>_* CACHE …)` defaults; a
-missing field is a hard configure error.
-The Python validator in `inference-scheduler/src/_pool_hw_config.py` reads the
-same file via `resolve(platform_name)`.  `CMAKE_CONFIGURE_DEPENDS` makes
-`make` auto-rerun cmake when the JSON changes.  See `doc/POOL_OPTIMIZATION.md`
-§4 for the pool field reference and `inference-scheduler/CLAUDE.md` for the
-validation flow.
+- The JSON is the **single source of truth**.  The C++ build reads it via `string(JSON …)` in `kernels/<k>/CMakeLists.txt::<k>_load_constants` (no `set(<K>_* CACHE …)` defaults); the Python scheduler reads it via `inference-scheduler/src/_<k>_hw_config.py::resolve()`.  A missing field is a `FATAL_ERROR` during CMake configure and a `<Kernel>HwConfigError` at scheduler load time.
+- `CMAKE_CONFIGURE_DEPENDS` is set on every platform JSON, so `make` auto-reruns cmake when the JSON changes.
+- Bumping a `max_*` bound requires re-running `inference-scheduler/test/gen_{conv,matmul,pool}_models.py` so the hardware-bound boundary fixtures re-derive their geometries from the new JSON — otherwise "must raise" / "at limit" tests can start passing on the wrong values.
+- `AXI_BUS_WIDTH` is a top-level CMake cache variable, **not** a JSON field, so a single platform can be synthesised against multiple bus widths.
 
 Adding a new platform requires only a JSON file and a re-run of cmake.
 
