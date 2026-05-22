@@ -2,7 +2,10 @@
 
 Real-time ImageNet classification from a live **Intel RealSense** camera on
 the KV260 FPGA platform, using **MobileNetV1 1.0/224** running on this
-repo's own HLS kernels (Conv / Pool / MatMul / VectorOP) — no Vitis-AI / DPU.
+repo's own HLS kernels (Conv / Pool / VectorOP) — no Vitis-AI / DPU.
+The shipped `mobilenet_v1_1.0_224_no_softmax` variant ends in a 1×1 Conv
+classifier, so MatmulKernel is not on the active path; the missing-driver
+warning during project generation is harmless for this model.
 
 Connect a RealSense camera to the board, run the orchestrator, and the demo
 will
@@ -166,27 +169,112 @@ A window opens showing the live annotated camera feed. Press **`q`** (or
 `ESC`) in the window — or `Ctrl-C` — to stop; the board loop is signalled to
 shut down cleanly and the remote scratch directory is removed.
 
-Sample output:
+Sample output (host `~/projects/axi_demo/demo/camera`, board at
+`192.168.100.8` with a RealSense D435):
 
 ```
+$ ./run_demo.py
+
+=== download_assets ===
+ONNX models → demo/camera/assets/models
+  ✓ mobilenet_v1_1.0_224_no_softmax.onnx  (16,908,384 B)
+  cached imagenet_1001_labels.txt (1001 lines)
+done
+
+=== generate_project ===
+warning: driver_dirs.MatmulKernel: ../../build/kernels/matmul/kv260/.../src
+         not found (run `make synthesize_kv260` from the repo root)
+[mobilenet_v1] scheduling mobilenet_v1_1.0_224_no_softmax.onnx
+Model      : demo/camera/assets/models/mobilenet_v1_1.0_224_no_softmax.onnx
+Inputs     : ['input:0[1, 3, 224, 224]']
+Outputs    : ['MobilenetV1/Logits/SpatialSqueeze:0[1, 1001]']
+Nodes      : 58
+  [  0] Conv         [1, 3, 224, 224] x [32, 3, 3, 3] x [32]   -> [1, 32, 112, 112]
+  [  1] Clip         [1, 32, 112, 112]                          -> [1, 32, 112, 112]
+  …  (depthwise-separable Conv / Clip blocks repeating to 14×14, 7×7) …
+  [ 54] AveragePool  [1, 1024, 7, 7]                            -> [1, 1024, 1, 1]
+  [ 55] Conv         [1, 1024, 1, 1] x [1001, 1024, 1, 1] x [1001] -> [1, 1001, 1, 1]
+  [ 56] Reshape      [1, 1001, 1, 1]                            -> [1, 1, 1, 1001]
+  [ 57] Squeeze      [1, 1, 1, 1001]                            -> [1, 1001]
+Weights    : 20 large weight(s) written to build/projects/mobilenet_v1/weights/
+[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel
+wrote 1 project(s) under demo/camera/build/projects
+
 === deploy_and_run ===
 
-Preflight (remote)
-    OK   board python deps (pyrealsense2, numpy, cv2)
-    OK   RealSense camera detected         1 device(s)
+Preflight (local)
+    OK   assets/labels/imagenet_1001_labels.txt    10,484 B
+    OK   project 'mobilenet_v1' on disk
+    OK     driver/xvectoropkernel.h  (VectorOPKernel)
+    OK     driver/xconvkernel.h      (ConvKernel)
+    OK     driver/xpoolingkernel.h   (PoolKernel)
+    OK     board/camera_loop.py
+    OK     board/preprocessing.py
+    OK     board/visualization.py
+    OK     board/power_monitor.py
 
+Connecting to root@192.168.100.8:22 …
+  connected
+
+Preflight (remote)
+    OK   cmake                                 cmake version 3.22.1
+    OK   gcc                                   gcc 11.4.0
+    OK   xrt headers                           xrt via pkg-config
+    OK   uio (VectorOPKernel: fabric)          /dev/uio4
+    OK   uio (ConvKernel:     fabric_conv)     /dev/uio6
+    OK   uio (PoolKernel:     fabric_pool)     /dev/uio7
+    OK   board python deps (pyrealsense2, numpy, cv2)
+    OK   RealSense camera detected             1 device(s)
+
+Uploading → /tmp/camera_demo
+  uploaded 54 project + 2 label file(s)
+  cmake …
+  make classify_stream …
   build OK
 
   ── streaming from the KV260 — press q to quit ──
-    camera_loop: RealSense 'Intel RealSense D435' streaming 640x480@30
+    camera_loop: loaded 1001 class labels
+    power_monitor: source='xlnx_platformstats'  initial=3.18 W
+    camera_loop: launching /tmp/camera_demo/projects/mobilenet_v1/build/classify_stream
+    classify_stream: model=mobilenet_v1 classes=1001 input_numel=150528 warmup=1 top_k=5
     classify_stream: ready — streaming frames
-    power_monitor: source='xlnx_platformstats'  initial=4.82 W
-    frame 0: golden_retriever (61.2%)  infer=2460.1ms  display=0.4fps  power=5.1W
-    frame 10: coffee_mug (44.8%)  infer=2461.3ms  display=0.4fps  power=5.0W
+    camera_loop: RealSense 'Intel RealSense D435' streaming 640x480@30
+      frame 0:  patio    (12.8%)  infer=2463.6ms  display=0.3fps  power=3.2W
+      frame 10: umbrella (17.5%)  infer=2463.6ms  display=0.4fps  power=3.4W
+      frame 20: yurt     (16.4%)  infer=2463.6ms  display=0.4fps  power=3.3W
+      frame 30: yurt     (22.6%)  infer=2463.3ms  display=0.4fps  power=3.4W
+    camera_loop: stopping (stop file) after 38 frame(s)
+    classify_stream: 38 frame(s) processed — shutting down
+
+cleanup /tmp/camera_demo
 ```
 
 Each annotated frame's bottom strip reads
 `infer <ms>   display <fps>   power <W>   frame <N>`.
+
+Notable behaviour visible in the run:
+
+- **Only three kernels are active.**  The `no_softmax` MobileNetV1 ends
+  in a 1×1 `Conv` (node 55) rather than a fully-connected `MatMul`, so
+  `[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel`.
+  The `warning: driver_dirs.MatmulKernel … not found` during generation
+  is harmless for this model — the generator only complains because the
+  config still lists a MatmulKernel driver path so other models could
+  drop in.  If you build only the kernels this demo needs (`make
+  synthesize_vectorop_kv260 synthesize_conv_kv260 synthesize_pool_kv260`)
+  the warning still appears but generation succeeds.
+- **Power source picked automatically.**  `xlnx_platformstats` (the SOM
+  INA260 sensor, 3.18 W idle) was selected at startup; see *Power
+  measurement* below for the fallback chain.
+- **Per-frame inference latency ≈ 2.46 s.**  Same as the
+  image-classification demo's MobileNetV1 column — that's pure HLS
+  kernel cost; the pipeline is one-frame-in-flight, so display refresh
+  caps at ~0.4 fps.
+- **Qt font warnings on the host display window** are cosmetic and can
+  be ignored; the live window still renders correctly.  They originate
+  in `opencv-python`'s bundled Qt and can be silenced with
+  `apt install fonts-dejavu` on the host (or `--save-only` to skip the
+  window entirely).
 
 ### Power measurement
 
