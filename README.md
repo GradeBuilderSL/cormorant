@@ -433,234 +433,20 @@ your own models see
 
 ## Testing
 
-### Python unit tests (no hardware)
+Five layers of testing, each independent — full details in
+**[doc/TESTING.md](doc/TESTING.md)**:
 
-The full test suite runs entirely on the host — no FPGA needed:
+| Layer | Needs | One-liner |
+|-------|-------|-----------|
+| Python unit tests | nothing | `.venv/bin/python -m pytest test/ -q` (1006 tests) |
+| HLS C-sim | gcc, CMake | `make TestSimulation TestConvRef TestMatmulRef TestPoolingSim && ctest` |
+| Vivado behavioural sim | Vitis, Vivado | `make sim_hw_kv260` (needs `synthesize_kv260` first) |
+| On-device correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
+| On-device performance | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |
 
-```bash
-cd inference-scheduler
-
-# Generate all test models first (one-time step)
-.venv/bin/python test/gen_all_models.py
-
-# Run all 1006 tests
-.venv/bin/python -m pytest test/ -q
-
-# Run a specific module
-.venv/bin/python -m pytest test/test_pool_alloc.py -v
-```
-
-### Hardware simulation (Vivado, no board)
-
-Behavioral simulation of the full block design against the SystemVerilog testbench:
-
-```bash
-# From the build directory (requires synthesize_kv260 to have run first)
-make sim_hw_kv260
-```
-
-Expected testbench output:
-```
-##  VectorOPKernel     12 /  12  (0 failed)
-##  ConvKernel         18 /  18  (0 failed)
-##  MatmulKernel        8 /   8  (0 failed)
-##  PoolingKernel      10 /  10  (0 failed)
-##  TOTAL: 48 / 48 passed  —  ALL TESTS PASSED
-```
-
-### On-device hardware tests (KV260)
-
-End-to-end correctness testing over SSH. The runner generates a C project per
-model, uploads it, builds on the board, executes the test binary, and compares
-every output element against Python-simulated ground truth.
-
-**Prerequisite:** the Cormorant bitstream must be loaded on the board before
-running any hardware tests.  Use `upload_bitstream.py` (see Quick Start step 6
-or `inference-scheduler/doc/REMOTE_TESTING.md` → *Bitstream Upload*).
-
-Each example config in `inference-scheduler/` targets a specific set of kernels.
-Copy the one that matches your loaded bitstream, then fill in your board details:
-
-```bash
-cd inference-scheduler
-
-# Copy and adapt the example that matches your loaded bitstream
-cp remote_config_all_models.json remote_config.json
-$EDITOR remote_config.json
-```
-
-The two fields you must set are:
-
-- **`ssh.host`** — IP address or hostname of the KV260 (`"192.168.100.8"` by default)
-- **`local.driver_dirs`** — paths on your host machine to the Vitis HLS-generated
-  driver sources for each kernel, e.g.:
-  ```
-  "VectorOPKernel": "<cormorant_base>/build/kernels/vectorop/kv260/<target>/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
-  ```
-
-The `remote.uio_devices` map must list the UIO sysfs name for every kernel in
-the config. After loading the `design_cormorant.dtbo` overlay all four names are
-`fabric_vecop`, `fabric_matmul`, `fabric_conv`, and `fabric_pool` — the example
-configs already have these set correctly for the full-cormorant bitstream.
-
-```bash
-# Verify board prerequisites before running
-.venv/bin/python run_remote_tests.py --config remote_config.json --check-only
-
-# Run all models in the config
-.venv/bin/python run_remote_tests.py --config remote_config.json
-
-# Run a specific model
-.venv/bin/python run_remote_tests.py --config remote_config.json \
-    --models test/models/single_add.onnx
-```
-
-For full SSH setup, config reference, and debugging guide see
-**[inference-scheduler/doc/REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md)**.
-
-### Performance benchmarking (KV260)
-
-`run_remote_perf.py` measures raw kernel throughput and latency. Unlike the
-correctness runner it does not check output values — it only times how fast
-each kernel runs for a configurable set of parameter cases.
-
-The script uploads a single self-contained C benchmark project, builds all
-four kernel binaries in one pass, then runs each case and reports results.
-Kernels whose driver files are absent are silently skipped, so you can
-benchmark only what is currently deployed.
-
-Copy the example config and fill in your board details before the first run:
-
-```bash
-cd inference-scheduler
-cp perf_config.json.example perf_config.json
-$EDITOR perf_config.json   # set ssh.host and local.driver_dirs
-```
-
-**Config file:** `perf_config.json` — extends the same SSH schema as the
-correctness configs with an additional `benchmarks` section.
-
-```json
-"benchmarks": {
-  "VectorOPKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] },
-  "MatmulKernel":   { "enabled": true, "warmup": 10, "cases": [ ... ] },
-  "ConvKernel":     { "enabled": false, "warmup": 10, "cases": [ ... ] },
-  "PoolingKernel":  { "enabled": true,  "warmup": 10, "cases": [ ... ] }
-}
-```
-
-The default `perf_config.json` ships with **53 benchmark cases** across the
-four kernels (20 VectorOPKernel, 12 MatmulKernel, 10 ConvKernel, 11 PoolingKernel).
-
-```bash
-cd inference-scheduler
-
-# Edit local.driver_dirs paths, then:
-
-# Full benchmark run (all enabled kernels)
-.venv/bin/python run_remote_perf.py --config perf_config.json
-
-# Specific kernels only
-.venv/bin/python run_remote_perf.py --config perf_config.json \
-    --kernels VectorOPKernel MatmulKernel
-
-# Override iteration and warmup counts for a quick spot-check
-.venv/bin/python run_remote_perf.py --config perf_config.json \
-    --iters 20 --warmup 5
-
-# Preflight check — verify board is ready without running benchmarks
-.venv/bin/python run_remote_perf.py --config perf_config.json --check-only
-```
-
-**Sample output:**
-
-```
-  VectorOPKernel
-  ───────────────────────────────────────────────────────────────────────────────────
-  Label                    Parameters                        Lat(ms)      GB/s
-  ───────────────────────────────────────────────────────────────────────────────────
-  ADD-1K                   ADD    size=1024    outer=1        0.0208     0.296
-  ADD-4K                   ADD    size=4096    outer=1        0.0515     0.477
-  ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
-  ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
-  ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
-  ...
-  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
-  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
-  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
-  ───────────────────────────────────────────────────────────────────────────────────
-                                                 peak GB/s                0.593
-                                               min latency     0.0181
-  20/20 OK
-
-  MatmulKernel
-  ─────────────────────────────────────────────────────────────────────────────
-  Label              Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────
-  8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
-  16x16x16           N=16   K=16   M=16   batch=1       0.0515     0.159
-  32x32x32           N=32   K=32   M=32   batch=1       0.3021     0.217
-  ...
-  dw-12544x16x3      N=12544 K=16   M=1    batch=3     38.7727     0.031
-  ─────────────────────────────────────────────────────────────────────────────
-                                         peak GOps/s                0.266
-                                         min latency     0.0176
-  12/12 OK
-
-  ConvKernel
-  ─────────────────────────────────────────────────────────────────────────────────────
-  Label                      Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────────────
-  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                5.9634     0.076
-  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k               95.2806     0.076
-  3x3-64ch-56x56             64ch 56x56→64ch 3x3k             127.1612     1.818
-  ...
-  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k              33.7165     0.107
-  ─────────────────────────────────────────────────────────────────────────────────────
-                                                 peak GOps/s                1.903
-                                                 min latency     4.2167
-  10/10 OK
-
-  PoolingKernel
-  ────────────────────────────────────────────────────────────────────────────────────
-  Label                     Parameters                        Lat(ms)      GB/s
-  ────────────────────────────────────────────────────────────────────────────────────
-  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             3.7900     0.132
-  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             1.0524     0.119
-  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             3.8125     0.132
-  ...
-  ────────────────────────────────────────────────────────────────────────────────────
-                                                  peak GB/s                0.133
-                                                min latency     0.1039
-  11/11 OK
-  ── OVERALL: All 53 cases passed ──
-
-  ── OVERALL: All 53 cases passed ──
-```
-
-| Metric | Meaning |
-|--------|---------|
-| `Lat(ms)` | Mean kernel wall-clock time per call (after warmup) |
-| `GB/s` | Memory bandwidth — VectorOPKernel and PoolingKernel |
-| `GOps/s` | Arithmetic throughput — MatmulKernel and ConvKernel |
-| `peak` | Best metric across all passing cases in the group |
-
-For the full config reference, per-kernel case field definitions, and
-debugging guide see the **Performance Benchmarking** section of
-**[inference-scheduler/doc/REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md)**.
-
-### UIO device names
-
-After loading the `design_cormorant.dtbo` overlay the four kernels appear as:
-
-| Kernel | UIO sysfs name |
-|--------|----------------|
-| `VectorOPKernel` | `fabric_vecop` |
-| `MatmulKernel` | `fabric_matmul` |
-| `ConvKernel` | `fabric_conv` |
-| `PoolingKernel` | `fabric_pool` |
-
-Verify on the board: `cat /sys/class/uio/uio*/name`
+The first three run on the host. The last two need the KV260 with the
+Cormorant bitstream loaded (Quick Start step 6, or
+[`inference-scheduler/doc/REMOTE_TESTING.md`](inference-scheduler/doc/REMOTE_TESTING.md)).
 
 ---
 
@@ -678,6 +464,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 
 | Document | Description |
 |----------|-------------|
+| [`doc/TESTING.md`](doc/TESTING.md) | Full testing reference — Python unit tests, HLS C-sim, Vivado sim, on-device correctness + perf |
 | [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](inference-scheduler/doc/INFERENCE_SCHEDULER.md) | Full inference scheduler technical reference |
 | [`inference-scheduler/doc/REMOTE_TESTING.md`](inference-scheduler/doc/REMOTE_TESTING.md) | SSH remote testing and performance benchmarking |
 | [`inference-scheduler/doc/BUFFER_REUSE.md`](inference-scheduler/doc/BUFFER_REUSE.md) | Live-interval buffer reuse optimisation |
