@@ -43,5 +43,7 @@ the fastest way to confirm a board is ready.
 
 See each demo's own `README.md` for model sources, config-field reference,
 sample output, and troubleshooting. The generated-project internals are
-documented in [`../doc/INFERENCE_SCHEDULER.md`](../doc/INFERENCE_SCHEDULER.md)
-and [`../doc/PROFILER.md`](../doc/PROFILER.md).
+documented in
+[`../inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md)
+(canonical scheduler reference; `doc/INFERENCE_SCHEDULER.md` is a thin
+pointer to it) and [`../doc/PROFILER.md`](../doc/PROFILER.md).
