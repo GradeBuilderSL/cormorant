@@ -227,115 +227,23 @@ make synthesize_vectorop_kv260
 
 ### Adding a new platform
 
-Create `platforms/<platform>.json`. The file is the **single source of
-truth** for everything platform-specific: the FPGA part / board / clock,
-plus the compile-time bounds each kernel synthesises against. Both the
-C++ build (`kernels/<k>/CMakeLists.txt::<k>_load_constants` via
-`string(JSON …)`) and the Python scheduler validators
-(`inference-scheduler/src/_<k>_hw_config.py::resolve()`) read the same
-JSON, so the two never drift apart. **A missing field is a `FATAL_ERROR`
-during CMake configure** — there are no implicit defaults.
-
-#### Top-level fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `description` | no | *(none)* | Informational only; surfaces in CMake status logs |
-| `part` | yes | — | Xilinx device part string passed to `set_part` |
-| `board` | no | *(none)* | Board identifier passed to `set_part -board` |
-| `clock` | no | `300` | Target clock in MHz |
-| `kernels.conv` | yes | — | ConvKernel compile-time bounds (table below) |
-| `kernels.matmul` | yes | — | MatmulKernel compile-time bounds (table below) |
-| `kernels.pool` | yes | — | PoolingKernel compile-time bounds (table below) |
-
-`AXI_BUS_WIDTH` is **not** a JSON field — it lives in the top-level
-CMakeLists (see Key CMake parameters above) so a single JSON can be
-synthesised against multiple bus widths.
-
-VectorOPKernel has no per-platform constants: it is a runtime-sized,
-element-wise kernel and has no compile-time bounds to validate.
-
-#### `kernels.conv` — see [`doc/CONV_KERNEL.md`](doc/CONV_KERNEL.md) for full semantics
-
-| Field | Description |
-|-------|-------------|
-| `tile_m` | Output-channel tile (unroll factor, power of 2; any out_ch works — residual-padded) |
-| `tile_ic` | Input-channel tile (unroll factor, power of 2; any in_ch works — residual-padded) |
-| `max_kh`, `max_kw` | Hard upper bound on kernel size; Conv nodes above this are rejected at scheduling |
-| `max_in_ch`, `max_out_ch` | Hard upper bound on channel counts; sizes the bias buffer and weight cache |
-| `max_line_buf_cols`, `max_line_buf_rows` | Line-buffer column / row capacity (cols caps `ow_per_tile`, not `in_w`); power of 2 |
-| `max_acc_persist_entries` | `out_w × out_ch` upper bound for the URAM persistent-accumulator across in-channel tiles |
-| `max_m_per_group` | Number of M-tiles cached together in the weight slab |
-
-#### `kernels.matmul` — see [`doc/MATMUL_KERNEL.md`](doc/MATMUL_KERNEL.md) for full semantics
-
-| Field | Description |
-|-------|-------------|
-| `tile_n` | Row tile (unroll factor, power of 2; any N works — residual-padded) |
-| `tile_m` | Column tile (unroll factor, power of 2; any M works — residual-padded) |
-| `tile_k` | K-loop tile (any K works — residual-padded) |
-| `max_k` | Hard upper bound on the inner dimension K; sizes the `a_buf[tile_n][max_k]` staging buffer. MatMul nodes with `k > max_k` are rejected at scheduling |
-
-#### `kernels.pool` — see [`doc/POOL_OPTIMIZATION.md` §4](doc/POOL_OPTIMIZATION.md) for full semantics
-
-| Field | Description |
-|-------|-------------|
-| `tile_c` | Channel tile width (II=1 lane rotation depth; power of 2; any C works — channel-tiled) |
-| `max_kh`, `max_kw` | Compile-time pool window limits; Pool nodes above this are rejected at scheduling |
-| `max_line_buf_rows` | Line-buffer row capacity. Constraint: `(pool_h-1)·dil_h + 1 ≤ max_line_buf_rows` |
-| `max_line_buf_cols` | Line-buffer column capacity. Constraint: `(pool_w-1)·dil_w + 1 ≤ max_line_buf_cols`; W-tiling kicks in for `in_w > this` |
-| `ow_parallel` | Output-position unroll factor (power of 2; any out_w works — residual-padded) |
-
-#### Example
-
-```jsonc
-{
-  "description": "Xilinx ZCU102 dev board",
-  "part":  "xczu9eg-ffvb1156-2-e",
-  "board": "xilinx.com:zcu102:part0:3.4",
-  "clock": 250,
-  "kernels": {
-    "conv": {
-      "tile_m":                  8,  "tile_ic":               16,
-      "max_kh":                  7,  "max_kw":                 7,
-      "max_in_ch":            1024,  "max_out_ch":          1280,
-      "max_line_buf_cols":      64,  "max_line_buf_rows":     16,
-      "max_acc_persist_entries": 65536,
-      "max_m_per_group":         4
-    },
-    "matmul": { "tile_n": 4, "tile_m": 16, "tile_k": 256, "max_k": 2048 },
-    "pool": {
-      "tile_c":            8,
-      "max_kh":            7,  "max_kw":            7,
-      "max_line_buf_rows": 16, "max_line_buf_cols": 64,
-      "ow_parallel":       2
-    }
-  }
-}
-```
-
-#### After editing
-
-Re-run CMake. `CMAKE_CONFIGURE_DEPENDS` is set on every platform JSON,
-so subsequent `make` invocations auto-rerun configure when the JSON
-changes. The new platform gets:
-
-- synthesis targets for each kernel: `synthesize_<kernel>_<platform>`
-- a roll-up target: `synthesize_<platform>`
-- a device-tree-overlay target for any `.dts` file placed under
-  `dts/<platform>/`
-
-If you bumped any `max_*` bound the inference scheduler's hardware-bound
-test fixtures (the "must raise" / "at limit" models in
-`inference-scheduler/test/gen_{conv,matmul,pool}_models.py`) need
-re-running so they re-derive boundary geometries from the new JSON:
+Drop a `platforms/<platform>.json` file next to `kv260.json` and re-run
+CMake. The JSON is the single source of truth for the FPGA part /
+board / clock and the compile-time bounds each kernel synthesises
+against (the `kernels.{conv,matmul,pool}` block); both the C++ build
+and the Python scheduler validators read it. A missing field is a
+`FATAL_ERROR` during CMake configure.
 
 ```bash
-cd inference-scheduler
-AXI_PLATFORM=<platform> .venv/bin/python test/gen_conv_models.py
-AXI_PLATFORM=<platform> .venv/bin/python test/gen_matmul_models.py
-AXI_PLATFORM=<platform> .venv/bin/python test/gen_pool_models.py
+cmake .. -DAXI_PLATFORM=<platform>    # makes <platform> the C-sim default
+make synthesize_<platform>             # synthesise all four kernels
 ```
+
+The full schema — top-level fields, the three per-kernel constant
+tables, constraint formulas, and the post-edit workflow (including
+regenerating the inference-scheduler hardware-bound test fixtures
+after a `max_*` change) — lives in
+**[doc/PLATFORM_CONFIGURATION.md](doc/PLATFORM_CONFIGURATION.md)**.
 
 ---
 
@@ -775,6 +683,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 | [`inference-scheduler/doc/BUFFER_REUSE.md`](inference-scheduler/doc/BUFFER_REUSE.md) | Live-interval buffer reuse optimisation |
 | [`demo/README.md`](demo/README.md) | End-to-end KV260 demos overview (mnist, image_classification, camera) |
 | [`inference-scheduler/doc/ARCHITECTURE.md`](inference-scheduler/doc/ARCHITECTURE.md) | Codegen internals — node classes, layout engine, mixin assembly |
+| [`doc/PLATFORM_CONFIGURATION.md`](doc/PLATFORM_CONFIGURATION.md) | Platform JSON schema, per-kernel constants, adding/editing a platform |
 | [`doc/PROFILER.md`](doc/PROFILER.md) | Per-layer wall-clock + DDR-bandwidth profiling runtime (`inference_prof` + `inference_ddr`) |
 | [`doc/CONV_KERNEL.md`](doc/CONV_KERNEL.md) | ConvKernel architecture and tiling details |
 | [`doc/POOLING_KERNEL.md`](doc/POOLING_KERNEL.md) | PoolingKernel architecture |
