@@ -83,6 +83,15 @@
       "_preprocess_note": "ONNX Model Zoo MobileNetV2 (PyTorch-trained) expects pixel/255 then per-channel (x - mean) / std.",
       "labels": { "skip_background_class": true },
       "_labels_note": "ONNX Model Zoo MobileNetV2 emits 1000 logits; shift label lookup by +1 to skip the synthetic 'background' slot at the top of the shared file."
+    },
+    {
+      "name": "resnet18",
+      "drive_filename": "resnet18-simplified-fused.onnx",
+      "_drive_filename_note": "File name inside the Google Drive folder.",
+      "preprocess": { "normalize": "imagenet" },
+      "_preprocess_note": "ONNX Model Zoo ResNet-18 (PyTorch-trained) expects per-channel (x - mean) / std.",
+      "labels": { "skip_background_class": true },
+      "_labels_note": "ONNX Model Zoo ResNet-18 emits 1000 logits; shift label lookup by +1 to skip the synthetic 'background' slot at the top of the shared file."
     }
   ],
 
