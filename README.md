@@ -487,6 +487,7 @@ The `DataType` abstraction in `inference-scheduler/src/dtype.py` allows
 
 This work was supported by the **[dAIEDGE Open Call Programme](https://daiedge.eu/)**, funded by the **[European Union's Horizon Europe research and innovation programme](https://research-and-innovation.ec.europa.eu/funding/funding-opportunities/funding-programmes-and-open-calls/horizon-europe_en)** under project number **#101120726**.
 
+Maintained by [GradeBuilder S.L.](https://laspi.pro/en) (Laspi).
 ---
 
 ## License
